@@ -1,0 +1,69 @@
+site_name: Caliscope
+site_description: A brief description of your project
+site_url: https://mprib.github.io/caliscope/
+repo_url: https://github.com/mprib/caliscope
+repo_name: caliscope
+
+theme:
+  logo: images/box3d-center.svg
+  favicon: images/box3d-center.svg
+  name: material
+  font:
+    text: 'Roboto'
+    code: 'Roboto Mono'
+  language: en
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/toggle-switch-off-outline 
+        name: Switch to dark mode
+      primary: blue
+      accent: green
+    - media: "(prefers-color-scheme: light)"
+      scheme: slate 
+      toggle:
+        icon: material/toggle-switch
+        name: Switch to light mode    
+      primary: blue 
+      accent: green
+
+
+nav:
+  - Installation: installation.md
+  - Project Setup: 
+    - Overview: project_setup.md
+    - Sample Project: sample_project.md
+  - Project Setup:  project_setup.md
+  - Workflow:
+    - Video Capture: video_capture.md
+    - Workspace: workspace.md
+    - Charuco Board: calibration_board.md
+    - Cameras: intrinsic_calibration.md
+    - Capture Volume: extrinsic_calibration.md
+    - Post-Processing: post_processing.md 
+
+
+plugins:
+  - search
+  - git-revision-date-localized
+
+markdown_extensions:
+  - toc:
+      permalink: true
+  - admonition
+  - pymdownx.details
+  - pymdownx.inlinehilite
+  - pymdownx.caret
+  - pymdownx.smartsymbols
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.tilde
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+
+
+
+copyright: |
+  &copy; 2023 <a href="https://github.com/mprib"  target="_blank" rel="noopener">Mac Prible</a>

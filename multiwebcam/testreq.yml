@@ -1,0 +1,7 @@
+name: mwc
+channels:
+  - https://repo.anaconda.com/pkgs/main
+  - https://repo.anaconda.com/pkgs/r
+dependencies:
+  - python=3.10
+prefix: /opt/miniconda3/envs/mwc
