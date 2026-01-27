@@ -1,0 +1,23 @@
+name: posetrack
+channels:
+  - pytorch-nightly
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10.16
+  - pandas=2.2.3
+  - pillow=11.1.0
+  - pytorch=2.6.0.dev20241112
+  - torchvision=0.20.0.dev20241118
+  - torchaudio=2.5.0.dev20241118
+  - numpy=2.0.1
+  - pip=25.0
+  - pytest=7.4.3     
+  - pytest-cov=4.1.0 
+  - pip:
+    - supervision==0.26.0  
+    - transformers==4.50.3
+    - opencv-python==4.11.0.86
+    - accelerate==0.26.0
+    - ultralytics==8.3.193
