@@ -20,6 +20,7 @@ Usage:
 """
 
 import ctypes
+import sys
 import numpy as np
 from pathlib import Path
 from dataclasses import dataclass
@@ -48,23 +49,34 @@ CM_ERROR_NOT_SUPPORTED = -6
 
 def _find_library() -> Path:
     """Find the calimerge shared library."""
+    # Determine platform-specific library name
+    if sys.platform == "win32":
+        lib_name = "calimerge.dll"
+    elif sys.platform == "darwin":
+        lib_name = "libcalimerge.dylib"
+    else:
+        lib_name = "libcalimerge.so"
+
     # Look relative to this file
     module_dir = Path(__file__).parent
 
     # Try various locations
     candidates = [
-        module_dir.parent.parent / "native" / "libcalimerge.dylib",  # src/native/
-        module_dir.parent / "native" / "libcalimerge.dylib",
-        module_dir / "libcalimerge.dylib",
-        Path("/usr/local/lib/libcalimerge.dylib"),
+        module_dir.parent.parent / "native" / lib_name,  # src/native/
+        module_dir.parent / "native" / lib_name,
+        module_dir / lib_name,
     ]
+
+    # System paths (Unix only)
+    if sys.platform != "win32":
+        candidates.append(Path(f"/usr/local/lib/{lib_name}"))
 
     for path in candidates:
         if path.exists():
             return path
 
     raise FileNotFoundError(
-        f"Could not find libcalimerge.dylib. Searched: {[str(p) for p in candidates]}"
+        f"Could not find {lib_name}. Searched: {[str(p) for p in candidates]}"
     )
 
 _lib_path = _find_library()
