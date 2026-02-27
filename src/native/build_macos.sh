@@ -26,6 +26,7 @@ clang++ $CFLAGS -std=c++17 \
     -framework CoreMedia \
     -framework CoreVideo \
     -framework Foundation \
+    -framework IOKit \
     -shared -fPIC \
     -o libcalimerge.dylib \
     calimerge_macos.mm

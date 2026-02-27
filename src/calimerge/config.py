@@ -261,22 +261,30 @@ def load_intrinsics(
     serial_number: str,
     resolution: tuple[int, int],
     db_path: Path = DEFAULT_INTRINSICS_DB,
+    allow_scaling: bool = True,
 ) -> CameraIntrinsics | None:
     """
     Load camera intrinsics from database.
+
+    If an exact resolution match isn't found but intrinsics exist at a different
+    resolution with the same aspect ratio, they will be automatically scaled
+    (unless allow_scaling=False).
 
     Args:
         serial_number: Camera serial number
         resolution: (width, height) tuple
         db_path: Path to SQLite database file
+        allow_scaling: If True, scale intrinsics from same aspect ratio if exact not found
 
     Returns:
-        CameraIntrinsics if found, None otherwise
+        CameraIntrinsics if found (possibly scaled), None otherwise
     """
     if not db_path.exists():
         return None
 
     conn = sqlite3.connect(db_path)
+
+    # First try exact match
     cursor = conn.execute(
         """
         SELECT matrix, distortion, error, grid_count
@@ -287,19 +295,59 @@ def load_intrinsics(
     )
 
     row = cursor.fetchone()
-    conn.close()
 
-    if row is None:
+    if row is not None:
+        conn.close()
+        return CameraIntrinsics(
+            serial_number=serial_number,
+            resolution=resolution,
+            matrix=np.frombuffer(row[0], dtype=np.float64).reshape(3, 3),
+            distortion=np.frombuffer(row[1], dtype=np.float64),
+            error=row[2],
+            grid_count=row[3],
+        )
+
+    # No exact match - try scaling if allowed
+    if not allow_scaling:
+        conn.close()
         return None
 
-    return CameraIntrinsics(
-        serial_number=serial_number,
-        resolution=resolution,
-        matrix=np.frombuffer(row[0], dtype=np.float64).reshape(3, 3),
-        distortion=np.frombuffer(row[1], dtype=np.float64),
-        error=row[2],
-        grid_count=row[3],
+    # Find all intrinsics for this camera
+    cursor = conn.execute(
+        """
+        SELECT width, height, matrix, distortion, error, grid_count
+        FROM intrinsics
+        WHERE serial_number = ?
+        ORDER BY width * height DESC
+    """,
+        (serial_number,),
     )
+
+    rows = cursor.fetchall()
+    conn.close()
+
+    if not rows:
+        return None
+
+    # Import here to avoid circular dependency
+    from .types import same_aspect_ratio, scale_intrinsics
+
+    # Find best match with same aspect ratio (prefer higher resolution source)
+    for db_w, db_h, matrix_bytes, dist_bytes, error, grid_count in rows:
+        db_resolution = (db_w, db_h)
+        if same_aspect_ratio(db_resolution, resolution):
+            # Found a scalable match
+            source_intrinsics = CameraIntrinsics(
+                serial_number=serial_number,
+                resolution=db_resolution,
+                matrix=np.frombuffer(matrix_bytes, dtype=np.float64).reshape(3, 3),
+                distortion=np.frombuffer(dist_bytes, dtype=np.float64),
+                error=error,
+                grid_count=grid_count,
+            )
+            return scale_intrinsics(source_intrinsics, resolution)
+
+    return None
 
 
 def list_intrinsics(
@@ -328,6 +376,62 @@ def list_intrinsics(
     conn.close()
 
     return rows
+
+
+def check_intrinsics_availability(
+    serial_number: str,
+    target_resolution: tuple[int, int],
+    db_path: Path = DEFAULT_INTRINSICS_DB,
+) -> tuple[str, tuple[int, int] | None]:
+    """
+    Check what intrinsics are available for a camera.
+
+    Args:
+        serial_number: Camera serial number
+        target_resolution: Desired (width, height)
+        db_path: Path to SQLite database file
+
+    Returns:
+        Tuple of (status_string, source_resolution_or_none)
+        - ("exact", (w, h)) if exact match exists
+        - ("scalable", (w, h)) if same-aspect-ratio match exists (returns best source res)
+        - ("mismatch", None) if intrinsics exist but wrong aspect ratio
+        - ("none", None) if no intrinsics for this camera
+    """
+    if not db_path.exists():
+        return ("none", None)
+
+    from .types import same_aspect_ratio
+
+    conn = sqlite3.connect(db_path)
+    cursor = conn.execute(
+        """
+        SELECT width, height, error
+        FROM intrinsics
+        WHERE serial_number = ?
+        ORDER BY width * height DESC
+    """,
+        (serial_number,),
+    )
+
+    rows = cursor.fetchall()
+    conn.close()
+
+    if not rows:
+        return ("none", None)
+
+    # Check for exact match first
+    for w, h, _ in rows:
+        if (w, h) == target_resolution:
+            return ("exact", (w, h))
+
+    # Check for scalable match (same aspect ratio)
+    for w, h, _ in rows:
+        if same_aspect_ratio((w, h), target_resolution):
+            return ("scalable", (w, h))
+
+    # Intrinsics exist but wrong aspect ratio
+    return ("mismatch", rows[0][:2])  # Return highest-res available
 
 
 def delete_intrinsics(

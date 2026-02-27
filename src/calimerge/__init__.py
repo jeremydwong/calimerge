@@ -1,6 +1,6 @@
 # calimerge - Unified multi-camera motion capture
 
-__version__ = "0.1.0"
+__version__ = "0.1.4"
 
 # Camera bindings (C++ module)
 from calimerge.camera_binding import (

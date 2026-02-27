@@ -4,6 +4,8 @@ Multi-camera display grid widget.
 
 from __future__ import annotations
 
+import time
+
 import numpy as np
 from PySide6.QtWidgets import (
     QWidget,
@@ -16,6 +18,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QPixmap
 
 from ..frame_utils import bgr_to_pixmap
+from ..colors import camera_color_hex
 
 
 class CameraCell(QWidget):
@@ -26,30 +29,35 @@ class CameraCell(QWidget):
     def __init__(self, port: int, label: str = "", parent: QWidget | None = None):
         super().__init__(parent)
         self.port = port
+        self._last_frame_time: float = 0.0
+        self._color_hex = camera_color_hex(port)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(2, 2, 2, 2)
         layout.setSpacing(2)
 
-        # Camera label
+        # Camera label (colored to match camera's palette color)
         self.label = QLabel(label or f"Camera {port}")
         self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.label.setStyleSheet("font-weight: bold; font-size: 11px;")
+        self.label.setStyleSheet(
+            f"font-weight: bold; font-size: 11px; color: {self._color_hex};"
+        )
         layout.addWidget(self.label)
 
-        # Frame display
+        # Frame display (border colored to match camera)
+        # Sized for 4:3 aspect ratio cameras
         self.frame_label = QLabel()
         self.frame_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.frame_label.setMinimumSize(160, 120)
+        self.frame_label.setMinimumSize(240, 180)  # 4:3 aspect ratio minimum
         self.frame_label.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
         self.frame_label.setStyleSheet(
-            "background-color: #1a1a1a; border: 1px solid #333;"
+            f"background-color: #1a1a1a; border: 2px solid {self._color_hex};"
         )
         layout.addWidget(self.frame_label, stretch=1)
 
-        # Status label
+        # Status label (resolution + fps)
         self.status_label = QLabel("No signal")
         self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.status_label.setStyleSheet("color: #888; font-size: 10px;")
@@ -60,7 +68,17 @@ class CameraCell(QWidget):
         if frame is None:
             self.frame_label.clear()
             self.status_label.setText("No signal")
+            self._last_frame_time = 0.0
             return
+
+        # Compute FPS from inter-frame period
+        now = time.perf_counter()
+        fps_str = ""
+        if self._last_frame_time > 0:
+            dt = now - self._last_frame_time
+            if dt > 0:
+                fps_str = f"  {1.0 / dt:.1f} fps"
+        self._last_frame_time = now
 
         pixmap = bgr_to_pixmap(frame)
         if not pixmap.isNull():
@@ -72,7 +90,7 @@ class CameraCell(QWidget):
             )
             self.frame_label.setPixmap(scaled)
             h, w = frame.shape[:2]
-            self.status_label.setText(f"{w}x{h}")
+            self.status_label.setText(f"{w}x{h}{fps_str}")
 
     def set_label(self, text: str) -> None:
         """Update camera label."""
@@ -93,6 +111,7 @@ class CameraGrid(QWidget):
     Grid layout for multiple camera displays.
 
     Automatically arranges cameras in optimal grid.
+    Designed for 4:3 aspect ratio cameras in 2x2 grid layout.
     """
 
     camera_clicked = Signal(int)  # port
@@ -102,8 +121,10 @@ class CameraGrid(QWidget):
         self.cells: dict[int, CameraCell] = {}
 
         self.grid_layout = QGridLayout(self)
-        self.grid_layout.setSpacing(4)
+        self.grid_layout.setSpacing(6)
         self.grid_layout.setContentsMargins(4, 4, 4, 4)
+        # Minimum size for comfortable 2x2 viewing of 4:3 cameras
+        self.setMinimumSize(520, 400)
 
     def set_cameras(self, camera_info: dict[int, str]) -> None:
         """

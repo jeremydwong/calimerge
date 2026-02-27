@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QTextEdit,
     QListWidget,
     QListWidgetItem,
+    QSpinBox,
 )
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QFont
@@ -36,6 +37,7 @@ class ProcessTab(QWidget):
     Allows users to:
     - Load recording videos
     - Select tracker backend
+    - Configure tracking parameters
     - Run 2D tracking and 3D triangulation
     - Export results
     """
@@ -49,6 +51,7 @@ class ProcessTab(QWidget):
         self.processing_worker: ProcessingWorker | None = None
         self.video_paths: dict[int, Path] = {}
         self.output_path: Path | None = None
+        self.frame_time_csv: Path | None = None
 
         self._init_ui()
         self._connect_signals()
@@ -67,18 +70,53 @@ class ProcessTab(QWidget):
 
         # Settings group
         settings_group = QGroupBox("Processing Settings")
-        settings_layout = QHBoxLayout(settings_group)
+        settings_layout = QVBoxLayout(settings_group)
 
-        settings_layout.addWidget(QLabel("Tracker:"))
+        # Row 1: Tracker and folder
+        row1 = QHBoxLayout()
+
+        row1.addWidget(QLabel("Tracker:"))
         self.tracker_combo = QComboBox()
-        self.tracker_combo.addItems(["charuco", "mediapipe"])
-        settings_layout.addWidget(self.tracker_combo)
+        self.tracker_combo.addItems(["synthpose"])
+        row1.addWidget(self.tracker_combo)
 
-        settings_layout.addStretch()
+        row1.addStretch()
 
         self.load_folder_button = QPushButton("Load Recording Folder...")
         self.load_folder_button.clicked.connect(self._load_folder)
-        settings_layout.addWidget(self.load_folder_button)
+        row1.addWidget(self.load_folder_button)
+
+        settings_layout.addLayout(row1)
+
+        # Row 2: Synthpose parameters
+        row2 = QHBoxLayout()
+
+        row2.addWidget(QLabel("Max persons:"))
+        self.max_persons_spin = QSpinBox()
+        self.max_persons_spin.setRange(1, 10)
+        self.max_persons_spin.setValue(2)
+        row2.addWidget(self.max_persons_spin)
+
+        row2.addWidget(QLabel("Device:"))
+        self.device_combo = QComboBox()
+        self.device_combo.addItems(["auto", "mps", "cuda", "cpu"])
+        row2.addWidget(self.device_combo)
+
+        row2.addWidget(QLabel("Batch size:"))
+        self.batch_size_spin = QSpinBox()
+        self.batch_size_spin.setRange(1, 64)
+        self.batch_size_spin.setValue(8)
+        row2.addWidget(self.batch_size_spin)
+
+        row2.addWidget(QLabel("Skip frames:"))
+        self.skip_frames_spin = QSpinBox()
+        self.skip_frames_spin.setRange(1, 100)
+        self.skip_frames_spin.setValue(1)
+        self.skip_frames_spin.setToolTip("Process every Nth sync index (1 = all frames)")
+        row2.addWidget(self.skip_frames_spin)
+
+        row2.addStretch()
+        settings_layout.addLayout(row2)
 
         layout.addWidget(settings_group)
 
@@ -126,7 +164,7 @@ class ProcessTab(QWidget):
 
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setFont(QFont("Courier", 9))
+        self.log_text.setFont(QFont("monospace", 9))
         self.log_text.setMaximumHeight(200)
         log_layout.addWidget(self.log_text)
 
@@ -188,18 +226,24 @@ class ProcessTab(QWidget):
         self.video_paths.clear()
         self.video_list.clear()
 
-        # Find port_X.mp4 files
-        for video_file in folder_path.glob("port_*.mp4"):
-            try:
-                # Extract port number
-                port = int(video_file.stem.split("_")[1])
-                self.video_paths[port] = video_file
+        # Discover videos (handles both port{N}_{serial}.mp4 and port_N.mp4)
+        from ..video_utils import discover_videos
 
-                item = QListWidgetItem(f"Camera {port}: {video_file.name}")
-                item.setData(Qt.ItemDataRole.UserRole, port)
-                self.video_list.addItem(item)
-            except (ValueError, IndexError):
-                continue
+        discovered = discover_videos(folder_path)
+        for port, video_path in sorted(discovered.items()):
+            self.video_paths[port] = video_path
+            item = QListWidgetItem(f"Camera {port}: {video_path.name}")
+            item.setData(Qt.ItemDataRole.UserRole, port)
+            self.video_list.addItem(item)
+
+        # Check for frame_time_history.csv
+        csv_path = folder_path / "frame_time_history.csv"
+        if csv_path.exists():
+            self.frame_time_csv = csv_path
+            self._log("Found frame_time_history.csv")
+        else:
+            self.frame_time_csv = None
+            self._log("Warning: No frame_time_history.csv found")
 
         if self.video_paths:
             self.process_button.setEnabled(True)
@@ -208,7 +252,7 @@ class ProcessTab(QWidget):
             for port, path in sorted(self.video_paths.items()):
                 self._log(f"  Camera {port}: {path.name}")
         else:
-            self.status_message.emit("No port_X.mp4 videos found in folder")
+            self.status_message.emit("No video files found in folder")
 
     def _on_video_selected(self, item: QListWidgetItem):
         """Handle video selection."""
@@ -233,16 +277,25 @@ class ProcessTab(QWidget):
             self.status_message.emit(f"Missing videos for cameras: {missing}")
             return
 
+        # Check frame time CSV for synthpose
+        tracker = self.tracker_combo.currentText()
+        if tracker == "synthpose" and self.frame_time_csv is None:
+            self.status_message.emit("frame_time_history.csv required for synthpose tracking")
+            self._log("ERROR: frame_time_history.csv not found in recording folder")
+            return
+
         self.process_button.setEnabled(False)
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
 
-        tracker = self.tracker_combo.currentText()
-
         self._log(f"\n{'='*50}")
-        self._log(f"Starting processing pipeline")
+        self._log("Starting processing pipeline")
         self._log(f"  Tracker: {tracker}")
         self._log(f"  Cameras: {list(self.video_paths.keys())}")
+        self._log(f"  Max persons: {self.max_persons_spin.value()}")
+        self._log(f"  Device: {self.device_combo.currentText()}")
+        self._log(f"  Batch size: {self.batch_size_spin.value()}")
+        self._log(f"  Skip frames: {self.skip_frames_spin.value()}")
         self._log(f"{'='*50}\n")
 
         self.processing_worker = ProcessingWorker(
@@ -250,6 +303,11 @@ class ProcessTab(QWidget):
             cameras=cal_state.calibrated_cameras.copy(),
             output_path=self.output_path,
             tracker_backend=tracker,
+            frame_time_csv=self.frame_time_csv,
+            device_name=self.device_combo.currentText(),
+            max_persons=self.max_persons_spin.value(),
+            batch_size=self.batch_size_spin.value(),
+            skip_sync_indices=self.skip_frames_spin.value(),
         )
         self.processing_worker.log_message.connect(self._log)
         self.processing_worker.progress_update.connect(self._on_progress)
@@ -269,7 +327,7 @@ class ProcessTab(QWidget):
 
     def _on_processing_done(self, output_file: Path):
         """Handle processing completion."""
-        self._log(f"\nProcessing complete!")
+        self._log("\nProcessing complete!")
         self._log(f"Output: {output_file}")
         self.export_csv_button.setEnabled(True)
         self.state_manager.update_processing(is_processing=False)

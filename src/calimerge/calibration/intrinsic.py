@@ -92,18 +92,34 @@ def _find_corners(
     Returns:
         (ids, img_loc) arrays
     """
-    # Detect ArUco markers
-    aruco_corners, aruco_ids, _ = cv2.aruco.detectMarkers(gray, dictionary)
+    # Detect ArUco markers using OpenCV 4.7+ API (ArucoDetector class)
+    # Fall back to legacy API for older versions
+    try:
+        # OpenCV 4.7+ API
+        detector_params = cv2.aruco.DetectorParameters()
+        detector = cv2.aruco.ArucoDetector(dictionary, detector_params)
+        aruco_corners, aruco_ids, _ = detector.detectMarkers(gray)
+    except AttributeError:
+        # Legacy API (OpenCV < 4.7)
+        aruco_corners, aruco_ids, _ = cv2.aruco.detectMarkers(gray, dictionary)
 
-    if len(aruco_corners) < 2:
+    if aruco_ids is None or len(aruco_corners) < 2:
         return np.array([], dtype=np.int32), np.array([], dtype=np.float32).reshape(0, 2)
 
-    # Interpolate ChArUco corners
-    success, img_loc, ids = cv2.aruco.interpolateCornersCharuco(
-        aruco_corners, aruco_ids, gray, board
-    )
+    # Interpolate ChArUco corners using OpenCV 4.7+ API
+    try:
+        # OpenCV 4.7+ API - use CharucoDetector for corner interpolation
+        charuco_detector = cv2.aruco.CharucoDetector(board)
+        img_loc, ids, _, _ = charuco_detector.detectBoard(gray)
+    except AttributeError:
+        # Legacy API (OpenCV < 4.7)
+        success, img_loc, ids = cv2.aruco.interpolateCornersCharuco(
+            aruco_corners, aruco_ids, gray, board
+        )
+        if not success:
+            return np.array([], dtype=np.int32), np.array([], dtype=np.float32).reshape(0, 2)
 
-    if not success or ids is None or img_loc is None:
+    if ids is None or img_loc is None or len(ids) == 0:
         return np.array([], dtype=np.int32), np.array([], dtype=np.float32).reshape(0, 2)
 
     # Sub-pixel refinement
@@ -113,9 +129,16 @@ def _find_corners(
     except cv2.error:
         pass  # Sub-pixel refinement failed, use raw corners
 
-    # Flatten arrays
-    ids_flat = ids[:, 0]
-    img_loc_flat = img_loc[:, 0, :]
+    # Flatten arrays - handle both old and new API shapes
+    if ids.ndim == 2:
+        ids_flat = ids[:, 0]
+    else:
+        ids_flat = ids.flatten()
+
+    if img_loc.ndim == 3:
+        img_loc_flat = img_loc[:, 0, :]
+    else:
+        img_loc_flat = img_loc
 
     return ids_flat, img_loc_flat
 

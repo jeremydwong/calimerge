@@ -33,7 +33,7 @@ from typing import Optional
 CM_MAX_CAMERAS = 16
 CM_SERIAL_LEN = 64
 CM_NAME_LEN = 128
-CM_RES_COUNT = 3
+CM_MAX_FORMATS = 32
 
 CM_OK = 0
 CM_ERROR_INIT_FAILED = -1
@@ -86,10 +86,11 @@ _lib = ctypes.CDLL(str(_lib_path))
 # C Struct Definitions
 # ============================================================================
 
-class CM_Resolution(ctypes.Structure):
+class CM_Format(ctypes.Structure):
     _fields_ = [
         ("width", ctypes.c_int),
         ("height", ctypes.c_int),
+        ("fps", ctypes.c_int),
     ]
 
 class CM_Camera(ctypes.Structure):
@@ -103,8 +104,8 @@ class CM_Camera(ctypes.Structure):
         ("rotation", ctypes.c_int),
         ("exposure", ctypes.c_int),
         ("enabled", ctypes.c_bool),
-        ("supported_resolutions", CM_Resolution * CM_RES_COUNT),
-        ("supported_resolution_count", ctypes.c_int),
+        ("supported_formats", CM_Format * CM_MAX_FORMATS),
+        ("supported_format_count", ctypes.c_int),
         ("platform_handle", ctypes.c_void_p),
     ]
 
@@ -159,6 +160,9 @@ _lib.cm_set_resolution.restype = ctypes.c_int
 _lib.cm_set_fps.argtypes = [ctypes.POINTER(CM_Camera), ctypes.c_int]
 _lib.cm_set_fps.restype = ctypes.c_int
 
+_lib.cm_set_format.argtypes = [ctypes.POINTER(CM_Camera), ctypes.c_int, ctypes.c_int, ctypes.c_int]
+_lib.cm_set_format.restype = ctypes.c_int
+
 _lib.cm_set_exposure.argtypes = [ctypes.POINTER(CM_Camera), ctypes.c_int]
 _lib.cm_set_exposure.restype = ctypes.c_int
 
@@ -195,10 +199,27 @@ class CameraInfo:
     rotation: int
     exposure: int
     enabled: bool
-    supported_resolutions: list[tuple[int, int]]
+    supported_formats: list[tuple[int, int, int]]  # (width, height, fps)
 
     # Internal: reference to the C struct for API calls
     _c_camera: Optional[CM_Camera] = None
+
+    @property
+    def supported_resolutions(self) -> list[tuple[int, int]]:
+        """Unique (width, height) pairs from supported formats, sorted largest first."""
+        seen = set()
+        result = []
+        for w, h, _ in self.supported_formats:
+            if (w, h) not in seen:
+                seen.add((w, h))
+                result.append((w, h))
+        # Sort by total pixels descending (largest resolution first)
+        result.sort(key=lambda r: r[0] * r[1], reverse=True)
+        return result
+
+    def fps_for_resolution(self, width: int, height: int) -> list[int]:
+        """FPS values available for a given resolution."""
+        return sorted({fps for w, h, fps in self.supported_formats if w == width and h == height})
 
 @dataclass
 class Frame:
@@ -290,11 +311,11 @@ def enumerate_cameras() -> list[CameraInfo]:
     for i in range(count):
         cam = _cameras[i]
 
-        # Extract supported resolutions
-        resolutions = []
-        for r in range(cam.supported_resolution_count):
-            res = cam.supported_resolutions[r]
-            resolutions.append((res.width, res.height))
+        # Extract supported formats
+        formats = []
+        for r in range(cam.supported_format_count):
+            fmt = cam.supported_formats[r]
+            formats.append((fmt.width, fmt.height, fmt.fps))
 
         info = CameraInfo(
             serial_number=cam.serial_number.decode('utf-8'),
@@ -306,7 +327,7 @@ def enumerate_cameras() -> list[CameraInfo]:
             rotation=cam.rotation,
             exposure=cam.exposure,
             enabled=cam.enabled,
-            supported_resolutions=resolutions,
+            supported_formats=formats,
             _c_camera=cam,
         )
         result.append(info)
@@ -340,6 +361,19 @@ def set_resolution(camera: CameraInfo, width: int, height: int) -> None:
     camera.width = width
     camera.height = height
 
+def set_format(camera: CameraInfo, width: int, height: int, fps: int) -> None:
+    """Set camera resolution and FPS atomically."""
+    if camera._c_camera is None:
+        raise ValueError("Invalid camera object")
+
+    result = _lib.cm_set_format(ctypes.byref(camera._c_camera), width, height, fps)
+    if result != CM_OK:
+        raise RuntimeError(f"Failed to set format {width}x{height}@{fps}: {result}")
+
+    camera.width = width
+    camera.height = height
+    camera.fps = fps
+
 def set_fps(camera: CameraInfo, fps: int) -> None:
     """Set camera frame rate."""
     if camera._c_camera is None:
@@ -350,6 +384,17 @@ def set_fps(camera: CameraInfo, fps: int) -> None:
         raise RuntimeError(f"Failed to set FPS: {result}")
 
     camera.fps = fps
+
+def set_exposure(camera: CameraInfo, exposure: int) -> None:
+    """Set camera exposure."""
+    if camera._c_camera is None:
+        raise ValueError("Invalid camera object")
+
+    result = _lib.cm_set_exposure(ctypes.byref(camera._c_camera), exposure)
+    if result != CM_OK:
+        raise RuntimeError(f"Failed to set exposure: {result}")
+
+    camera.exposure = exposure
 
 def capture_frame(camera: CameraInfo) -> Frame:
     """

@@ -79,10 +79,11 @@ class CameraPreviewWorker(QThread):
 
 
 class RecordingWorker(QThread):
-    """Record synchronized video to files."""
+    """Record synchronized video to files with hardware encoding."""
 
     log_message = Signal(str)
     progress_update = Signal(int, int)  # current, total
+    frame_captured = Signal(int, object)  # port, np.ndarray (for preview/FPS)
     recording_finished = Signal(dict)  # stats
     error = Signal(str)
 
@@ -92,18 +93,20 @@ class RecordingWorker(QThread):
         output_path: Path,
         duration: float,
         fps: int,
+        codec: str = "h264",
     ):
         super().__init__()
         self.cameras = cameras
         self.output_path = output_path
         self.duration = duration
         self.fps = fps
+        self.codec = codec
         self.running = True
 
     def run(self):
         try:
-            import cv2
             from ..camera_binding import capture_synced
+            from .video_utils import create_video_writer, detect_encoders
 
             target_frames = int(self.duration * self.fps)
             frame_interval = 1.0 / self.fps
@@ -111,6 +114,15 @@ class RecordingWorker(QThread):
             writers = {}
             frame_counts = {i: 0 for i in range(len(self.cameras))}
             frame_times = []
+
+            # Log encoder info
+            info = detect_encoders()
+            if info.ffmpeg_path and info.has_h264_hw:
+                self.log_message.emit(f"Using hardware encoder ({self.codec})")
+            elif info.ffmpeg_path:
+                self.log_message.emit(f"Using ffmpeg software encoder ({self.codec})")
+            else:
+                self.log_message.emit("Using OpenCV fallback encoder")
 
             start_time = time.perf_counter()
             sync_index = 0
@@ -132,12 +144,12 @@ class RecordingWorker(QThread):
                     # Initialize writer on first frame
                     if cam_idx not in writers:
                         video_path = self.output_path / f"port_{cam_idx}.mp4"
-                        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                        writers[cam_idx] = cv2.VideoWriter(
-                            str(video_path),
-                            fourcc,
+                        writers[cam_idx] = create_video_writer(
+                            video_path,
+                            frame.width,
+                            frame.height,
                             self.fps,
-                            (frame.width, frame.height),
+                            codec=self.codec,
                         )
                         self.log_message.emit(
                             f"  Camera {cam_idx}: {frame.width}x{frame.height}"
@@ -145,6 +157,9 @@ class RecordingWorker(QThread):
 
                     writers[cam_idx].write(frame.pixels)
                     frame_counts[cam_idx] += 1
+
+                    # Emit for preview/FPS tracking
+                    self.frame_captured.emit(cam_idx, frame.pixels)
 
                     frame_times.append(
                         {

@@ -534,3 +534,267 @@ def compute_reprojection_rmse(
             rmse[str(port)] = float(np.sqrt(np.mean(cam_error**2)))
 
     return rmse
+
+
+# ============================================================================
+# End-to-End Pipeline
+# ============================================================================
+
+
+def run_extrinsic_from_videos(
+    video_paths: dict[int, "Path"],
+    intrinsics: dict[int, CameraIntrinsics],
+    charuco_config: "CharucoConfig",
+    frame_time_csv: "Path | None" = None,
+    sample_interval: int = 10,
+    progress_callback: "Callable | None" = None,
+) -> tuple[dict[int, CalibratedCamera], float]:
+    """
+    Run the full extrinsic calibration pipeline from video files.
+
+    Steps:
+    1. Detect charuco corners in all videos (every sample_interval frames)
+    2. Build SyncedPoints list (frame-for-frame sync, or from CSV if provided)
+    3. Compute initial extrinsics via pairwise stereo calibration
+    4. Triangulate initial 3D points
+    5. Run bundle adjustment for joint optimization
+
+    Args:
+        video_paths: Dict of port -> video file path
+        intrinsics: Dict of port -> CameraIntrinsics
+        charuco_config: ChArUco board configuration
+        frame_time_csv: Optional CSV with sync timing (sync_index, port, frame_index, frame_time)
+        sample_interval: Process every Nth frame
+        progress_callback: Optional callback(fraction: float, message: str)
+
+    Returns:
+        (calibrated_cameras, rmse)
+    """
+    from pathlib import Path
+    from .charuco import create_charuco_board
+    from .intrinsic import detect_charuco_points
+    from ..types import FramePoints, SyncedPoints, CalibratedCamera, CameraExtrinsics
+
+    def report(fraction: float, message: str):
+        if progress_callback:
+            progress_callback(fraction, message)
+
+    ports = sorted(video_paths.keys())
+    board = create_charuco_board(charuco_config)
+
+    # Step 1: Detect charuco corners in all videos
+    report(0.0, "Step 1: Detecting charuco corners in videos...")
+
+    # per_port_detections[port] = list of (frame_index, PointPacket)
+    per_port_detections: dict[int, list[tuple[int, "PointPacket"]]] = {}
+
+    for port_i, port in enumerate(ports):
+        video_path = video_paths[port]
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            raise RuntimeError(f"Cannot open video: {video_path}")
+
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        detections = []
+        frame_idx = 0
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            if frame_idx % sample_interval == 0:
+                packet = detect_charuco_points(frame, charuco_config, board)
+                if packet.point_id is not None and len(packet.point_id) >= 4:
+                    detections.append((frame_idx, packet))
+
+            frame_idx += 1
+
+        cap.release()
+        per_port_detections[port] = detections
+
+        fraction = 0.3 * (port_i + 1) / len(ports)
+        report(fraction, f"  Port {port}: {len(detections)} detections from {frame_idx} frames")
+
+    # Step 2: Build SyncedPoints
+    report(0.3, "Step 2: Building synchronized point correspondences...")
+
+    synced_points_list = _build_synced_points(
+        per_port_detections, ports, frame_time_csv, sample_interval
+    )
+
+    report(0.35, f"  {len(synced_points_list)} sync frames with shared observations")
+
+    if len(synced_points_list) < 3:
+        raise RuntimeError(
+            f"Only {len(synced_points_list)} synced frames with shared charuco "
+            "detections. Need at least 3. Check that the board is visible in all cameras."
+        )
+
+    # Step 3: Build initial CalibratedCamera dict and compute initial extrinsics
+    report(0.4, "Step 3: Computing initial extrinsics via stereo pairs...")
+
+    cameras = {}
+    for port in ports:
+        cameras[port] = CalibratedCamera(
+            serial_number=intrinsics[port].serial_number,
+            port=port,
+            intrinsics=intrinsics[port],
+            extrinsics=CameraExtrinsics(
+                rotation=np.eye(3, dtype=np.float64),
+                translation=np.zeros(3, dtype=np.float64),
+            ),
+        )
+
+    initial_extrinsics = compute_initial_extrinsics(synced_points_list, cameras)
+
+    calibrated_ports = set(initial_extrinsics.keys())
+    if len(calibrated_ports) < len(ports):
+        missing = set(ports) - calibrated_ports
+        report(0.45, f"  Warning: Could not calibrate cameras {missing}")
+
+    # Update cameras with initial extrinsics
+    for port in ports:
+        if port in initial_extrinsics:
+            cameras[port] = CalibratedCamera(
+                serial_number=intrinsics[port].serial_number,
+                port=port,
+                intrinsics=intrinsics[port],
+                extrinsics=initial_extrinsics[port],
+            )
+
+    report(0.5, f"  Initial extrinsics computed for {len(calibrated_ports)} cameras")
+
+    # Step 4: Build point estimates (triangulate initial 3D points)
+    report(0.5, "Step 4: Triangulating initial 3D point estimates...")
+
+    point_estimates = build_point_estimates(synced_points_list, cameras)
+
+    report(0.6, f"  {point_estimates.n_obj_points} 3D points, {point_estimates.n_img_points} observations")
+
+    # Step 5: Bundle adjustment
+    report(0.6, "Step 5: Running bundle adjustment...")
+
+    refined_cameras, refined_points, rmse = run_bundle_adjustment(
+        cameras, point_estimates
+    )
+
+    report(1.0, f"  Bundle adjustment complete. RMSE: {rmse:.4f}")
+
+    return refined_cameras, rmse
+
+
+def _build_synced_points(
+    per_port_detections: dict[int, list[tuple[int, "PointPacket"]]],
+    ports: list[int],
+    frame_time_csv: "Path | None",
+    sample_interval: int,
+) -> list["SyncedPoints"]:
+    """
+    Build SyncedPoints from per-port charuco detections.
+
+    If frame_time_csv is provided, uses sync_index from CSV.
+    Otherwise, uses frame-for-frame sync: detection N in all cameras = sync_index N
+    (based on sampled frame index / sample_interval).
+    """
+    from ..types import FramePoints, SyncedPoints
+
+    if frame_time_csv is not None:
+        return _build_synced_from_csv(per_port_detections, ports, frame_time_csv)
+
+    # Frame-for-frame sync: group by sampled frame index
+    # Each detection was at frame_idx where frame_idx % sample_interval == 0
+    # Use frame_idx // sample_interval as sync_index
+
+    # Build lookup: port -> {sync_key -> PointPacket}
+    port_sync_map: dict[int, dict[int, "PointPacket"]] = {}
+    for port in ports:
+        lookup = {}
+        for frame_idx, packet in per_port_detections[port]:
+            sync_key = frame_idx // sample_interval
+            lookup[sync_key] = (frame_idx, packet)
+        port_sync_map[port] = lookup
+
+    # Find sync keys where at least 2 cameras have detections
+    all_keys: set[int] = set()
+    for lookup in port_sync_map.values():
+        all_keys.update(lookup.keys())
+
+    synced_list = []
+    for sync_key in sorted(all_keys):
+        frame_points = {}
+        cam_count = 0
+        for port in ports:
+            if sync_key in port_sync_map[port]:
+                frame_idx, packet = port_sync_map[port][sync_key]
+                frame_points[port] = FramePoints(
+                    port=port, frame_index=frame_idx, points=packet
+                )
+                cam_count += 1
+            else:
+                frame_points[port] = None
+
+        if cam_count >= 2:
+            synced_list.append(SyncedPoints(sync_index=sync_key, frame_points=frame_points))
+
+    return synced_list
+
+
+def _build_synced_from_csv(
+    per_port_detections: dict[int, list[tuple[int, "PointPacket"]]],
+    ports: list[int],
+    frame_time_csv: "Path",
+) -> list["SyncedPoints"]:
+    """Build SyncedPoints using sync timing from a frame_time_history CSV."""
+    import csv
+    from ..types import FramePoints, SyncedPoints
+
+    # Parse CSV: build mapping of (port, frame_index) -> sync_index
+    frame_to_sync: dict[tuple[int, int], int] = {}
+    with open(frame_time_csv, "r") as f:
+        reader = csv.reader(f)
+        for row in reader:
+            if not row or row[0].startswith("#"):
+                continue
+            if row[0] == "sync_index":
+                continue  # header
+            sync_idx = int(row[0])
+            port = int(row[1])
+            frame_idx = int(row[2])
+            frame_to_sync[(port, frame_idx)] = sync_idx
+
+    # Build lookup: port -> {sync_index -> PointPacket}
+    port_sync_map: dict[int, dict[int, tuple[int, "PointPacket"]]] = {}
+    for port in ports:
+        lookup = {}
+        for frame_idx, packet in per_port_detections[port]:
+            # Find the nearest sync_index for this frame
+            key = (port, frame_idx)
+            if key in frame_to_sync:
+                sync_idx = frame_to_sync[key]
+                lookup[sync_idx] = (frame_idx, packet)
+        port_sync_map[port] = lookup
+
+    # Find sync indices where at least 2 cameras have detections
+    all_sync_indices: set[int] = set()
+    for lookup in port_sync_map.values():
+        all_sync_indices.update(lookup.keys())
+
+    synced_list = []
+    for sync_idx in sorted(all_sync_indices):
+        frame_points = {}
+        cam_count = 0
+        for port in ports:
+            if sync_idx in port_sync_map[port]:
+                frame_idx, packet = port_sync_map[port][sync_idx]
+                frame_points[port] = FramePoints(
+                    port=port, frame_index=frame_idx, points=packet
+                )
+                cam_count += 1
+            else:
+                frame_points[port] = None
+
+        if cam_count >= 2:
+            synced_list.append(SyncedPoints(sync_index=sync_idx, frame_points=frame_points))
+
+    return synced_list

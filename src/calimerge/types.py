@@ -43,14 +43,22 @@ class CameraIntrinsics:
     """
     Intrinsic parameters for a camera.
     Stored in SQLite database keyed by (serial_number, resolution).
+
+    If scaled from a different resolution, scaled_from contains the original resolution.
     """
 
     serial_number: str
-    resolution: tuple[int, int]  # (width, height)
+    resolution: tuple[int, int]  # (width, height) - current/target resolution
     matrix: np.ndarray  # 3x3 camera matrix
     distortion: np.ndarray  # Distortion coefficients (5,)
-    error: float  # RMSE of reprojection
+    error: float  # RMSE of reprojection (at original resolution)
     grid_count: int  # Number of grids used in calibration
+    scaled_from: tuple[int, int] | None = None  # Original resolution if scaled
+
+    @property
+    def is_scaled(self) -> bool:
+        """True if these intrinsics were scaled from a different resolution."""
+        return self.scaled_from is not None
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,3 +249,94 @@ def get_projection_matrices(
     Build dict of projection matrices for triangulation.
     """
     return {port: compute_projection_matrix(cam) for port, cam in cameras.items()}
+
+
+# ============================================================================
+# Intrinsics Scaling
+# ============================================================================
+
+
+def get_aspect_ratio(resolution: tuple[int, int]) -> tuple[int, int]:
+    """
+    Get simplified aspect ratio for a resolution.
+
+    Args:
+        resolution: (width, height) tuple
+
+    Returns:
+        Simplified (w, h) ratio, e.g. (4, 3) or (16, 9)
+    """
+    from math import gcd
+
+    w, h = resolution
+    divisor = gcd(w, h)
+    return (w // divisor, h // divisor)
+
+
+def same_aspect_ratio(res1: tuple[int, int], res2: tuple[int, int]) -> bool:
+    """Check if two resolutions have the same aspect ratio."""
+    return get_aspect_ratio(res1) == get_aspect_ratio(res2)
+
+
+def scale_intrinsics(
+    intrinsics: CameraIntrinsics,
+    new_resolution: tuple[int, int],
+) -> CameraIntrinsics:
+    """
+    Scale intrinsics to a different resolution.
+
+    Camera matrix parameters (fx, fy, cx, cy) scale linearly with resolution.
+    Distortion coefficients are dimensionless and unchanged.
+
+    Args:
+        intrinsics: Original intrinsics
+        new_resolution: Target (width, height)
+
+    Returns:
+        New CameraIntrinsics scaled to the target resolution
+
+    Raises:
+        ValueError: If aspect ratios don't match
+    """
+    old_w, old_h = intrinsics.resolution
+    new_w, new_h = new_resolution
+
+    # Verify aspect ratios match
+    if not same_aspect_ratio(intrinsics.resolution, new_resolution):
+        old_ar = get_aspect_ratio(intrinsics.resolution)
+        new_ar = get_aspect_ratio(new_resolution)
+        raise ValueError(
+            f"Cannot scale intrinsics: aspect ratio mismatch "
+            f"({old_ar[0]}:{old_ar[1]} -> {new_ar[0]}:{new_ar[1]})"
+        )
+
+    # Compute scale factors
+    scale_x = new_w / old_w
+    scale_y = new_h / old_h
+
+    # Scale camera matrix
+    # [[fx, 0, cx], [0, fy, cy], [0, 0, 1]]
+    new_matrix = intrinsics.matrix.copy()
+    new_matrix[0, 0] *= scale_x  # fx
+    new_matrix[1, 1] *= scale_y  # fy
+    new_matrix[0, 2] *= scale_x  # cx
+    new_matrix[1, 2] *= scale_y  # cy
+    # [2, 2] stays 1.0
+
+    # Note: The original reprojection error was computed at the original
+    # resolution. At higher resolutions the effective error in pixels is larger,
+    # but we keep the original value since it represents calibration quality.
+
+    # Track the original resolution for UI display
+    # If already scaled, preserve the original source
+    original_source = intrinsics.scaled_from or intrinsics.resolution
+
+    return CameraIntrinsics(
+        serial_number=intrinsics.serial_number,
+        resolution=new_resolution,
+        matrix=new_matrix,
+        distortion=intrinsics.distortion,  # Unchanged - dimensionless
+        error=intrinsics.error,  # Keep original quality metric
+        grid_count=intrinsics.grid_count,
+        scaled_from=original_source,
+    )

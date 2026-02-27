@@ -70,8 +70,8 @@ Calimerge uses separate board configurations for intrinsic and extrinsic calibra
 
 | Purpose | Default Size | Square Size | Rationale |
 |---------|--------------|-------------|-----------|
-| **Intrinsic** | 7×5 | 3 cm | Smaller board, close to camera for good coverage |
-| **Extrinsic** | 4×3 | 5 cm | Larger squares visible from multiple cameras |
+| **Intrinsic** | 9×10 | 1 cm | Smaller board, close to camera for good coverage |
+| **Extrinsic** | 4×3 | 20 cm | Larger squares visible from multiple cameras |
 
 The marker size is automatically computed as **75% of square size** (standard ratio).
 
@@ -170,9 +170,85 @@ cd src/native
 
 Produces `libcalimerge.dylib` using AVFoundation.
 
-### Windows (WIP)
+### Windows
 
-Not yet implemented. Will use Media Foundation.
+Uses Media Foundation for camera capture.
+
+#### Prerequisites
+
+1. **Install uv** (Python package manager):
+   ```powershell
+   powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+   ```
+
+2. **Install Visual Studio Build Tools** (if not already installed):
+   - Download from: https://visualstudio.microsoft.com/visual-cpp-build-tools/
+   - Select "Desktop development with C++" workload
+
+#### Build Steps
+
+```powershell
+# Clone and setup
+git clone <repo>
+cd calimerge
+uv sync
+
+# Build native camera library
+cd src\native
+build_win32.bat
+```
+
+If `build_win32.bat` fails, compile manually from a **Developer Command Prompt for VS**:
+
+```powershell
+cl /LD /EHsc /O2 /DNDEBUG calimerge_win32.cpp mfplat.lib mfreadwrite.lib mfuuid.lib ole32.lib /Fe:calimerge.dll
+```
+
+#### Test Native Library
+
+```powershell
+# After building, test camera enumeration
+test_enumerate.exe
+
+# Test single camera capture (camera index 0)
+test_capture.exe 0
+
+# Test multi-camera sync
+test_multi.exe
+```
+
+#### Run the GUI
+
+```powershell
+cd ..\..  # Back to project root
+uv run calimerge gui
+```
+
+#### Troubleshooting
+
+**DLL not found**: Ensure `calimerge.dll` is in `src/native/` - the Python binding looks there.
+
+**No cameras detected**:
+- Check Device Manager for camera devices
+- Some cameras need manufacturer drivers installed
+- Try running as Administrator
+
+**Media Foundation errors**: Windows 10/11 should have MF built-in. If issues persist:
+```powershell
+Get-WindowsCapability -Online | Where-Object Name -like '*Media*'
+```
+
+**Import errors**: Verify the binding can load:
+```powershell
+uv run python -c "from calimerge.camera_binding import enumerate_cameras; print(enumerate_cameras())"
+```
+
+#### Debug Build
+
+For better stack traces, edit `build_win32.bat` to use debug flags:
+```batch
+cl /LD /EHsc /Zi /DEBUG calimerge_win32.cpp mfplat.lib mfreadwrite.lib mfuuid.lib ole32.lib /Fe:calimerge.dll
+```
 
 ### Linux (WIP)
 
@@ -346,6 +422,57 @@ cd caliscope && poetry install && poetry run caliscope
 cd multiwebcam && poetry install && poetry run mwc clock
 ```
 
+## Memory Management
+
+### Native Camera Module (C++)
+
+The native library (`libcalimerge.dylib`) uses a clear ownership model:
+
+| Resource | Allocation | Deallocation | Notes |
+|----------|------------|--------------|-------|
+| `CM_Camera` | Stack/caller | N/A | Plain struct, no dynamic members |
+| `MacOSCameraHandle` | `cm_open_camera()` via `calloc()` | `cm_close_camera()` via `free()` | Per-camera state |
+| Ring buffer pixels | `ring_buffer_push()` via `malloc()` | `ring_buffer_destroy()` via `free()` | Overwritten each frame |
+| Frame pixels (output) | `ring_buffer_get_latest()` via `malloc()` | **Caller** via `cm_release_frame()` | Copied from ring buffer |
+| Synced frame pixels | `cm_capture_synced()` via `malloc()` | **Caller** via `cm_release_synced()` | One per camera |
+
+**Key patterns:**
+
+1. **Ring buffer ownership:** Each camera maintains an 8-frame ring buffer. Frames are overwritten as new ones arrive. The buffer owns pixel memory until `ring_buffer_destroy()`.
+
+2. **Output frame copies:** `cm_capture_frame()` and `cm_capture_synced()` return **copies** of pixel data. The caller **must** call `cm_release_frame()` or `cm_release_synced()` to free this memory.
+
+3. **AVFoundation objects:** Managed via `__bridge_retained` (take ownership) and `__bridge_transfer` (release ownership). All ARC objects are released in `cm_close_camera()`.
+
+4. **Thread safety:** Ring buffer protected by `pthread_mutex` + `pthread_cond`. Frame capture blocks until a frame is available or timeout.
+
+### Python Bindings
+
+The Python `camera_binding.py` wraps the C library:
+
+```python
+# capture_frame() copies pixels to numpy array and releases C memory
+frame = capture_frame(camera)   # Returns Frame with numpy array
+# frame.pixels is a numpy copy - safe to use, no manual release needed
+
+# For synced capture:
+frameset = capture_synced(cameras)  # Returns SyncedFrameSet
+# All frames are numpy copies, C buffers already released
+```
+
+**Important:** Python handles memory automatically:
+- `capture_frame()` copies pixel data to numpy array, then calls `cm_release_frame()`
+- `capture_synced()` copies all frames, then calls `cm_release_synced()`
+- Numpy arrays are managed by Python's garbage collector
+
+### Video Recording
+
+Recording uses **direct-write mode**:
+- Frames written to disk immediately via `cv2.VideoWriter`
+- No in-memory buffering of entire recording
+- OpenCV handles internal buffering
+- Memory usage stays constant regardless of recording duration
+
 ## Architecture Notes
 
 See [CLAUDE.md](CLAUDE.md) for detailed design documentation including:
@@ -357,3 +484,20 @@ See [CLAUDE.md](CLAUDE.md) for detailed design documentation including:
 ## License
 
 BSD-2-Clause
+
+## Todo
+<li>
+- we have no file menu so far! perhaps we won't need one but we'll probably eventually need one. Implement an 'open project' file menu. show the pathname in a 'status bar' which the applciation does currently have, along the bottom of (all of the ) gui tabs. ASSOCIATED WITH THIS, please save all of the files and configurations for each camera and project there.
+
+1. RECORD TAB
+- FPS: 'fps' in settings table for each camera is weird, because you don't usually want to have some cameras running faster than others. moreover, changing one camera changes the framerate of all, suggesting they're locked under the hood. I think this is probably a good way to go, we typically DO want the cameras to all share the same framerate. so, let's remove FPS from the table.
+- COLORS: each entry in the textbox window should also have a color field. can be a square of the color in question.
+- the name of each camera should be name-serial not just name (often you'll have the same kind of camera)
+- the live preview should only show 'enabled' cameras. 
+- TABLE: can you guess at the required size of the table columns so that they don't default to kinda generic bad? 
+- VIDEO PREVIEW the aspect ratio of the cameras by default is not pleasing because everything is quite wide. assume 4x3 and 2x2 grid, make this subsection an appropriate size. squeeze the text sections as necessary. 
+- BUFFERING vs WRITING right now, are we buffering the frames? if so, we could get the required pages of memory ahead of time if using the 'timed' approach. probably best! this is likely best for performance since writing to disk is going to be the limiting performance factor when reading camera frames? 
+- how are we encoding the videos? 264 or otherwise? provide this as an option or make it clear in a hover-over. 
+- EXPOSURE: changes are not doing anything at the moment! suggest that this command isn't effectual for some reason, worth checking. 
+
+

@@ -35,11 +35,12 @@ int main(void) {
         printf("  Name:       %s\n", cam->display_name);
         printf("  Resolution: %dx%d\n", cam->width, cam->height);
         printf("  FPS:        %d\n", cam->fps);
-        printf("  Supported resolutions:\n");
-        for (int r = 0; r < cam->supported_resolution_count; r++) {
-            printf("    - %dx%d\n",
-                   cam->supported_resolutions[r].width,
-                   cam->supported_resolutions[r].height);
+        printf("  Supported formats (%d):\n", cam->supported_format_count);
+        for (int r = 0; r < cam->supported_format_count; r++) {
+            printf("    - %dx%d @ %d fps\n",
+                   cam->supported_formats[r].width,
+                   cam->supported_formats[r].height,
+                   cam->supported_formats[r].fps);
         }
         printf("\n");
     }

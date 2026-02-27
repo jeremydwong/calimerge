@@ -27,12 +27,7 @@ extern "C" {
 #define CM_MAX_CAMERAS 16
 #define CM_SERIAL_LEN 64
 #define CM_NAME_LEN 128
-
-/* Common resolutions to test */
-#define CM_RES_640x480   0
-#define CM_RES_1280x720  1
-#define CM_RES_1920x1080 2
-#define CM_RES_COUNT     3
+#define CM_MAX_FORMATS 32
 
 /* ============================================================================
  * Core Data Structures
@@ -41,7 +36,8 @@ extern "C" {
 typedef struct {
     int width;
     int height;
-} CM_Resolution;
+    int fps;                             /* Max fps for this format entry */
+} CM_Format;
 
 typedef struct {
     char serial_number[CM_SERIAL_LEN];   /* Unique device identifier */
@@ -56,9 +52,11 @@ typedef struct {
     int  exposure;                       /* Platform-specific units */
     bool enabled;
 
-    /* Supported resolutions (filled by cm_enumerate_cameras) */
-    CM_Resolution supported_resolutions[CM_RES_COUNT];
-    int supported_resolution_count;
+    /* Supported formats: (width, height, fps) tuples.
+     * Filled by cm_enumerate_cameras.  Each entry is a unique
+     * (resolution, frame-rate) pair the camera supports. */
+    CM_Format supported_formats[CM_MAX_FORMATS];
+    int supported_format_count;
 
     /* Opaque platform handle - do not touch from Python */
     void *platform_handle;
@@ -117,7 +115,7 @@ void cm_shutdown(void);
 
 /*
  * Enumerate available cameras.
- * Fills out_cameras array with camera info (serial, name, supported resolutions).
+ * Fills out_cameras array with camera info (serial, name, supported formats).
  * Returns number of cameras found, or negative error code.
  */
 int cm_enumerate_cameras(CM_Camera *out_cameras, int max_cameras);
@@ -146,16 +144,22 @@ int cm_open_camera(CM_Camera *camera);
 void cm_close_camera(CM_Camera *camera);
 
 /*
- * Set camera resolution.
- * Takes effect on next frame capture.
- * Returns CM_OK on success.
+ * Set camera format (resolution + fps) atomically.
+ * Finds the best matching platform format entry.
+ * Only restarts the capture session if the underlying format must change.
+ * Returns CM_OK on success, CM_ERROR_NOT_SUPPORTED if no match.
+ */
+int cm_set_format(CM_Camera *camera, int width, int height, int fps);
+
+/*
+ * Set camera resolution (convenience wrapper).
+ * Equivalent to cm_set_format(camera, width, height, camera->fps).
  */
 int cm_set_resolution(CM_Camera *camera, int width, int height);
 
 /*
- * Set target frame rate.
- * Actual FPS may vary based on camera capabilities.
- * Returns CM_OK on success.
+ * Set target frame rate (convenience wrapper).
+ * Equivalent to cm_set_format(camera, camera->width, camera->height, fps).
  */
 int cm_set_fps(CM_Camera *camera, int fps);
 
