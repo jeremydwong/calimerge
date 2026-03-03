@@ -131,6 +131,9 @@ class EncoderInfo:
     has_h264_hw: bool
     has_hevc_hw: bool
     has_prores_hw: bool
+    h264_hw_encoder: str | None = None   # e.g. "h264_nvenc", "h264_amf", "h264_qsv"
+    hevc_hw_encoder: str | None = None
+    has_libx264: bool = False
 
 
 _encoder_info: EncoderInfo | None = None
@@ -146,6 +149,9 @@ def detect_encoders() -> EncoderInfo:
     has_h264_hw = False
     has_hevc_hw = False
     has_prores_hw = False
+    h264_hw_encoder = None
+    hevc_hw_encoder = None
+    has_libx264 = False
 
     if ffmpeg_path:
         try:
@@ -156,9 +162,23 @@ def detect_encoders() -> EncoderInfo:
                 timeout=5,
             )
             output = result.stdout + result.stderr
-            has_h264_hw = "h264_videotoolbox" in output or "h264_nvenc" in output
-            has_hevc_hw = "hevc_videotoolbox" in output or "hevc_nvenc" in output
+
+            # H.264 hardware: check all platform encoders (prefer order)
+            for enc in ("h264_nvenc", "h264_amf", "h264_qsv", "h264_videotoolbox"):
+                if enc in output:
+                    has_h264_hw = True
+                    h264_hw_encoder = enc
+                    break
+
+            # HEVC hardware
+            for enc in ("hevc_nvenc", "hevc_amf", "hevc_qsv", "hevc_videotoolbox"):
+                if enc in output:
+                    has_hevc_hw = True
+                    hevc_hw_encoder = enc
+                    break
+
             has_prores_hw = "prores_videotoolbox" in output
+            has_libx264 = "libx264" in output
         except Exception:
             pass
 
@@ -167,6 +187,9 @@ def detect_encoders() -> EncoderInfo:
         has_h264_hw=has_h264_hw,
         has_hevc_hw=has_hevc_hw,
         has_prores_hw=has_prores_hw,
+        h264_hw_encoder=h264_hw_encoder,
+        hevc_hw_encoder=hevc_hw_encoder,
+        has_libx264=has_libx264,
     )
     return _encoder_info
 
@@ -174,166 +197,89 @@ def detect_encoders() -> EncoderInfo:
 Codec = Literal["h264", "hevc", "prores", "mpeg4"]
 
 
-class FFmpegWriter:
-    """
-    Video writer using ffmpeg subprocess with hardware encoding.
+# ── Video writer handle (plain struct, no methods) ──
 
-    Frames are piped to ffmpeg's stdin as raw BGR24 data.
-    The pipe buffer provides natural decoupling between capture and encoding.
-    """
+@dataclass
+class VideoWriterHandle:
+    """Opaque handle for an active video writer."""
+    kind: Literal["ffmpeg", "cv2"]
+    process: subprocess.Popen | None = None   # ffmpeg only
+    cv2_writer: object | None = None          # cv2 only
+    frame_count: int = 0
 
-    def __init__(
-        self,
-        output_path: Path,
-        width: int,
-        height: int,
-        fps: int,
-        codec: Codec = "h264",
-        bitrate: str = "8M",
-    ):
-        self.output_path = output_path
-        self.width = width
-        self.height = height
-        self.fps = fps
-        self.codec = codec
-        self.bitrate = bitrate
-        self.process: subprocess.Popen | None = None
-        self.frame_count = 0
 
-        self._start_ffmpeg()
+def _pick_encoder(codec: Codec, bitrate: str) -> tuple[str, list[str]]:
+    """Pick best available encoder + args for the given codec."""
+    info = detect_encoders()
 
-    def _get_encoder(self) -> tuple[str, list[str]]:
-        """Get encoder name and extra args based on codec and hardware availability."""
-        info = detect_encoders()
-
-        if self.codec == "h264":
-            if info.has_h264_hw:
-                return "h264_videotoolbox", ["-b:v", self.bitrate]
-            else:
-                return "libx264", ["-preset", "fast", "-crf", "23"]
-
-        elif self.codec == "hevc":
-            if info.has_hevc_hw:
-                return "hevc_videotoolbox", ["-b:v", self.bitrate]
-            else:
-                return "libx265", ["-preset", "fast", "-crf", "28"]
-
-        elif self.codec == "prores":
-            if info.has_prores_hw:
-                return "prores_videotoolbox", ["-profile:v", "0"]  # Proxy profile
-            else:
-                return "prores_ks", ["-profile:v", "0"]
-
-        else:  # mpeg4 fallback
+    if codec == "h264":
+        if info.has_h264_hw and info.h264_hw_encoder:
+            return info.h264_hw_encoder, ["-b:v", bitrate]
+        elif info.has_libx264:
+            return "libx264", ["-preset", "fast", "-crf", "23"]
+        else:
             return "mpeg4", ["-q:v", "5"]
 
-    def _start_ffmpeg(self):
-        """Start ffmpeg subprocess."""
-        info = detect_encoders()
-        if not info.ffmpeg_path:
-            raise RuntimeError("ffmpeg not found")
+    elif codec == "hevc":
+        if info.has_hevc_hw and info.hevc_hw_encoder:
+            return info.hevc_hw_encoder, ["-b:v", bitrate]
+        else:
+            return "libx265", ["-preset", "fast", "-crf", "28"]
 
-        encoder, encoder_args = self._get_encoder()
+    elif codec == "prores":
+        if info.has_prores_hw:
+            return "prores_videotoolbox", ["-profile:v", "0"]
+        else:
+            return "prores_ks", ["-profile:v", "0"]
 
-        cmd = [
-            info.ffmpeg_path,
-            "-y",  # Overwrite output
-            "-f", "rawvideo",
-            "-vcodec", "rawvideo",
-            "-pix_fmt", "bgr24",
-            "-s", f"{self.width}x{self.height}",
-            "-r", str(self.fps),
-            "-i", "pipe:0",  # Read from stdin
-            "-c:v", encoder,
-            *encoder_args,
-            "-pix_fmt", "yuv420p",  # Compatibility
-            str(self.output_path),
-        ]
-
-        self.process = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-        )
-
-    def write(self, frame) -> bool:
-        """
-        Write a frame (numpy array, BGR format).
-
-        Returns True on success, False if pipe is broken.
-        """
-        if self.process is None or self.process.stdin is None:
-            return False
-
-        try:
-            # Ensure contiguous array
-            if hasattr(frame, "tobytes"):
-                data = frame.tobytes()
-            else:
-                data = bytes(frame)
-
-            self.process.stdin.write(data)
-            self.frame_count += 1
-            return True
-        except BrokenPipeError:
-            return False
-
-    def release(self):
-        """Close the writer and wait for ffmpeg to finish."""
-        if self.process is None:
-            return
-
-        try:
-            if self.process.stdin:
-                self.process.stdin.close()
-            self.process.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            self.process.kill()
-        finally:
-            self.process = None
+    else:  # mpeg4 fallback
+        return "mpeg4", ["-q:v", "5"]
 
 
-class CV2Writer:
-    """Fallback video writer using OpenCV (software encoding)."""
+def _open_ffmpeg_writer(
+    output_path: Path, width: int, height: int, fps: int,
+    codec: Codec, bitrate: str,
+) -> VideoWriterHandle:
+    """Start an ffmpeg subprocess that accepts raw BGR24 on stdin."""
+    info = detect_encoders()
+    if not info.ffmpeg_path:
+        raise RuntimeError("ffmpeg not found")
 
-    def __init__(
-        self,
-        output_path: Path,
-        width: int,
-        height: int,
-        fps: int,
-        codec: Codec = "h264",
-    ):
-        import cv2
+    encoder, encoder_args = _pick_encoder(codec, bitrate)
 
-        # Map codec to fourcc
-        fourcc_map = {
-            "h264": "avc1",
-            "hevc": "hvc1",
-            "mpeg4": "mp4v",
-            "prores": "ap4h",
-        }
-        fourcc_str = fourcc_map.get(codec, "mp4v")
-        fourcc = cv2.VideoWriter_fourcc(*fourcc_str)
+    cmd = [
+        info.ffmpeg_path,
+        "-y",
+        "-f", "rawvideo",
+        "-vcodec", "rawvideo",
+        "-pix_fmt", "bgr24",
+        "-s", f"{width}x{height}",
+        "-r", str(fps),
+        "-i", "pipe:0",
+        "-c:v", encoder,
+        *encoder_args,
+        "-pix_fmt", "yuv420p",
+        str(output_path),
+    ]
 
-        self.writer = cv2.VideoWriter(
-            str(output_path),
-            fourcc,
-            fps,
-            (width, height),
-        )
-        self.frame_count = 0
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    return VideoWriterHandle(kind="ffmpeg", process=proc)
 
-    def write(self, frame) -> bool:
-        """Write a frame."""
-        self.writer.write(frame)
-        self.frame_count += 1
-        return True
 
-    def release(self):
-        """Close the writer."""
-        self.writer.release()
+def _open_cv2_writer(
+    output_path: Path, width: int, height: int, fps: int,
+) -> VideoWriterHandle:
+    """Open an OpenCV VideoWriter using mp4v (always available, no openh264 needed)."""
+    import cv2
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+    return VideoWriterHandle(kind="cv2", cv2_writer=writer)
 
 
 def create_video_writer(
@@ -344,19 +290,55 @@ def create_video_writer(
     codec: Codec = "h264",
     bitrate: str = "8M",
     prefer_hardware: bool = True,
-) -> FFmpegWriter | CV2Writer:
+) -> VideoWriterHandle:
     """
     Create a video writer with automatic encoder selection.
 
-    Prefers ffmpeg with hardware encoding when available,
-    falls back to cv2.VideoWriter.
+    Prefers ffmpeg (hw or sw H.264) when available,
+    falls back to cv2 with mp4v (no openh264 dependency).
     """
     info = detect_encoders()
 
     if prefer_hardware and info.ffmpeg_path:
         try:
-            return FFmpegWriter(output_path, width, height, fps, codec, bitrate)
+            return _open_ffmpeg_writer(output_path, width, height, fps, codec, bitrate)
         except Exception:
-            pass  # Fall through to cv2
+            pass
 
-    return CV2Writer(output_path, width, height, fps, codec)
+    return _open_cv2_writer(output_path, width, height, fps)
+
+
+def write_frame(handle: VideoWriterHandle, frame) -> bool:
+    """Write a BGR frame to the video writer. Returns True on success."""
+    if handle.kind == "ffmpeg":
+        if handle.process is None or handle.process.stdin is None:
+            return False
+        try:
+            data = frame.tobytes() if hasattr(frame, "tobytes") else bytes(frame)
+            handle.process.stdin.write(data)
+            handle.frame_count += 1
+            return True
+        except BrokenPipeError:
+            return False
+    else:
+        handle.cv2_writer.write(frame)
+        handle.frame_count += 1
+        return True
+
+
+def release_writer(handle: VideoWriterHandle):
+    """Close the video writer and free resources."""
+    if handle.kind == "ffmpeg":
+        if handle.process is not None:
+            try:
+                if handle.process.stdin:
+                    handle.process.stdin.close()
+                handle.process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                handle.process.kill()
+            finally:
+                handle.process = None
+    else:
+        if handle.cv2_writer is not None:
+            handle.cv2_writer.release()
+            handle.cv2_writer = None

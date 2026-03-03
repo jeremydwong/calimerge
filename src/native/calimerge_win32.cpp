@@ -14,6 +14,7 @@
  * - This preserves the camera's native timing while enabling cross-camera sync
  */
 
+#define _CRT_SECURE_NO_WARNINGS
 #include "calimerge_platform.h"
 
 #include <windows.h>
@@ -21,6 +22,7 @@
 #include <mfidl.h>
 #include <mfreadwrite.h>
 #include <mferror.h>
+#include <strmif.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -31,6 +33,7 @@
 #pragma comment(lib, "mf.lib")
 #pragma comment(lib, "mfuuid.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "strmiids.lib")
 
 /* ============================================================================
  * QPC Timestamp (global, thread-safe after first call)
@@ -205,22 +208,6 @@ static bool ring_buffer_get_closest_corrected(
 
     LeaveCriticalSection(&rb->cs);
     return true;
-}
-
-/* Get latest arrival timestamp (common clock domain) without copying frame */
-static uint64_t ring_buffer_get_latest_arrival(FrameRingBuffer *rb) {
-    EnterCriticalSection(&rb->cs);
-
-    if (rb->frame_count == 0) {
-        LeaveCriticalSection(&rb->cs);
-        return 0;
-    }
-
-    int idx = (rb->write_index - 1 + RING_BUFFER_SIZE) % RING_BUFFER_SIZE;
-    uint64_t ts = rb->frames[idx].arrival_ns;
-
-    LeaveCriticalSection(&rb->cs);
-    return ts;
 }
 
 /* Get latest camera PTS timestamp (camera's native clock) */
@@ -702,11 +689,24 @@ void cm_shutdown(void) {
  * ============================================================================ */
 
 /*
- * Helper: Find the best matching media type for a given resolution.
+ * Helper: Check if a pixel format GUID is one we can convert to BGR.
+ */
+static bool is_supported_pixel_format(const GUID *subtype) {
+    return IsEqualGUID(*subtype, MFVideoFormat_RGB32) ||
+           IsEqualGUID(*subtype, MFVideoFormat_NV12) ||
+           IsEqualGUID(*subtype, MFVideoFormat_YUY2);
+}
+
+/*
+ * Helper: Find the best matching media type for a given resolution and fps.
+ * If target_fps > 0, prefers types that match the fps.
  * Returns the index of the media type, or -1 if not found.
  */
-static int find_media_type_for_resolution(IMFSourceReader *reader, int target_w, int target_h, GUID *out_format) {
+static int find_best_media_type(IMFSourceReader *reader, int target_w, int target_h,
+                                int target_fps, GUID *out_format) {
     int best_index = -1;
+    bool best_has_fps_match = false;
+    int best_format_rank = 0;  /* 3=RGB32, 2=NV12, 1=YUY2 */
 
     for (DWORD i = 0; ; i++) {
         IMFMediaType *type = NULL;
@@ -720,17 +720,39 @@ static int find_media_type_for_resolution(IMFSourceReader *reader, int target_w,
             GUID subtype = {0};
             type->GetGUID(MF_MT_SUBTYPE, &subtype);
 
-            /* Prefer RGB32, then NV12, then YUY2 */
-            if (IsEqualGUID(subtype, MFVideoFormat_RGB32)) {
-                if (out_format) *out_format = subtype;
-                best_index = (int)i;
-                type->Release();
-                break;  /* Best possible */
-            } else if (IsEqualGUID(subtype, MFVideoFormat_NV12) ||
-                       IsEqualGUID(subtype, MFVideoFormat_YUY2)) {
-                if (best_index < 0) {
-                    if (out_format) *out_format = subtype;
+            int rank = 0;
+            if (IsEqualGUID(subtype, MFVideoFormat_RGB32)) rank = 3;
+            else if (IsEqualGUID(subtype, MFVideoFormat_NV12)) rank = 2;
+            else if (IsEqualGUID(subtype, MFVideoFormat_YUY2)) rank = 1;
+
+            if (rank > 0) {
+                /* Check FPS match */
+                bool fps_match = false;
+                if (target_fps > 0) {
+                    UINT32 num = 0, den = 0;
+                    MFGetAttributeRatio(type, MF_MT_FRAME_RATE, &num, &den);
+                    if (den > 0) {
+                        int type_fps = (int)(num / den);
+                        fps_match = (type_fps == target_fps);
+                    }
+                }
+
+                /* Pick this type if:
+                 *   - we have nothing yet, or
+                 *   - it matches fps and current best doesn't, or
+                 *   - same fps-match status but better pixel format rank */
+                bool dominated = false;
+                if (best_index >= 0) {
+                    if (best_has_fps_match && !fps_match) dominated = true;
+                    if (!dominated && !fps_match && !best_has_fps_match && rank <= best_format_rank) dominated = true;
+                    if (!dominated && fps_match == best_has_fps_match && rank <= best_format_rank) dominated = true;
+                }
+
+                if (!dominated) {
                     best_index = (int)i;
+                    best_has_fps_match = fps_match;
+                    best_format_rank = rank;
+                    if (out_format) *out_format = subtype;
                 }
             }
         }
@@ -803,31 +825,51 @@ int cm_enumerate_cameras(CM_Camera *out_cameras, int max_cameras) {
         cam->enabled = true;
         cam->platform_handle = NULL;
 
-        /* Probe supported resolutions by temporarily activating the source */
+        /* Enumerate supported formats by temporarily activating the source */
         IMFMediaSource *source = NULL;
         hr = devices[d]->ActivateObject(__uuidof(IMFMediaSource), (void **)&source);
         if (SUCCEEDED(hr) && source) {
             IMFSourceReader *reader = NULL;
             hr = MFCreateSourceReaderFromMediaSource(source, NULL, &reader);
             if (SUCCEEDED(hr) && reader) {
-                static const CM_Resolution test_resolutions[] = {
-                    {640, 480}, {1280, 720}, {1920, 1080}
-                };
+                cam->supported_format_count = 0;
 
-                cam->supported_resolution_count = 0;
+                for (DWORD mi = 0; ; mi++) {
+                    IMFMediaType *type = NULL;
+                    hr = reader->GetNativeMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, mi, &type);
+                    if (FAILED(hr)) break;
 
-                for (int r = 0; r < CM_RES_COUNT; r++) {
-                    GUID dummy_format;
-                    if (find_media_type_for_resolution(reader,
-                            test_resolutions[r].width,
-                            test_resolutions[r].height,
-                            &dummy_format) >= 0) {
-                        cam->supported_resolutions[cam->supported_resolution_count].width =
-                            test_resolutions[r].width;
-                        cam->supported_resolutions[cam->supported_resolution_count].height =
-                            test_resolutions[r].height;
-                        cam->supported_resolution_count++;
+                    GUID subtype = {0};
+                    type->GetGUID(MF_MT_SUBTYPE, &subtype);
+
+                    if (is_supported_pixel_format(&subtype)) {
+                        UINT32 w = 0, h = 0;
+                        MFGetAttributeSize(type, MF_MT_FRAME_SIZE, &w, &h);
+
+                        UINT32 fps_num = 0, fps_den = 0;
+                        MFGetAttributeRatio(type, MF_MT_FRAME_RATE, &fps_num, &fps_den);
+                        int fps = (fps_den > 0) ? (int)(fps_num / fps_den) : 0;
+
+                        /* Deduplicate (w, h, fps) */
+                        bool already_have = false;
+                        for (int k = 0; k < cam->supported_format_count; k++) {
+                            if (cam->supported_formats[k].width == (int)w &&
+                                cam->supported_formats[k].height == (int)h &&
+                                cam->supported_formats[k].fps == fps) {
+                                already_have = true;
+                                break;
+                            }
+                        }
+
+                        if (!already_have && cam->supported_format_count < CM_MAX_FORMATS) {
+                            cam->supported_formats[cam->supported_format_count].width = (int)w;
+                            cam->supported_formats[cam->supported_format_count].height = (int)h;
+                            cam->supported_formats[cam->supported_format_count].fps = fps;
+                            cam->supported_format_count++;
+                        }
                     }
+
+                    type->Release();
                 }
 
                 reader->Release();
@@ -837,11 +879,19 @@ int cm_enumerate_cameras(CM_Camera *out_cameras, int max_cameras) {
             source->Release();
         }
 
-        /* Default to best supported resolution */
-        if (cam->supported_resolution_count > 0) {
-            int best = cam->supported_resolution_count - 1;
-            cam->width = cam->supported_resolutions[best].width;
-            cam->height = cam->supported_resolutions[best].height;
+        /* Default to best supported resolution (highest pixel count) */
+        if (cam->supported_format_count > 0) {
+            int best = 0;
+            int best_pixels = 0;
+            for (int k = 0; k < cam->supported_format_count; k++) {
+                int pixels = cam->supported_formats[k].width * cam->supported_formats[k].height;
+                if (pixels > best_pixels) {
+                    best_pixels = pixels;
+                    best = k;
+                }
+            }
+            cam->width = cam->supported_formats[best].width;
+            cam->height = cam->supported_formats[best].height;
         } else {
             cam->width = 640;
             cam->height = 480;
@@ -972,11 +1022,11 @@ int cm_open_camera(CM_Camera *camera) {
         return CM_ERROR_OPEN_FAILED;
     }
 
-    /* Find and set the best media type for requested resolution */
+    /* Find and set the best media type for requested resolution + fps */
     GUID best_format = MFVideoFormat_RGB32;
-    int type_index = find_media_type_for_resolution(handle->source_reader,
-                                                      camera->width, camera->height,
-                                                      &best_format);
+    int type_index = find_best_media_type(handle->source_reader,
+                                           camera->width, camera->height,
+                                           camera->fps, &best_format);
 
     if (type_index >= 0) {
         IMFMediaType *type = NULL;
@@ -1078,10 +1128,11 @@ void cm_close_camera(CM_Camera *camera) {
     camera->platform_handle = NULL;
 }
 
-int cm_set_resolution(CM_Camera *camera, int width, int height) {
+int cm_set_format(CM_Camera *camera, int width, int height, int fps) {
     if (!camera) return CM_ERROR_INVALID_PARAM;
     camera->width = width;
     camera->height = height;
+    camera->fps = fps;
     if (camera->platform_handle) {
         cm_close_camera(camera);
         return cm_open_camera(camera);
@@ -1089,22 +1140,45 @@ int cm_set_resolution(CM_Camera *camera, int width, int height) {
     return CM_OK;
 }
 
+int cm_set_resolution(CM_Camera *camera, int width, int height) {
+    if (!camera) return CM_ERROR_INVALID_PARAM;
+    return cm_set_format(camera, width, height, camera->fps);
+}
+
 int cm_set_fps(CM_Camera *camera, int fps) {
     if (!camera) return CM_ERROR_INVALID_PARAM;
-    camera->fps = fps;
-
-    if (camera->platform_handle) {
-        /* Need to close and reopen to change FPS with MF source reader */
-        cm_close_camera(camera);
-        return cm_open_camera(camera);
-    }
-    return CM_OK;
+    return cm_set_format(camera, camera->width, camera->height, fps);
 }
 
 int cm_set_exposure(CM_Camera *camera, int exposure) {
     if (!camera) return CM_ERROR_INVALID_PARAM;
     camera->exposure = exposure;
-    /* Note: Manual exposure via IAMVideoProcAmp not implemented yet */
+
+    if (!camera->platform_handle) return CM_OK;
+
+    Win32CameraHandle *handle = (Win32CameraHandle *)camera->platform_handle;
+    if (!handle->media_source) return CM_OK;
+
+    IAMVideoProcAmp *proc_amp = NULL;
+    HRESULT hr = handle->media_source->QueryInterface(IID_IAMVideoProcAmp,
+                                                       (void **)&proc_amp);
+    if (SUCCEEDED(hr) && proc_amp) {
+        /* Disable auto-exposure, set manual value */
+        hr = proc_amp->Set(VideoProcAmp_Exposure, (long)exposure,
+                           VideoProcAmp_Flags_Manual);
+        if (SUCCEEDED(hr)) {
+            printf("[calimerge] Camera %d: exposure set to %d\n",
+                   camera->device_index, exposure);
+        } else {
+            printf("[calimerge] Camera %d: exposure set failed (hr=0x%08lx)\n",
+                   camera->device_index, (unsigned long)hr);
+        }
+        proc_amp->Release();
+    } else {
+        printf("[calimerge] Camera %d: IAMVideoProcAmp not supported\n",
+               camera->device_index);
+    }
+
     return CM_OK;
 }
 

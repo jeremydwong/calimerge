@@ -44,7 +44,7 @@ class VideoRecorderWorker(QThread):
     """Worker thread for recording synchronized video."""
     log_message = Signal(str)
     progress_update = Signal(int, int)  # current_frame, total_frames
-    recording_finished = Signal(dict)  # stats
+    recording_finished = Signal(object)  # stats dict
 
     def __init__(self, cameras: list, output_path: Path, duration: float, fps: int):
         super().__init__()

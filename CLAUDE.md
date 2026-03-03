@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Development Platforms
+
+This project is developed on **both Windows and macOS**. Platform-specific instructions are noted below.
+
 ## Environment Setup for Claude
 
 **IMPORTANT**: uv is installed at `~/.local/bin/uv`. Add to PATH before running commands:
@@ -17,6 +21,31 @@ Or use the full path directly:
 ~/.local/bin/uv run calimerge gui
 ~/.local/bin/uv run python3 -c "from calimerge import types; print('ok')"
 ```
+
+### Windows Environment Gotcha (Anaconda)
+
+On Windows, if Anaconda is installed, the `VIRTUAL_ENV` environment variable may be set to the conda base path (e.g. `C:\Users\<user>\anaconda3`). This interferes with `uv run` — it prints a warning and uses the wrong Python interpreter, causing missing module errors (cv2, etc.).
+
+**Fix**: Unset `VIRTUAL_ENV` before running `uv` commands:
+```bash
+unset VIRTUAL_ENV
+~/.local/bin/uv run pytest ...
+```
+
+Or prefix each command:
+```bash
+VIRTUAL_ENV= ~/.local/bin/uv run pytest ...
+```
+
+### Platform Differences
+
+| | macOS | Windows |
+|---|---|---|
+| Python binary | `python3` | `python` |
+| Native build | `cd src/native && ./build_macos.sh release` | `cd src/native && cmd //c build_win32.bat release` |
+| Camera backend | AVFoundation (`calimerge_macos.mm`) | Media Foundation (`calimerge_win32.cpp`) |
+| Exposure API | AVCaptureDevice exposureDuration | IAMVideoProcAmp (log2 seconds) |
+| Shell | zsh/bash | Git Bash (use Unix syntax, not Windows) |
 
 ## Repository Overview
 
@@ -52,6 +81,31 @@ cd src/native && ./build_macos.sh release && cd ../..
 
 # Test imports
 ~/.local/bin/uv run python3 -c "from calimerge.types import CameraConfig; print('ok')"
+```
+
+### Windows Build Tools
+
+MSVC Build Tools are installed at:
+```
+C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\
+```
+
+To set up the compiler environment from bash (required before building native code):
+```bash
+# Initialize MSVC environment (sets up cl.exe, link.exe, etc.)
+eval "$('/c/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/Common7/Tools/VsDevCmd.bat' > /dev/null 2>&1 && set)" 2>/dev/null
+# Or from a Windows cmd prompt:
+# "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat"
+```
+
+Build the native Windows DLL:
+```bash
+cd src/native && cmd //c build_win32.bat release && cd ../..
+```
+
+File search utility: **Everything** (voidtools) is installed with the `es.exe` CLI at:
+```
+C:\Program Files (x86)\Everything\es.exe
 ```
 
 ### Native C++ Tests (after building)
@@ -243,14 +297,18 @@ get_projection_matrices(cameras) -> dict[int, np.ndarray]   # All projection mat
 ### C Structs (calimerge_platform.h)
 
 ```c
+CM_Format {
+    int width, height, fps;         // Unique (resolution, frame-rate) tuple
+};
+
 CM_Camera {
     char serial_number[64];
     char display_name[128];
     int  device_index;
     int  width, height, fps, rotation, exposure;
     bool enabled;
-    CM_Resolution supported_resolutions[3];
-    int supported_resolution_count;
+    CM_Format supported_formats[32]; // All supported (w, h, fps) tuples
+    int supported_format_count;
     void *platform_handle;          // Opaque — do not touch from Python
 };
 

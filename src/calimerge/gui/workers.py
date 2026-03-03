@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 class CameraEnumerateWorker(QThread):
     """Enumerate available cameras."""
 
-    cameras_found = Signal(list)  # list[CameraInfo]
+    cameras_found = Signal(object)  # list[CameraInfo]
     error = Signal(str)
 
     def run(self):
@@ -84,7 +84,7 @@ class RecordingWorker(QThread):
     log_message = Signal(str)
     progress_update = Signal(int, int)  # current, total
     frame_captured = Signal(int, object)  # port, np.ndarray (for preview/FPS)
-    recording_finished = Signal(dict)  # stats
+    recording_finished = Signal(object)  # stats dict
     error = Signal(str)
 
     def __init__(
@@ -106,7 +106,7 @@ class RecordingWorker(QThread):
     def run(self):
         try:
             from ..camera_binding import capture_synced
-            from .video_utils import create_video_writer, detect_encoders
+            from .video_utils import create_video_writer, write_frame, release_writer, detect_encoders
 
             target_frames = int(self.duration * self.fps)
             frame_interval = 1.0 / self.fps
@@ -118,11 +118,13 @@ class RecordingWorker(QThread):
             # Log encoder info
             info = detect_encoders()
             if info.ffmpeg_path and info.has_h264_hw:
-                self.log_message.emit(f"Using hardware encoder ({self.codec})")
+                self.log_message.emit(f"Using {info.h264_hw_encoder} hardware encoder")
+            elif info.ffmpeg_path and info.has_libx264:
+                self.log_message.emit(f"Using libx264 software encoder")
             elif info.ffmpeg_path:
-                self.log_message.emit(f"Using ffmpeg software encoder ({self.codec})")
+                self.log_message.emit(f"Using ffmpeg mpeg4 encoder")
             else:
-                self.log_message.emit("Using OpenCV fallback encoder")
+                self.log_message.emit("Using OpenCV mp4v fallback encoder")
 
             start_time = time.perf_counter()
             sync_index = 0
@@ -155,7 +157,7 @@ class RecordingWorker(QThread):
                             f"  Camera {cam_idx}: {frame.width}x{frame.height}"
                         )
 
-                    writers[cam_idx].write(frame.pixels)
+                    write_frame(writers[cam_idx], frame.pixels)
                     frame_counts[cam_idx] += 1
 
                     # Emit for preview/FPS tracking
@@ -181,7 +183,7 @@ class RecordingWorker(QThread):
 
             # Close writers
             for writer in writers.values():
-                writer.release()
+                release_writer(writer)
 
             # Save frame_time_history.csv
             self._save_frame_times(frame_times)
@@ -326,7 +328,7 @@ class ExtrinsicCalibrationWorker(QThread):
 
     log_message = Signal(str)
     progress_update = Signal(float)  # 0.0 to 1.0
-    calibration_finished = Signal(dict, float)  # cameras, error
+    calibration_finished = Signal(object, float)  # cameras dict, error
     error = Signal(str)
 
     def __init__(
@@ -373,24 +375,45 @@ class ProcessingWorker(QThread):
         cameras: dict[int, "CalibratedCamera"],
         output_path: Path,
         tracker_backend: str = "charuco",
+        frame_time_csv: Path | None = None,
+        device_name: str = "auto",
+        max_persons: int = 2,
+        batch_size: int = 8,
+        skip_sync_indices: int = 1,
     ):
         super().__init__()
         self.video_paths = video_paths
         self.cameras = cameras
         self.output_path = output_path
         self.tracker_backend = tracker_backend
+        self.frame_time_csv = frame_time_csv
+        self.device_name = device_name
+        self.max_persons = max_persons
+        self.batch_size = batch_size
+        self.skip_sync_indices = skip_sync_indices
         self.running = True
 
     def run(self):
         try:
-            # Placeholder - full implementation would:
-            # 1. Run 2D tracking on all videos
-            # 2. Sync points across cameras
-            # 3. Triangulate to 3D
-            # 4. Export results
+            from ..tracking.pipeline import run_pose_tracking
 
-            self.log_message.emit("Processing not yet implemented")
-            self.error.emit("Processing not yet implemented")
+            result = run_pose_tracking(
+                cameras=self.cameras,
+                video_paths=self.video_paths,
+                frame_time_csv=self.frame_time_csv,
+                output_path=self.output_path,
+                device_name=self.device_name,
+                skip_sync_indices=self.skip_sync_indices,
+                max_persons=self.max_persons,
+                batch_size=self.batch_size,
+                progress_callback=lambda step, frac: self.progress_update.emit(step, frac),
+                log_callback=lambda msg: self.log_message.emit(msg),
+            )
+
+            if result is not None:
+                self.processing_finished.emit(result)
+            else:
+                self.error.emit("Processing pipeline returned no results")
 
         except Exception as e:
             self.error.emit(str(e))

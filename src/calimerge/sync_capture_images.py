@@ -53,7 +53,7 @@ class CaptureWorker(QThread):
     """Worker thread for capturing synchronized frames."""
     log_message = Signal(str)
     capture_complete = Signal(int, float)  # capture_idx, spread_ms
-    finished_all = Signal(list)  # stats list
+    finished_all = Signal(object)  # stats list
 
     def __init__(self, cameras: list, num_captures: int, output_path: Path):
         super().__init__()

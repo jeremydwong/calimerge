@@ -296,9 +296,9 @@ class CamerasTab(QWidget):
         camera_layout = QVBoxLayout(camera_group)
 
         self.camera_table = QTableWidget()
-        self.camera_table.setColumnCount(5)
+        self.camera_table.setColumnCount(6)
         self.camera_table.setHorizontalHeaderLabels(
-            ["", "Port", "Name", "Resolution", "Enabled"]
+            ["", "Port", "Name", "Resolution", "Exposure", "Enabled"]
         )
         header = self.camera_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
@@ -309,7 +309,9 @@ class CamerasTab(QWidget):
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
         header.resizeSection(3, 100)  # Resolution
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
-        header.resizeSection(4, 60)  # Enabled
+        header.resizeSection(4, 80)  # Exposure
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
+        header.resizeSection(5, 60)  # Enabled
         self.camera_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         camera_layout.addWidget(self.camera_table)
 
@@ -414,8 +416,9 @@ class CamerasTab(QWidget):
             port_item.setFlags(port_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.camera_table.setItem(row, 1, port_item)
 
-            # Name
-            name_item = QTableWidgetItem(info.display_name)
+            # Name (brand + serial for unique identification)
+            name_text = f"{info.display_name} [{info.serial_number}]"
+            name_item = QTableWidgetItem(name_text)
             name_item.setFlags(name_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.camera_table.setItem(row, 2, name_item)
 
@@ -424,21 +427,30 @@ class CamerasTab(QWidget):
             resolutions = info.supported_resolutions
             for w, h in resolutions:
                 res_combo.addItem(f"{w}x{h}", (w, h))
-            # Select current or 1280x720 fallback
-            current_res = (info.width, info.height)
+            # Select 640x480 by default (fast preview), fallback to current
             selected_idx = 0
             for idx in range(res_combo.count()):
                 res = res_combo.itemData(idx)
-                if res == current_res:
+                if res == (640, 480):
                     selected_idx = idx
                     break
-                elif res == (1280, 720):
+                elif res == (info.width, info.height):
                     selected_idx = idx
             res_combo.setCurrentIndex(selected_idx)
             res_combo.currentIndexChanged.connect(
                 lambda idx, p=port, cb=res_combo: self._on_resolution_changed(p, cb)
             )
             self.camera_table.setCellWidget(row, 3, res_combo)
+
+            # Exposure spinbox
+            exposure_spin = QSpinBox()
+            exposure_spin.setRange(-13, 0)
+            exposure_spin.setValue(info.exposure)
+            exposure_spin.setToolTip("Exposure (log2 seconds, e.g. -4 = 1/16s)")
+            exposure_spin.valueChanged.connect(
+                lambda val, p=port: self._on_exposure_changed(p, val)
+            )
+            self.camera_table.setCellWidget(row, 4, exposure_spin)
 
             # Enabled checkbox
             checkbox = QCheckBox()
@@ -451,7 +463,7 @@ class CamerasTab(QWidget):
             checkbox_layout.addWidget(checkbox)
             checkbox_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
             checkbox_layout.setContentsMargins(0, 0, 0, 0)
-            self.camera_table.setCellWidget(row, 4, checkbox_widget)
+            self.camera_table.setCellWidget(row, 5, checkbox_widget)
 
         self._updating_table = False
 
@@ -479,6 +491,22 @@ class CamerasTab(QWidget):
         else:
             self.status_message.emit(f"Port {port}: resolution set to {res[0]}x{res[1]} (will apply on preview)")
 
+    def _on_exposure_changed(self, port: int, value: int):
+        if self._updating_table:
+            return
+
+        cameras = self.state_manager.state.cameras
+        cam_state = cameras.get(port)
+        if cam_state and cam_state.is_open:
+            try:
+                from ...camera_binding import set_exposure
+                set_exposure(cam_state.info, value)
+                self.status_message.emit(f"Port {port}: exposure set to {value}")
+            except Exception as e:
+                self.status_message.emit(f"Port {port}: exposure change failed: {e}")
+        else:
+            self.status_message.emit(f"Port {port}: exposure set to {value} (will apply on preview)")
+
     def _browse_output(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Output Folder")
         if folder:
@@ -499,9 +527,19 @@ class CamerasTab(QWidget):
                         return res
         return (1280, 720)
 
+    def _get_exposure_for_port(self, port: int) -> int:
+        """Get selected exposure from table for a port."""
+        cameras = self.state_manager.state.cameras
+        for row, (p, _) in enumerate(sorted(cameras.items())):
+            if p == port:
+                exp_widget = self.camera_table.cellWidget(row, 4)
+                if exp_widget and isinstance(exp_widget, QSpinBox):
+                    return exp_widget.value()
+        return -4
+
     def _open_cameras(self) -> dict[int, str]:
         """Open enabled cameras. Returns camera_info dict."""
-        from ...camera_binding import open_camera, set_resolution
+        from ...camera_binding import open_camera, set_resolution, set_exposure
 
         cameras = self.state_manager.state.cameras
         self.opened_cameras = []
@@ -517,6 +555,10 @@ class CamerasTab(QWidget):
                 # Apply selected resolution
                 w, h = self._get_resolution_for_port(port)
                 set_resolution(cam, w, h)
+
+                # Apply selected exposure
+                exposure = self._get_exposure_for_port(port)
+                set_exposure(cam, exposure)
 
                 self.opened_cameras.append(cam)
                 camera_info[port] = cam.display_name

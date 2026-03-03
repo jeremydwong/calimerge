@@ -1,4 +1,5 @@
 
+import os
 import torch
 import numpy as np
 import cv2
@@ -6,17 +7,24 @@ from PIL import Image
 from transformers import (
     AutoProcessor,
     RTDetrForObjectDetection,
-    VitPoseForPoseEstimation, 
+    VitPoseForPoseEstimation,
     AutoModelForObjectDetection,
     AutoImageProcessor
 )
 import time
 from tqdm import tqdm
-import supervision as sv # Added for visualization types if needed later
 import pickle # for saving/loading models / results
-      
-LOCAL_SP_DIR    = "/Users/jeremy/Git/KeypointInference/models/synthpose/checkpoints"
-LOCAL_DET_DIR   = "/Users/jeremy/Git/KeypointInference/models/yolov10s/"
+
+# Model directories: auto-detect relative to posetrack package root
+_POSETRACK_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+MODELS_DIR = os.path.join(_POSETRACK_ROOT, "models")
+LOCAL_DET_DIR = os.path.join(MODELS_DIR, "yolo")
+LOCAL_SP_DIR = os.path.join(MODELS_DIR, "vitpose")
+
+# Model identifiers
+YOLO_FILENAME = "yolov10s.pt"
+YOLO_DOWNLOAD_URL = "https://github.com/THU-MIG/yolov10/releases/download/v1.1/yolov10s.pt"
+VITPOSE_MODEL_ID = "usyd-community/vitpose-base-simple"
 
 # Define the markers directly here. we could rewrite these names, since they become the keys in the dictionary.
 class SynthPoseMarkers:
@@ -38,50 +46,55 @@ class SynthPoseMarkers:
     num_markers = len(markers) # Should be 52
 
 def load_models(detect_path=LOCAL_DET_DIR, pose_model_path=LOCAL_SP_DIR, device="cpu"):
-    """Loads the detection and pose estimation models."""
+    """Loads the detection and pose estimation models.
+
+    Models are auto-downloaded from HuggingFace on first use and saved
+    locally in the specified directories for subsequent runs.
+    """
     print(f"Loading models to device: {device}")
 
-    # --- Person Detection Model ---
-    # print("Loading detection model...")
-    # if detect_path and detect_path != "PekingU/rtdetr_r50vd_coco_o365":
-    #     print(f"Loading local detector from: {detect_path}")
-    #     person_image_processor = AutoProcessor.from_pretrained(detect_path, local_files_only=True)
-    #     person_model = RTDetrForObjectDetection.from_pretrained(detect_path, local_files_only=True, device_map=device)
-    # else:
-    #     print("Loading detector from Hugging Face: PekingU/rtdetr_r50vd_coco_o365")
-    #     # Ensure use_fast=True is compatible or remove if causing issues
-    #     person_image_processor = AutoProcessor.from_pretrained("PekingU/rtdetr_r50vd_coco_o365")
-    #     person_model = RTDetrForObjectDetection.from_pretrained("PekingU/rtdetr_r50vd_coco_o365", device_map=device)
-
     from ultralytics import YOLO
-    from huggingface_hub import hf_hub_download
 
-    # Define where you want to store the model
-    
-    os.makedirs(detect_path,exist_ok=True)
-    model_id = "jameslahm/yolov10s.pt"
-    filename = model_id.split('/')[-1]
-    model_path = os.path.join(detect_path,filename)
+    # --- Person Detection: YOLO v10s ---
+    os.makedirs(detect_path, exist_ok=True)
+    model_path = os.path.join(detect_path, YOLO_FILENAME)
 
-    # Check if model already exists locally.
-    # note: ultralytics packages processor and model together. 
     if not os.path.exists(model_path):
-        # Download only if it doesn't exist
-        print("Downloading model...")
-        model_path = hf_hub_download(
-        repo_id=model_id,
-        filename=filename,
-        cache_dir=detect_path,
-        local_dir_use_symlinks=False)
-        
-    person_model = YOLO(model_path)    
+        print(f"Downloading YOLO model from: {YOLO_DOWNLOAD_URL}")
+        import urllib.request
+        urllib.request.urlretrieve(YOLO_DOWNLOAD_URL, model_path)
+        print(f"YOLO model saved to: {model_path}")
+    else:
+        print(f"Loading YOLO from: {model_path}")
+
+    person_model = YOLO(model_path)
     person_model.to(device)
 
-    # --- Pose Estimation Model ---
-    print(f"Loading pose estimation model from: {pose_model_path}")
-    # Ensure use_fast=True is compatible or remove if causing issues
-    pose_image_processor = AutoProcessor.from_pretrained(pose_model_path, local_files_only=True)
-    pose_model = VitPoseForPoseEstimation.from_pretrained(pose_model_path, local_files_only=True, device_map=device)
+    # --- Pose Estimation: VitPose-Base (SynthPose 52 keypoints) ---
+    config_file = os.path.join(pose_model_path, "config.json")
+    if os.path.exists(config_file):
+        # Load from local saved copy
+        print(f"Loading VitPose from local: {pose_model_path}")
+        pose_image_processor = AutoProcessor.from_pretrained(
+            pose_model_path, local_files_only=True
+        )
+        pose_model = VitPoseForPoseEstimation.from_pretrained(
+            pose_model_path, local_files_only=True
+        )
+    else:
+        # Auto-download from HuggingFace and save locally
+        print(f"Downloading VitPose from HuggingFace: {VITPOSE_MODEL_ID}")
+        pose_image_processor = AutoProcessor.from_pretrained(VITPOSE_MODEL_ID)
+        pose_model = VitPoseForPoseEstimation.from_pretrained(VITPOSE_MODEL_ID)
+        # Save locally for future runs
+        os.makedirs(pose_model_path, exist_ok=True)
+        pose_image_processor.save_pretrained(pose_model_path)
+        pose_model.save_pretrained(pose_model_path)
+        print(f"VitPose saved to: {pose_model_path}")
+
+    # Move pose model to device
+    if device != "cpu":
+        pose_model = pose_model.to(device)
 
     print("Models loaded successfully.")
     return None, person_model, pose_image_processor, pose_model
@@ -151,7 +164,6 @@ def detect_persons_rtdetr(image, person_image_processor, person_model, device, c
 
 import cv2 # Make sure cv2 is imported
 import numpy as np # Make sure numpy is imported
-import os # For creating directories
 
 def estimate_poses(
     image,

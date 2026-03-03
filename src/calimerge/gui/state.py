@@ -122,7 +122,7 @@ class StateManager(QObject):
 
     # State change signals
     state_changed = Signal(AppState)
-    cameras_changed = Signal(dict)  # dict[int, CameraState]
+    cameras_changed = Signal(object)  # dict[int, CameraState]
     recording_changed = Signal(RecordingState)
     calibration_changed = Signal(CalibrationState)
     processing_changed = Signal(ProcessingState)

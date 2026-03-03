@@ -1,63 +1,37 @@
 @echo off
-::
 :: build_win32.bat - Unity build for calimerge camera module (Windows)
 ::
-:: Usage: build_win32.bat [debug|release]
-::
-:: Requires: Visual Studio Developer Command Prompt (or vcvarsall.bat)
-::
+:: Usage: build_win32.bat [debug]
 
-setlocal
+echo Build script starting...
+call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat" -arch=amd64
 
-cd /d "%~dp0"
+pushd %~dp0
 
-set BUILD_TYPE=%1
-if "%BUILD_TYPE%"=="" set BUILD_TYPE=release
-
-echo Building calimerge for Windows (%BUILD_TYPE%)...
-
-if "%BUILD_TYPE%"=="debug" (
-    set CFLAGS=/Zi /Od /DDEBUG /W3
+if "%1"=="debug" (
+    set CFLAGS=-W4 -WX -wd4100 -wd4201 -wd4189 /Zi /Od /DDEBUG
 ) else (
-    set CFLAGS=/O2 /DNDEBUG /W3
+    set CFLAGS=-W4 -WX -wd4100 -wd4201 -wd4189 /O2 /DNDEBUG
 )
 
-:: Check that cl.exe is available
-where cl >nul 2>&1
-if errorlevel 1 (
-    echo Error: cl.exe not found. Run from a Visual Studio Developer Command Prompt.
-    echo   Or run: vcvarsall.bat x64
-    exit /b 1
-)
-
-:: Build shared library (DLL)
+:: DLL (unity build - single translation unit)
 cl %CFLAGS% /EHsc /LD /Fe:calimerge.dll calimerge_win32.cpp ^
-    mfplat.lib mfreadwrite.lib mf.lib mfuuid.lib ole32.lib ^
-    /link /DLL
+    mfplat.lib mfreadwrite.lib mf.lib mfuuid.lib ole32.lib strmiids.lib ^
+    /link /DLL /DEF:calimerge.def
 
 if errorlevel 1 (
-    echo Build FAILED.
+    echo BUILD FAILED
+    popd
     exit /b 1
 )
 
 echo.
-echo Built: %~dp0calimerge.dll
-
-:: Show exported symbols
-echo.
-echo Exported symbols:
 dumpbin /exports calimerge.dll 2>nul | findstr "cm_"
 
-:: Build test executables
-echo.
-echo Building test executables...
-
+:: Test programs
 cl %CFLAGS% /Fe:test_enumerate.exe test_enumerate.c /link calimerge.lib
 cl %CFLAGS% /Fe:test_capture.exe test_capture.c /link calimerge.lib
 cl %CFLAGS% /Fe:test_multi.exe test_multi.c /link calimerge.lib
 cl %CFLAGS% /Fe:test_sync_log.exe test_sync_log.c /link calimerge.lib
 
-echo.
-echo Done.
-
-endlocal
+popd

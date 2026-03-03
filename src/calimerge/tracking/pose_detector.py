@@ -2,21 +2,32 @@
 Person detection and pose estimation.
 
 Uses YOLO v10s for person detection and VitPose-Base (SynthPose) for
-52-keypoint pose estimation. Models are auto-downloaded from HuggingFace.
+52-keypoint pose estimation. Models are auto-downloaded from HuggingFace
+and saved to the models/ directory at the project root.
 
 Adapted from posetrack/pose_detector.py.
 """
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 import numpy as np
 import torch
 from PIL import Image
 
 
-# HuggingFace model identifiers
-YOLO_MODEL_ID = "jameslahm/yolov10s.pt"
+# Model identifiers
+YOLO_FILENAME = "yolov10s.pt"
+YOLO_DOWNLOAD_URL = "https://github.com/THU-MIG/yolov10/releases/download/v1.1/yolov10s.pt"
 VITPOSE_MODEL_ID = "usyd-community/vitpose-base-simple"
+
+# Model directories: project_root/models/
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+MODELS_DIR = _PROJECT_ROOT / "models"
+YOLO_DIR = MODELS_DIR / "yolo"
+VITPOSE_DIR = MODELS_DIR / "vitpose"
 
 
 def setup_device(device_name: str = "auto") -> str:
@@ -46,7 +57,7 @@ def load_models(
     Load person detection and pose estimation models.
 
     Models are auto-downloaded from HuggingFace Hub on first use
-    and cached locally for subsequent runs.
+    and saved to the models/ directory for subsequent runs.
 
     Returns:
         (person_model, pose_processor, pose_model)
@@ -57,26 +68,47 @@ def load_models(
 
     log(f"Loading models to device: {device}")
 
-    # --- Person Detection: YOLO v10s ---
     from ultralytics import YOLO
-    from huggingface_hub import hf_hub_download
+    from transformers import AutoProcessor, VitPoseForPoseEstimation
 
-    log("Loading YOLO person detection model...")
-    model_filename = YOLO_MODEL_ID.split("/")[-1]
-    model_path = hf_hub_download(repo_id=YOLO_MODEL_ID, filename=model_filename)
-    person_model = YOLO(model_path)
+    # --- Person Detection: YOLO v10s ---
+    YOLO_DIR.mkdir(parents=True, exist_ok=True)
+    model_path = YOLO_DIR / YOLO_FILENAME
+
+    if model_path.exists():
+        log(f"Loading YOLO from: {model_path}")
+    else:
+        log(f"Downloading YOLO from: {YOLO_DOWNLOAD_URL}")
+        import urllib.request
+        urllib.request.urlretrieve(YOLO_DOWNLOAD_URL, str(model_path))
+        log(f"YOLO model saved to: {model_path}")
+
+    person_model = YOLO(str(model_path))
     person_model.to(device)
 
     # --- Pose Estimation: VitPose-Base (SynthPose) ---
-    from transformers import AutoProcessor, VitPoseForPoseEstimation
+    config_file = VITPOSE_DIR / "config.json"
 
-    log("Loading VitPose pose estimation model...")
-    pose_processor = AutoProcessor.from_pretrained(VITPOSE_MODEL_ID)
-    pose_model = VitPoseForPoseEstimation.from_pretrained(
-        VITPOSE_MODEL_ID, device_map=device
-    )
+    if config_file.exists():
+        log(f"Loading VitPose from local: {VITPOSE_DIR}")
+        pose_processor = AutoProcessor.from_pretrained(
+            str(VITPOSE_DIR), local_files_only=True
+        )
+        pose_model = VitPoseForPoseEstimation.from_pretrained(
+            str(VITPOSE_DIR), local_files_only=True
+        )
+    else:
+        log(f"Downloading VitPose from HuggingFace: {VITPOSE_MODEL_ID}")
+        pose_processor = AutoProcessor.from_pretrained(VITPOSE_MODEL_ID)
+        pose_model = VitPoseForPoseEstimation.from_pretrained(VITPOSE_MODEL_ID)
+        VITPOSE_DIR.mkdir(parents=True, exist_ok=True)
+        pose_processor.save_pretrained(str(VITPOSE_DIR))
+        pose_model.save_pretrained(str(VITPOSE_DIR))
+        log(f"VitPose saved to: {VITPOSE_DIR}")
 
-    # Set to eval mode
+    # Move to device and set eval mode
+    if device != "cpu":
+        pose_model = pose_model.to(device)
     person_model.eval()
     pose_model.eval()
 

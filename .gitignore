@@ -79,3 +79,6 @@ poetry.lock
 *.pkl
 *.mp4
 *.avi
+
+# ML model weights (auto-downloaded from HuggingFace)
+models/

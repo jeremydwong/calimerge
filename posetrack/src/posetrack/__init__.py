@@ -7,7 +7,8 @@ from .pose_detector import (
     estimate_poses,
     detect_persons_batch,
     estimate_poses_batch,
-    LOCAL_SP_DIR,  # Default path for pose model
+    MODELS_DIR,
+    LOCAL_SP_DIR,
     LOCAL_DET_DIR)
 
 from .cs_parse import (
