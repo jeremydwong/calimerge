@@ -38,29 +38,23 @@ void pt_track_init(PT_TrackState *state);
 /*
  * Generate 3D candidates from cross-view groups.
  *
- * For each group, triangulates all keypoints using views from the group
- * and computes the 3D center of mass.
+ * For each group, generates ALL view subsets (combinations of 2..N views)
+ * and triangulates each subset independently.  This matches the Python
+ * generate_3d_candidates_from_groups() which uses itertools.combinations.
  *
- * Algorithm (from tracker.py:generate_3d_candidates_from_groups):
- *   For each group:
- *     1. Collect all detection pointers and camera indices from group members
- *     2. Call pt_triangulate_person() to triangulate all keypoints
- *     3. If COM is valid, output as a candidate
+ * Each group produces a PT_CandidateGroup with up to PT_MAX_VIEW_SUBSETS
+ * candidates (one per view combination).  The tracker then selects the
+ * candidate whose view set matches the track's last views.
  *
- * The Python version tries all view subsets (combinations of 2..N views) and
- * picks the best. For the C version we use all views in the group directly --
- * more views is strictly better for SVD triangulation when the cameras are
- * calibrated.
- *
- * Returns number of candidates generated.
+ * Returns number of groups that produced at least one valid candidate.
  */
 int pt_generate_candidates(
     const PT_Group *groups, int num_groups,
     const PT_Detection2D detections[PT_MAX_CAMERAS][PT_MAX_DETECTIONS],
     const PT_CameraConstants *constants,
     float keypoint_confidence,
-    PT_Candidate3D *out_candidates,
-    int max_candidates
+    PT_CandidateGroup *out_groups,
+    int max_groups
 );
 
 /* ============================================================================
@@ -70,22 +64,20 @@ int pt_generate_candidates(
 /*
  * Assign 3D candidates to existing tracks and update track state.
  *
- * Algorithm (from tracker.py:assign_3d_candidates_to_tracks):
- *   1. Build cost matrix: cost[track][candidate] = ||track.com - candidate.com||
- *      Set cost = 1000.0 if distance > max_distance
- *   2. Run Hungarian algorithm on cost matrix
- *   3. Accept matches where cost < max_distance
- *   4. Update matched tracks:
- *      - Write new keypoints to ring buffer
- *      - Update last_com_3d, last_views, last_sync_index
- *      - Reset frames_since_seen = 0
- *   5. Increment frames_since_seen for unmatched active tracks
- *   6. Create new tracks from unmatched candidates (if under max_persons)
- *   7. Deactivate tracks where frames_since_seen > patience
+ * Faithfully ports Python assign_3d_candidates_to_tracks():
+ *   1. For each (track, group) pair, find the candidate whose view set
+ *      exactly matches the track's last views.  Hard constraint: no match
+ *      if views differ.
+ *   2. Build cost matrix from COM distances of best-matching candidates.
+ *   3. Run Hungarian algorithm on the cost matrix.
+ *   4. Accept matches where cost < max_distance.
+ *   5. Update matched tracks, increment lost counter for unmatched.
+ *   6. Create new tracks from unmatched groups (min_new_track_distance=0.3m).
+ *   7. Deactivate tracks where frames_since_seen > patience.
  */
 void pt_track_frame(
     PT_TrackState *state,
-    const PT_Candidate3D *candidates, int num_candidates,
+    const PT_CandidateGroup *groups, int num_groups,
     int sync_index,
     float max_distance,
     int max_persons,

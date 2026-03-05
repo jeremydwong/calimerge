@@ -592,13 +592,15 @@ void pt_hungarian(
     n = (n_rows > n_cols) ? n_rows : n_cols;
     if (n == 0) return;
 
-    /* Fill cost matrix; pad with zeros */
+    /* Fill cost matrix; pad with large cost to avoid phantom matches.
+     * Using 0.0 for padding causes the Hungarian algorithm to prefer
+     * phantom matches over real ones (see audit Bug #1). */
     for (i = 0; i < n; i++) {
         for (j = 0; j < n; j++) {
             if (i < n_rows && j < n_cols) {
                 cost[i][j] = cost_matrix[i * n_cols + j];
             } else {
-                cost[i][j] = 0.0;
+                cost[i][j] = 1000.0;
             }
         }
     }

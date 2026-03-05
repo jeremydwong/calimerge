@@ -34,6 +34,9 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#endif
+
+#ifdef _WIN32
 static double pt_time_seconds(void) {
     LARGE_INTEGER freq, now;
     QueryPerformanceFrequency(&freq);
@@ -71,7 +74,7 @@ struct PT_Pipeline {
     /* Scratch buffers for CPU-side processing per sync index */
     PT_Detection2D detections[PT_MAX_CAMERAS][PT_MAX_DETECTIONS];
     PT_Group groups[PT_MAX_GROUPS];
-    PT_Candidate3D candidates[PT_MAX_GROUPS];
+    PT_CandidateGroup candidate_groups[PT_MAX_GROUPS];
 
     int is_initialized;
 };
@@ -188,6 +191,42 @@ static int parse_string_value(const char *s, char *out, int max_len) {
     return i;
 }
 
+/* Rodrigues vector to 3x3 rotation matrix.
+ * r[3] is the axis-angle vector; theta = ||r||.
+ * R = cos(t)I + (1-cos(t))r_hat*r_hat^T + sin(t)[r_hat]_x */
+static void rodrigues_to_matrix(const double r[3], double R[3][3]) {
+    double theta = sqrt(r[0]*r[0] + r[1]*r[1] + r[2]*r[2]);
+    if (theta < 1e-12) {
+        /* Identity */
+        R[0][0] = 1; R[0][1] = 0; R[0][2] = 0;
+        R[1][0] = 0; R[1][1] = 1; R[1][2] = 0;
+        R[2][0] = 0; R[2][1] = 0; R[2][2] = 1;
+        return;
+    }
+    double rx = r[0]/theta, ry = r[1]/theta, rz = r[2]/theta;
+    double c = cos(theta), s = sin(theta), t = 1.0 - c;
+    R[0][0] = c + rx*rx*t;     R[0][1] = rx*ry*t - rz*s; R[0][2] = rx*rz*t + ry*s;
+    R[1][0] = ry*rx*t + rz*s;  R[1][1] = c + ry*ry*t;    R[1][2] = ry*rz*t - rx*s;
+    R[2][0] = rz*rx*t - ry*s;  R[2][1] = rz*ry*t + rx*s; R[2][2] = c + rz*rz*t;
+}
+
+/* Try to start accumulating an array value. Returns 1 if complete on this line. */
+static int try_parse_array_inline(const char *trimmed, char *array_buf, int buf_size, int *in_array) {
+    const char *eq = strchr(trimmed, '=');
+    if (!eq) return 0;
+    eq = skip_ws(eq + 1);
+    strncpy(array_buf, eq, buf_size - 1);
+    array_buf[buf_size - 1] = '\0';
+    int open = 0, close = 0;
+    for (const char *c = array_buf; *c; c++) {
+        if (*c == '[') open++;
+        if (*c == ']') close++;
+    }
+    if (close >= open && open > 0) return 1; /* complete */
+    *in_array = 1;
+    return 0;
+}
+
 static int load_calibration_toml(PT_CameraConstants *constants, const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) return PT_ERR_FILE_NOT_FOUND;
@@ -200,6 +239,11 @@ static int load_calibration_toml(PT_CameraConstants *constants, const char *path
     char array_buf[4096];
     int in_array = 0;   /* 1 = accumulating a multi-line array */
     int array_type = 0; /* 0=camera_matrix, 1=distortion, 2=rotation, 3=translation */
+
+    /* Track whether rotation was given as Rodrigues (3 values) or matrix (9 values).
+     * Caliscope uses Rodrigues; calimerge uses 3x3 matrix. */
+    int rotation_is_rodrigues[PT_MAX_CAMERAS];
+    memset(rotation_is_rodrigues, 0, sizeof(rotation_is_rodrigues));
 
     while (fgets(line, sizeof(line), f)) {
         /* If we are accumulating a multi-line array, append this line */
@@ -222,21 +266,22 @@ static int load_calibration_toml(PT_CameraConstants *constants, const char *path
 
                 if (current_cam >= 0 && current_cam < PT_MAX_CAMERAS) {
                     if (array_type == 0 && n >= 9) {
-                        /* camera_matrix 3x3 row-major */
                         for (int r = 0; r < 3; r++)
                             for (int c = 0; c < 3; c++)
                                 constants->camera_matrix[current_cam][r][c] = vals[r * 3 + c];
                     } else if (array_type == 1 && n >= 5) {
-                        /* distortion [k1, k2, p1, p2, k3] */
                         for (int i = 0; i < 5; i++)
                             constants->distortion[current_cam][i] = vals[i];
-                    } else if (array_type == 2 && n >= 9) {
-                        /* rotation 3x3 row-major */
-                        for (int r = 0; r < 3; r++)
-                            for (int c = 0; c < 3; c++)
-                                constants->rotation[current_cam][r][c] = vals[r * 3 + c];
+                    } else if (array_type == 2) {
+                        if (n >= 9) {
+                            for (int r = 0; r < 3; r++)
+                                for (int c = 0; c < 3; c++)
+                                    constants->rotation[current_cam][r][c] = vals[r * 3 + c];
+                        } else if (n == 3) {
+                            rotation_is_rodrigues[current_cam] = 1;
+                            rodrigues_to_matrix(vals, constants->rotation[current_cam]);
+                        }
                     } else if (array_type == 3 && n >= 3) {
-                        /* translation [tx, ty, tz] */
                         for (int i = 0; i < 3; i++)
                             constants->translation[current_cam][i] = vals[i];
                     }
@@ -253,13 +298,20 @@ static int load_calibration_toml(PT_CameraConstants *constants, const char *path
             continue;
         }
 
-        /* Section header: [camera_N] */
+        /* Section header: [camera_N] or [cam_N] (caliscope format) */
         if (*trimmed == '[') {
             int cam_idx = -1;
-            if (sscanf(trimmed, "[camera_%d]", &cam_idx) == 1 && cam_idx >= 0 && cam_idx < PT_MAX_CAMERAS) {
-                current_cam = cam_idx;
-                if (cam_idx >= num_cameras_found) {
-                    num_cameras_found = cam_idx + 1;
+            if (sscanf(trimmed, "[camera_%d]", &cam_idx) == 1 ||
+                sscanf(trimmed, "[cam_%d]", &cam_idx) == 1) {
+                if (cam_idx >= 0 && cam_idx < PT_MAX_CAMERAS) {
+                    current_cam = cam_idx;
+                    /* Default port to section index (matches Python cs_parse.py:648
+                     * which infers port from cam_N suffix). May be overridden by
+                     * explicit 'port' key below. */
+                    constants->ports[current_cam] = cam_idx;
+                    if (cam_idx >= num_cameras_found) {
+                        num_cameras_found = cam_idx + 1;
+                    }
                 }
             }
             continue;
@@ -270,104 +322,70 @@ static int load_calibration_toml(PT_CameraConstants *constants, const char *path
 
         if (strncmp(trimmed, "port", 4) == 0 && (trimmed[4] == ' ' || trimmed[4] == '=')) {
             constants->ports[current_cam] = parse_int_value(trimmed);
-        } else if (strncmp(trimmed, "camera_matrix", 13) == 0) {
-            /* Start accumulating array -- might be multi-line */
+        } else if (strncmp(trimmed, "size", 4) == 0 && (trimmed[4] == ' ' || trimmed[4] == '=')) {
+            /* Caliscope format: size = [640, 480] — store per-camera */
+            double vals[2];
             const char *eq = strchr(trimmed, '=');
-            if (eq) {
-                eq = skip_ws(eq + 1);
-                strncpy(array_buf, eq, sizeof(array_buf) - 1);
-                array_buf[sizeof(array_buf) - 1] = '\0';
-                array_type = 0;
-                /* Check if complete on this line */
-                int open = 0, close = 0;
-                for (const char *c = array_buf; *c; c++) {
-                    if (*c == '[') open++;
-                    if (*c == ']') close++;
-                }
-                if (close >= open && open > 0) {
-                    double vals[16];
-                    int n = parse_double_array(array_buf, vals, 16);
-                    if (n >= 9) {
-                        for (int r = 0; r < 3; r++)
-                            for (int c = 0; c < 3; c++)
-                                constants->camera_matrix[current_cam][r][c] = vals[r * 3 + c];
-                    }
-                } else {
-                    in_array = 1;
+            if (eq && parse_double_array(eq, vals, 2) >= 2) {
+                constants->cam_width[current_cam] = (int)vals[0];
+                constants->cam_height[current_cam] = (int)vals[1];
+                /* Also update common frame dimensions (last camera wins,
+                 * overridden later from video files if available) */
+                constants->frame_width = (int)vals[0];
+                constants->frame_height = (int)vals[1];
+            }
+        } else if (strncmp(trimmed, "camera_matrix", 13) == 0 ||
+                   (strncmp(trimmed, "matrix", 6) == 0 && trimmed[6] != '_' &&
+                    (trimmed[6] == ' ' || trimmed[6] == '='))) {
+            /* "camera_matrix" (calimerge) or "matrix" (caliscope) */
+            array_type = 0;
+            if (try_parse_array_inline(trimmed, array_buf, sizeof(array_buf), &in_array)) {
+                double vals[16];
+                int n = parse_double_array(array_buf, vals, 16);
+                if (n >= 9 && current_cam < PT_MAX_CAMERAS) {
+                    for (int r = 0; r < 3; r++)
+                        for (int c = 0; c < 3; c++)
+                            constants->camera_matrix[current_cam][r][c] = vals[r * 3 + c];
                 }
             }
         } else if (strncmp(trimmed, "distortion", 10) == 0) {
-            const char *eq = strchr(trimmed, '=');
-            if (eq) {
-                eq = skip_ws(eq + 1);
-                strncpy(array_buf, eq, sizeof(array_buf) - 1);
-                array_buf[sizeof(array_buf) - 1] = '\0';
-                array_type = 1;
-                int open = 0, close = 0;
-                for (const char *c = array_buf; *c; c++) {
-                    if (*c == '[') open++;
-                    if (*c == ']') close++;
-                }
-                if (close >= open && open > 0) {
-                    double vals[8];
-                    int n = parse_double_array(array_buf, vals, 8);
-                    if (n >= 5) {
-                        for (int i = 0; i < 5; i++)
-                            constants->distortion[current_cam][i] = vals[i];
-                    }
-                } else {
-                    in_array = 1;
+            /* "distortion" or "distortions" (caliscope) */
+            array_type = 1;
+            if (try_parse_array_inline(trimmed, array_buf, sizeof(array_buf), &in_array)) {
+                double vals[8];
+                int n = parse_double_array(array_buf, vals, 8);
+                if (n >= 5 && current_cam < PT_MAX_CAMERAS) {
+                    for (int i = 0; i < 5; i++)
+                        constants->distortion[current_cam][i] = vals[i];
                 }
             }
         } else if (strncmp(trimmed, "rotation", 8) == 0 && trimmed[8] != '_') {
-            const char *eq = strchr(trimmed, '=');
-            if (eq) {
-                eq = skip_ws(eq + 1);
-                strncpy(array_buf, eq, sizeof(array_buf) - 1);
-                array_buf[sizeof(array_buf) - 1] = '\0';
-                array_type = 2;
-                int open = 0, close = 0;
-                for (const char *c = array_buf; *c; c++) {
-                    if (*c == '[') open++;
-                    if (*c == ']') close++;
-                }
-                if (close >= open && open > 0) {
-                    double vals[16];
-                    int n = parse_double_array(array_buf, vals, 16);
+            array_type = 2;
+            if (try_parse_array_inline(trimmed, array_buf, sizeof(array_buf), &in_array)) {
+                double vals[16];
+                int n = parse_double_array(array_buf, vals, 16);
+                if (current_cam < PT_MAX_CAMERAS) {
                     if (n >= 9) {
                         for (int r = 0; r < 3; r++)
                             for (int c = 0; c < 3; c++)
                                 constants->rotation[current_cam][r][c] = vals[r * 3 + c];
+                    } else if (n == 3) {
+                        rotation_is_rodrigues[current_cam] = 1;
+                        rodrigues_to_matrix(vals, constants->rotation[current_cam]);
                     }
-                } else {
-                    in_array = 1;
                 }
             }
         } else if (strncmp(trimmed, "translation", 11) == 0) {
-            const char *eq = strchr(trimmed, '=');
-            if (eq) {
-                eq = skip_ws(eq + 1);
-                strncpy(array_buf, eq, sizeof(array_buf) - 1);
-                array_buf[sizeof(array_buf) - 1] = '\0';
-                array_type = 3;
-                int open = 0, close = 0;
-                for (const char *c = array_buf; *c; c++) {
-                    if (*c == '[') open++;
-                    if (*c == ']') close++;
-                }
-                if (close >= open && open > 0) {
-                    double vals[4];
-                    int n = parse_double_array(array_buf, vals, 4);
-                    if (n >= 3) {
-                        for (int i = 0; i < 3; i++)
-                            constants->translation[current_cam][i] = vals[i];
-                    }
-                } else {
-                    in_array = 1;
+            array_type = 3;
+            if (try_parse_array_inline(trimmed, array_buf, sizeof(array_buf), &in_array)) {
+                double vals[4];
+                int n = parse_double_array(array_buf, vals, 4);
+                if (n >= 3 && current_cam < PT_MAX_CAMERAS) {
+                    for (int i = 0; i < 3; i++)
+                        constants->translation[current_cam][i] = vals[i];
                 }
             }
         }
-        /* serial_number is informational -- we don't need it for computation */
     }
 
     fclose(f);
@@ -378,6 +396,14 @@ static int load_calibration_toml(PT_CameraConstants *constants, const char *path
     }
 
     constants->num_cameras = num_cameras_found;
+
+    /* Log Rodrigues conversions */
+    for (int i = 0; i < num_cameras_found; i++) {
+        if (rotation_is_rodrigues[i]) {
+            fprintf(stderr, "[pt_pipeline] Camera %d: converted Rodrigues rotation to 3x3 matrix\n", i);
+        }
+    }
+
     return PT_OK;
 }
 
@@ -396,7 +422,9 @@ static int load_calibration_toml(PT_CameraConstants *constants, const char *path
 typedef struct {
     int sync_index;
     int port;
-    int frame_index;
+    int frame_index;         /* raw frame_index from CSV (camera counter, NOT video position) */
+    double frame_time;       /* frame_time from CSV, used to derive 0-based video position */
+    int derived_frame_index; /* 0-based video position per camera (computed from frame_time rank) */
 } SyncRow;
 
 static int compare_sync_rows(const void *a, const void *b) {
@@ -404,6 +432,16 @@ static int compare_sync_rows(const void *a, const void *b) {
     const SyncRow *rb = (const SyncRow *)b;
     if (ra->sync_index != rb->sync_index) return ra->sync_index - rb->sync_index;
     return ra->port - rb->port;
+}
+
+/* Compare SyncRows by (port, frame_time) for deriving per-camera frame index */
+static int compare_by_port_time(const void *a, const void *b) {
+    const SyncRow *ra = (const SyncRow *)a;
+    const SyncRow *rb = (const SyncRow *)b;
+    if (ra->port != rb->port) return ra->port - rb->port;
+    if (ra->frame_time < rb->frame_time) return -1;
+    if (ra->frame_time > rb->frame_time) return 1;
+    return 0;
 }
 
 static int load_sync_table_csv(PT_SyncTable *table, const char *path, int num_cameras,
@@ -427,8 +465,8 @@ static int load_sync_table_csv(PT_SyncTable *table, const char *path, int num_ca
 
     while (fgets(line, sizeof(line), f)) {
         int sync_idx, port, frame_idx;
-        float frame_time;
-        if (sscanf(line, "%d,%d,%d,%f", &sync_idx, &port, &frame_idx, &frame_time) >= 3) {
+        double frame_time = 0.0;
+        if (sscanf(line, "%d,%d,%d,%lf", &sync_idx, &port, &frame_idx, &frame_time) >= 3) {
             if (num_rows >= capacity) {
                 capacity *= 2;
                 SyncRow *new_rows = (SyncRow *)realloc(rows, capacity * sizeof(SyncRow));
@@ -438,6 +476,8 @@ static int load_sync_table_csv(PT_SyncTable *table, const char *path, int num_ca
             rows[num_rows].sync_index = sync_idx;
             rows[num_rows].port = port;
             rows[num_rows].frame_index = frame_idx;
+            rows[num_rows].frame_time = frame_time;
+            rows[num_rows].derived_frame_index = -1;
             num_rows++;
         }
     }
@@ -448,7 +488,41 @@ static int load_sync_table_csv(PT_SyncTable *table, const char *path, int num_ca
         return PT_ERR_INVALID_PARAM;
     }
 
-    /* Sort by (sync_index, port) */
+    /* Derive 0-based video frame index per camera.
+     *
+     * Python equivalent (from process_image_batches.py):
+     *   df = df.sort_values(by=['port', 'frame_time'])
+     *   df['derived_frame_index'] = df.groupby('port')['frame_time'].rank(method='min').astype(int) - 1
+     *
+     * The raw frame_index in the CSV is the camera's internal counter (e.g. 73338),
+     * NOT a 0-based position in the video file.  The video file contains frames
+     * sequentially from 0..N-1, so we need to compute the rank of each frame
+     * within its camera, ordered by frame_time.
+     */
+    qsort(rows, num_rows, sizeof(SyncRow), compare_by_port_time);
+
+    {
+        int i = 0;
+        while (i < num_rows) {
+            /* Find range of rows with the same port */
+            int port_start = i;
+            int current_port = rows[i].port;
+            while (i < num_rows && rows[i].port == current_port) {
+                i++;
+            }
+            /* Assign 0-based rank within this port (already sorted by frame_time) */
+            int rank = 0;
+            for (int j = port_start; j < i; j++) {
+                /* rank(method='min'): equal frame_times get the same rank */
+                if (j > port_start && rows[j].frame_time != rows[j - 1].frame_time) {
+                    rank = j - port_start;
+                }
+                rows[j].derived_frame_index = rank;
+            }
+        }
+    }
+
+    /* Sort by (sync_index, port) for building the packed table */
     qsort(rows, num_rows, sizeof(SyncRow), compare_sync_rows);
 
     /* Count unique sync indices */
@@ -505,7 +579,7 @@ static int load_sync_table_csv(PT_SyncTable *table, const char *path, int num_ca
             cam_idx = port_to_cam[rows[i].port];
         }
         if (cam_idx >= 0 && cam_idx < num_cameras) {
-            table->sync_to_frame[sync_slot * num_cameras + cam_idx] = rows[i].frame_index;
+            table->sync_to_frame[sync_slot * num_cameras + cam_idx] = rows[i].derived_frame_index;
         }
     }
 
@@ -684,6 +758,7 @@ extern "C" int pt_pipeline_run(PT_Pipeline *p) {
     for (int i = 0; i < num_cameras; i++) {
         memset(&p->decoders[i], 0, sizeof(PT_VideoDecoder));
         rc = pt_video_open(&p->decoders[i], p->config.video_paths[i]);
+
         if (rc != PT_OK) {
             fprintf(stderr, "[pt_pipeline] Failed to open video %d: %s (error %d)\n",
                     i, p->config.video_paths[i], rc);
@@ -748,8 +823,12 @@ extern "C" int pt_pipeline_run(PT_Pipeline *p) {
     }
     pipeline_log(p, "YOLO engine ready.");
 
-    /* VitPose engine: max batch = yolo_max_batch * PT_MAX_DETECTIONS */
-    int vitpose_max_batch = yolo_max_batch * PT_MAX_DETECTIONS;
+    /* VitPose engine: max batch = num_cameras * PT_MAX_DETECTIONS.
+     * VitPose is called per sync_index (inside the bi loop), so the max
+     * crops in a single inference call is num_cameras * max_dets_per_image,
+     * NOT batch_size * num_cameras * max_dets (which would be too large
+     * for TensorRT to build). */
+    int vitpose_max_batch = num_cameras * PT_MAX_DETECTIONS;
     pipeline_log(p, "Building VitPose engine (max_batch=%d)...", vitpose_max_batch);
     memset(&p->vitpose_engine, 0, sizeof(PT_TrtEngine));
     rc = pt_trt_build_engine(&p->vitpose_engine, p->config.vitpose_onnx_path,
@@ -1141,21 +1220,21 @@ extern "C" int pt_pipeline_run(PT_Pipeline *p) {
             t_matching_total += pt_time_seconds() - t_match_start;
             double t_tri_start = pt_time_seconds();
 
-            /* Generate 3D candidates from groups */
-            int num_candidates = pt_generate_candidates(
+            /* Generate 3D candidates from groups (all view subsets) */
+            int num_candidate_groups = pt_generate_candidates(
                 p->groups, num_groups,
                 p->detections,
                 &p->constants,
                 p->config.keypoint_confidence,
-                p->candidates, PT_MAX_GROUPS
+                p->candidate_groups, PT_MAX_GROUPS
             );
 
-            /* Update tracks with new candidates */
+            /* Update tracks with new candidate groups */
             int actual_sync_index = p->sync_table.sync_indices[sync_slot];
 
             pt_track_frame(
                 &p->tracks,
-                p->candidates, num_candidates,
+                p->candidate_groups, num_candidate_groups,
                 actual_sync_index,
                 p->config.max_track_distance,
                 p->config.max_persons,

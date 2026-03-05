@@ -79,14 +79,14 @@ def export_yolo(output_dir: Path) -> Path:
 
 def export_vitpose(output_dir: Path) -> Path:
     """
-    Export VitPose-Base (SynthPose, 52 keypoints) to ONNX format.
+    Export VitPose-Base (COCO, 17 keypoints) to ONNX format.
 
     Uses the HuggingFace transformers library to download the model
     and exports with dynamic batch dimension.
 
     The model is usyd-community/vitpose-base-simple, which outputs
-    52 keypoints matching the SynthPose marker set used by the
-    calimerge tracking pipeline.
+    17 COCO keypoints. The CSV export pads to 52 SynthPose columns
+    with NaN (matching the Python pipeline behavior).
 
     Returns:
         Path to the exported ONNX file.
@@ -120,7 +120,7 @@ def export_vitpose(output_dir: Path) -> Path:
     # This matches PT_VITPOSE_INPUT_H=256, PT_VITPOSE_INPUT_W=192 in pt_common.h
     dummy_input = torch.randn(1, 3, 256, 192)
 
-    output_path = output_dir / "vitpose_base_coco_wholebody.onnx"
+    output_path = output_dir / "vitpose_base_coco.onnx"
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     print("Exporting VitPose to ONNX...")
@@ -167,7 +167,7 @@ def export_vitpose(output_dir: Path) -> Path:
 
     print(f"VitPose ONNX exported to: {output_path}")
     print(f"  Input:  images   (batch, 3, 256, 192)")
-    print(f"  Output: heatmaps (batch, 52, 64, 48)")
+    print(f"  Output: heatmaps (batch, 17, 64, 48)")
     return output_path
 
 

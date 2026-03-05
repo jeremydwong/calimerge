@@ -20,6 +20,7 @@ dependencies = [
     "ultralytics>=8.0.0",
     "huggingface-hub>=0.20.0",
     "pandas>=2.0.0",
+    "onnxscript>=0.6.2",
 ]
 
 [project.optional-dependencies]

@@ -304,7 +304,18 @@ static int pt_build_from_onnx(PT_TrtEngine *eng, int max_batch, int use_fp16) {
     if (use_fp16) {
         if (builder->platformHasFastFp16()) {
             config->setFlag(nvinfer1::BuilderFlag::kFP16);
-            fprintf(stderr, "[TRT]   FP16 enabled\n");
+
+            /* Set input tensor type to kHALF so the engine accepts __half input.
+             * TensorRT's kFP16 flag only enables FP16 internal computation;
+             * I/O tensor types default to the ONNX model's dtype (FP32).
+             * Our letterbox kernel writes __half, so we need FP16 I/O. */
+            for (int i = 0; i < network->getNbInputs(); ++i) {
+                network->getInput(i)->setType(nvinfer1::DataType::kHALF);
+            }
+            /* Leave output as FP32 — the filter_detections kernel reads float,
+             * and YOLO output is small (300*6 floats per image). */
+
+            fprintf(stderr, "[TRT]   FP16 enabled (input I/O set to HALF)\n");
         } else {
             fprintf(stderr, "[TRT]   FP16 requested but not supported on this GPU -- using FP32\n");
         }
@@ -321,19 +332,70 @@ static int pt_build_from_onnx(PT_TrtEngine *eng, int max_batch, int use_fp16) {
         return PT_ERR_ENGINE_BUILD;
     }
 
-    /* Set min/opt/max for every input tensor. */
+    /* Set min/opt/max for every input tensor.
+     * Any dynamic dimension (-1 in the ONNX) must be replaced with a concrete value.
+     * For batch (dim 0): use 1/opt/max.
+     * For non-batch dynamic dims: infer from model name.
+     *
+     * Known models:
+     *   YOLO v10:  input 'images' = (batch, 3, 640, 640)
+     *   VitPose:   input 'input'  = (batch, 3, 256, 192) */
     int opt_batch = max_batch / 2;
     if (opt_batch < 1) opt_batch = 1;
+
+    /* Determine expected input H/W from the ONNX filename */
+    int expected_h = 0, expected_w = 0;
+    {
+        char model_lower[256];
+        pt_extract_model_name(eng->onnx_path, model_lower, sizeof(model_lower));
+        for (char *p = model_lower; *p; p++) {
+            if (*p >= 'A' && *p <= 'Z') *p += 32;
+        }
+        if (strstr(model_lower, "yolo")) {
+            expected_h = PT_YOLO_INPUT_H;
+            expected_w = PT_YOLO_INPUT_W;
+        } else if (strstr(model_lower, "vitpose")) {
+            expected_h = PT_VITPOSE_INPUT_H;
+            expected_w = PT_VITPOSE_INPUT_W;
+        }
+        if (expected_h > 0) {
+            fprintf(stderr, "[TRT]   Detected model: %s -> expected input %dx%d\n",
+                    model_lower, expected_w, expected_h);
+        }
+    }
 
     for (int i = 0; i < network->getNbInputs(); ++i) {
         nvinfer1::ITensor *input = network->getInput(i);
         const char *name = input->getName();
         nvinfer1::Dims dims = input->getDimensions();
 
-        /* dims.d[0] is the batch dimension (-1 for dynamic). */
+        fprintf(stderr, "[TRT]   Input '%s' dims: [", name);
+        for (int d = 0; d < dims.nbDims; d++)
+            fprintf(stderr, "%d%s", dims.d[d], (d < dims.nbDims - 1) ? ", " : "");
+        fprintf(stderr, "]\n");
+
         nvinfer1::Dims min_dims = dims;
         nvinfer1::Dims opt_dims = dims;
         nvinfer1::Dims max_dims = dims;
+
+        for (int d = 0; d < dims.nbDims; d++) {
+            if (dims.d[d] < 0) {
+                if (dims.nbDims == 4 && d == 2 && expected_h > 0) {
+                    min_dims.d[d] = expected_h;
+                    opt_dims.d[d] = expected_h;
+                    max_dims.d[d] = expected_h;
+                } else if (dims.nbDims == 4 && d == 3 && expected_w > 0) {
+                    min_dims.d[d] = expected_w;
+                    opt_dims.d[d] = expected_w;
+                    max_dims.d[d] = expected_w;
+                } else if (d != 0) {
+                    fprintf(stderr, "[TRT] WARNING: unresolved dynamic dim %d on '%s'\n", d, name);
+                    min_dims.d[d] = 1;
+                    opt_dims.d[d] = 1;
+                    max_dims.d[d] = 1;
+                }
+            }
+        }
 
         min_dims.d[0] = 1;
         opt_dims.d[0] = opt_batch;
@@ -343,8 +405,14 @@ static int pt_build_from_onnx(PT_TrtEngine *eng, int max_batch, int use_fp16) {
         profile->setDimensions(name, nvinfer1::OptProfileSelector::kOPT, opt_dims);
         profile->setDimensions(name, nvinfer1::OptProfileSelector::kMAX, max_dims);
 
-        fprintf(stderr, "[TRT]   Input '%s': min=[%d,...], opt=[%d,...], max=[%d,...]\n",
-                name, 1, opt_batch, max_batch);
+        fprintf(stderr, "[TRT]   Profile '%s': min=[%d,%d,%d,%d], opt=[%d,%d,%d,%d], max=[%d,%d,%d,%d]\n",
+                name,
+                min_dims.d[0], (min_dims.nbDims > 1 ? min_dims.d[1] : 0),
+                (min_dims.nbDims > 2 ? min_dims.d[2] : 0), (min_dims.nbDims > 3 ? min_dims.d[3] : 0),
+                opt_dims.d[0], (opt_dims.nbDims > 1 ? opt_dims.d[1] : 0),
+                (opt_dims.nbDims > 2 ? opt_dims.d[2] : 0), (opt_dims.nbDims > 3 ? opt_dims.d[3] : 0),
+                max_dims.d[0], (max_dims.nbDims > 1 ? max_dims.d[1] : 0),
+                (max_dims.nbDims > 2 ? max_dims.d[2] : 0), (max_dims.nbDims > 3 ? max_dims.d[3] : 0));
     }
 
     config->addOptimizationProfile(profile);

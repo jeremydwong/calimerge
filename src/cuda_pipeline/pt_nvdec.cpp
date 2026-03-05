@@ -705,7 +705,24 @@ static int open_opencv(PT_VideoDecoder *dec, const char *path) {
         return PT_ERR_DECODE;
     }
 
-    if (!cap->open(path)) {
+    /*
+     * Open with CAP_FFMPEG first (uses plugin DLL on Windows), then MSMF fallback.
+     */
+    bool opened = false;
+
+    if (cap->open(path, cv::CAP_FFMPEG)) {
+        opened = true;
+    }
+
+    if (!opened && cap->open(path, cv::CAP_MSMF)) {
+        opened = true;
+    }
+
+    if (!opened && cap->open(path)) {
+        opened = true;
+    }
+
+    if (!opened) {
         pt_log_error("open_opencv", "VideoCapture failed to open '%s'", path);
         delete cap;
         return PT_ERR_DECODE;
@@ -720,8 +737,9 @@ static int open_opencv(PT_VideoDecoder *dec, const char *path) {
     dec->current_frame_idx = -1;
     dec->nv12_pitch = dec->width;
 
-    fprintf(stderr, "[pt_nvdec] Opened '%s': %dx%d, %d frames, CPU fallback (OpenCV)\n",
-            path, dec->width, dec->height, dec->num_frames);
+    fprintf(stderr, "[pt_nvdec] Opened '%s': %dx%d, %d frames, CPU fallback (OpenCV %s)\n",
+            path, dec->width, dec->height, dec->num_frames,
+            cap->getBackendName().c_str());
 
     return PT_OK;
 }

@@ -32,12 +32,13 @@ extern "C" {
 #define PT_MAX_CAMERAS          16
 #define PT_MAX_PERSONS          8       /* max tracked persons simultaneously */
 #define PT_MAX_TRACKS           32      /* max track slots (active + recently lost) */
-#define PT_NUM_KEYPOINTS        52      /* SynthPose/VitPose marker count */
+#define PT_NUM_KEYPOINTS        17      /* VitPose COCO keypoint count (model output) */
+#define PT_EXPORT_KEYPOINTS     52      /* SynthPose marker count for CSV export (pad with NaN) */
 #define PT_MAX_DETECTIONS       16      /* max person detections per image */
 #define PT_MAX_GROUPS           32      /* max cross-view groups per sync index */
 #define PT_PIPELINE_DEPTH       2       /* double-buffer: decode N+1 while processing N */
 #define PT_BATCH_SIZE_MAX       32      /* max sync indices per batch */
-#define PT_TRACK_HISTORY_SIZE   128     /* ring buffer size for track history */
+#define PT_TRACK_HISTORY_SIZE   2048    /* ring buffer size for track history */
 
 /* Model input dimensions */
 #define PT_YOLO_INPUT_W         640
@@ -171,7 +172,11 @@ typedef struct {
     int    ports[PT_MAX_CAMERAS];
     int    num_cameras;
 
-    /* Common frame dimensions */
+    /* Per-camera frame dimensions (from calibration 'size' field) */
+    int    cam_width[PT_MAX_CAMERAS];
+    int    cam_height[PT_MAX_CAMERAS];
+
+    /* Common frame dimensions (from video files, used for arena allocation) */
     int    frame_width;
     int    frame_height;
 
@@ -231,6 +236,16 @@ typedef struct {
     int    views_used[PT_MAX_CAMERAS];  /* which cameras contributed */
     int    num_views;
 } PT_Candidate3D;
+
+/* A group of candidates from different view subsets of the same cross-view group.
+ * Python's generate_3d_candidates_from_groups() returns one of these per group,
+ * containing candidates for all combinations of 2..N views. */
+#define PT_MAX_VIEW_SUBSETS  32
+
+typedef struct {
+    PT_Candidate3D candidates[PT_MAX_VIEW_SUBSETS];
+    int num_candidates;
+} PT_CandidateGroup;
 
 /* ============================================================================
  * Person track - persistent across frames
@@ -314,15 +329,20 @@ typedef struct {
 } PT_Stats;
 
 /* ============================================================================
- * SynthPose marker names (52 keypoints)
- * Order matches the VitPose model output and the Python SYNTHPOSE_MARKERS dict.
+ * Marker names for CSV export.
+ *
+ * First 17 = COCO keypoints (actual model output).
+ * Indices 17-51 = SynthPose extended markers (padded with NaN in CSV).
+ * Matches Python SynthPoseMarkers dict in pose_detector.py:30.
  * ============================================================================ */
 
-static const char *PT_MARKER_NAMES[PT_NUM_KEYPOINTS] = {
+static const char *PT_EXPORT_MARKER_NAMES[PT_EXPORT_KEYPOINTS] = {
+    /* 0-16: COCO keypoints (from VitPose model output) */
     "Nose", "L_Eye", "R_Eye", "L_Ear", "R_Ear",
     "L_Shoulder", "R_Shoulder", "L_Elbow", "R_Elbow",
     "L_Wrist", "R_Wrist", "L_Hip", "R_Hip",
     "L_Knee", "R_Knee", "L_Ankle", "R_Ankle",
+    /* 17-51: SynthPose extended markers (not produced by model, NaN in CSV) */
     "sternum", "rshoulder", "lshoulder",
     "r_lelbow", "l_lelbow", "r_melbow", "l_melbow",
     "r_lwrist", "l_lwrist", "r_mwrist", "l_mwrist",

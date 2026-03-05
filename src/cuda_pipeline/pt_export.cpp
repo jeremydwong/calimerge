@@ -4,9 +4,13 @@
  * Writes one CSV file per tracked person.  The format matches the Python
  * output convention: output_3d_poses_tracked.csv_person0.csv
  *
- * Column order: sync_index, then for each of the 52 SynthPose markers:
+ * Column order: sync_index, person_id, then for each of the 52 SynthPose markers:
  *   {MarkerName}_X, {MarkerName}_Y, {MarkerName}_Z
- * giving 1 + 52*3 = 157 columns total.
+ * giving 2 + 52*3 = 158 columns total.
+ *
+ * The model outputs 17 COCO keypoints (PT_NUM_KEYPOINTS).
+ * Columns 17-51 are padded with empty fields (NaN) to match the
+ * Python SynthPoseMarkers format (PT_EXPORT_KEYPOINTS = 52).
  *
  * Invalid (non-triangulated) keypoints are written as empty fields (,,)
  * which Python/pandas reads as NaN.
@@ -24,6 +28,14 @@
 #include <string.h>
 #include <math.h>
 
+#ifdef _WIN32
+#include <direct.h>
+#define pt_mkdir(path) _mkdir(path)
+#else
+#include <sys/stat.h>
+#define pt_mkdir(path) mkdir(path, 0755)
+#endif
+
 /* ============================================================================
  * Internal: Write CSV header line
  *
@@ -31,11 +43,13 @@
  * ============================================================================ */
 
 static int write_csv_header(FILE *f) {
-    if (fprintf(f, "sync_index") < 0) return -1;
+    if (fprintf(f, "sync_index,person_id") < 0) return -1;
 
-    for (int k = 0; k < PT_NUM_KEYPOINTS; k++) {
+    for (int k = 0; k < PT_EXPORT_KEYPOINTS; k++) {
         if (fprintf(f, ",%s_X,%s_Y,%s_Z",
-                    PT_MARKER_NAMES[k], PT_MARKER_NAMES[k], PT_MARKER_NAMES[k]) < 0) {
+                    PT_EXPORT_MARKER_NAMES[k],
+                    PT_EXPORT_MARKER_NAMES[k],
+                    PT_EXPORT_MARKER_NAMES[k]) < 0) {
             return -1;
         }
     }
@@ -47,29 +61,35 @@ static int write_csv_header(FILE *f) {
 /* ============================================================================
  * Internal: Write one data row for a single frame
  *
- * sync_index followed by 52 * 3 values.  Invalid keypoints produce empty
- * fields (,,) which pandas reads as NaN.
+ * sync_index, person_id, followed by 52 * 3 values.
+ * First 17 keypoints come from model output; 17-51 are NaN padding.
+ * Invalid keypoints produce empty fields (,,) which pandas reads as NaN.
+ * Matches Python save_person_csv() in process_synced_poses.py:1424.
  * ============================================================================ */
 
-static int write_csv_row(FILE *f, int sync_index,
+static int write_csv_row(FILE *f, int sync_index, int person_id,
                           const double keypoints_3d[PT_NUM_KEYPOINTS][3],
                           const int keypoints_valid[PT_NUM_KEYPOINTS]) {
-    if (fprintf(f, "%d", sync_index) < 0) return -1;
+    /* Python uses %.4f format: process_synced_poses.py:1460 */
+    if (fprintf(f, "%d,%d", sync_index, person_id) < 0) return -1;
 
+    /* Write actual model keypoints (0 to PT_NUM_KEYPOINTS-1 = 0..16) */
     for (int k = 0; k < PT_NUM_KEYPOINTS; k++) {
         if (keypoints_valid[k]) {
-            /* Write 3D coordinates with 6 decimal places (sub-millimeter for
-             * meter-scale data, matching Python's default float formatting) */
-            if (fprintf(f, ",%.6f,%.6f,%.6f",
+            if (fprintf(f, ",%.4f,%.4f,%.4f",
                         keypoints_3d[k][0],
                         keypoints_3d[k][1],
                         keypoints_3d[k][2]) < 0) {
                 return -1;
             }
         } else {
-            /* Invalid keypoint: empty fields (read as NaN by pandas) */
             if (fprintf(f, ",,,") < 0) return -1;
         }
+    }
+
+    /* Pad remaining columns (PT_NUM_KEYPOINTS to PT_EXPORT_KEYPOINTS-1 = 17..51) with NaN */
+    for (int k = PT_NUM_KEYPOINTS; k < PT_EXPORT_KEYPOINTS; k++) {
+        if (fprintf(f, ",,,") < 0) return -1;
     }
 
     if (fprintf(f, "\n") < 0) return -1;
@@ -101,6 +121,22 @@ static int compare_export_entries(const void *a, const void *b) {
 
 extern "C" int pt_export_csv(const PT_TrackState *tracks, const char *output_base_path) {
     if (!tracks || !output_base_path) return PT_ERR_INVALID_PARAM;
+
+    /* Ensure the parent directory exists */
+    {
+        char dir[1024];
+        strncpy(dir, output_base_path, sizeof(dir) - 1);
+        dir[sizeof(dir) - 1] = '\0';
+        /* Find last slash or backslash */
+        char *last_sep = NULL;
+        for (char *p = dir; *p; p++) {
+            if (*p == '/' || *p == '\\') last_sep = p;
+        }
+        if (last_sep) {
+            *last_sep = '\0';
+            pt_mkdir(dir);
+        }
+    }
 
     int persons_exported = 0;
 
@@ -149,7 +185,7 @@ extern "C" int pt_export_csv(const PT_TrackState *tracks, const char *output_bas
         }
 
         /* Allocate sort buffer on the stack if small enough, else heap.
-         * PT_TRACK_HISTORY_SIZE is 128, so this is ~1KB -- fine for stack. */
+         * PT_TRACK_HISTORY_SIZE is 2048, so this is ~16KB -- fine for stack. */
         ExportEntry entries[PT_TRACK_HISTORY_SIZE];
 
         if (track->history_count <= PT_TRACK_HISTORY_SIZE) {
@@ -175,6 +211,7 @@ extern "C" int pt_export_csv(const PT_TrackState *tracks, const char *output_bas
         for (int i = 0; i < num_entries; i++) {
             int ri = entries[i].ring_idx;
             if (write_csv_row(f, entries[i].sync_index,
+                               track->person_id,
                                track->keypoints_3d[ri],
                                track->keypoints_valid[ri]) < 0) {
                 fprintf(stderr, "[pt_export] Write error on row %d: %s\n", i, filename);

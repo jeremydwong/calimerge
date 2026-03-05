@@ -363,7 +363,9 @@ int pt_triangulate_person(
             }
         }
 
-        if (n_hips >= 1) {
+        /* Python default: min_keypoints_for_com=2 (both hips required).
+         * See process_synced_poses.py:74 */
+        if (n_hips >= 2) {
             out_candidate->com_3d[0] = com[0] / (double)n_hips;
             out_candidate->com_3d[1] = com[1] / (double)n_hips;
             out_candidate->com_3d[2] = com[2] / (double)n_hips;

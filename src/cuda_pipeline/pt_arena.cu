@@ -59,7 +59,9 @@ static void compute_sizes(int num_cameras,
                           size_t *out_gpu_bytes,
                           size_t *out_host_bytes) {
     int max_images  = batch_size * num_cameras;
-    int max_crops   = max_images * PT_MAX_DETECTIONS;
+    /* VitPose is called per sync_index, not per batch, so max crops
+     * per inference call is num_cameras * PT_MAX_DETECTIONS. */
+    int max_crops   = num_cameras * PT_MAX_DETECTIONS;
 
     size_t nv12_bytes = (size_t)frame_width * frame_height * 3 / 2;  /* Y + UV */
     size_t bgr_bytes  = (size_t)frame_width * frame_height * 3;
@@ -74,7 +76,9 @@ static void compute_sizes(int num_cameras,
         }
     }
 
-    /* YOLO input: (max_images, 3, 640, 640) fp16  --  __half is 2 bytes */
+    /* YOLO input: (max_images, 3, 640, 640) fp16
+     * The letterbox kernel writes __half values. When FP16 is enabled, the TensorRT
+     * engine's input type is set to kHALF so it accepts __half data directly. */
     gpu += align_up((size_t)max_images * 3 * PT_YOLO_INPUT_H * PT_YOLO_INPUT_W * 2, ARENA_ALIGN);
 
     /* YOLO output: (max_images, 300, 6) fp32 */
@@ -136,7 +140,9 @@ int pt_arena_init(PT_GpuArena *arena,
     arena->frame_height         = frame_height;
     arena->batch_size           = batch_size;
     arena->max_images_per_batch = batch_size * num_cameras;
-    arena->max_crops_per_batch  = arena->max_images_per_batch * PT_MAX_DETECTIONS;
+    /* VitPose processes one sync_index at a time, so max crops per call
+     * is num_cameras * PT_MAX_DETECTIONS (not batch * cameras * detections). */
+    arena->max_crops_per_batch  = num_cameras * PT_MAX_DETECTIONS;
 
     /* Compute total sizes */
     size_t gpu_bytes  = 0;

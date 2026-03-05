@@ -3,7 +3,7 @@
  *
  * Five kernels:
  *   1. NV12 -> BGR8 colorspace conversion
- *   2. Letterbox resize + normalize for YOLO (BGR8 -> fp16 CHW RGB 640x640)
+ *   2. Letterbox resize + normalize for YOLO (BGR8 -> fp32 CHW RGB 640x640)
  *   3. Filter YOLO detections (threshold, undo letterbox)
  *   4. Crop + resize + normalize for VitPose (BGR8 -> fp32 CHW RGB 256x192)
  *   5. Heatmap decode with DARK refinement (heatmaps -> 2D keypoints)

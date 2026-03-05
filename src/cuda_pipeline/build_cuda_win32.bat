@@ -124,13 +124,13 @@ set LINK_LIBS=cuda.lib cudart.lib nvinfer.lib nvonnxparser.lib
 set LINK_PATHS=/LIBPATH:"%CUDA_PATH%\lib\x64" /LIBPATH:"%TENSORRT_PATH%\lib"
 
 if defined OPENCV_PATH (
-    :: OpenCV Windows layout: build/x64/vc16/lib/ or build/lib/
+    REM Use release lib only - no 'd' suffix. Debug/release CRT mismatch causes heap corruption.
     if exist "%OPENCV_PATH%\x64\vc16\lib" (
         set LINK_PATHS=%LINK_PATHS% /LIBPATH:"%OPENCV_PATH%\x64\vc16\lib"
-        for %%f in ("%OPENCV_PATH%\x64\vc16\lib\opencv_world4*.lib") do set LINK_LIBS=%LINK_LIBS% %%~nxf
+        set LINK_LIBS=%LINK_LIBS% opencv_world4130.lib
     ) else (
         set LINK_PATHS=%LINK_PATHS% /LIBPATH:"%OPENCV_PATH%\lib"
-        for %%f in ("%OPENCV_PATH%\lib\opencv_world4*.lib") do set LINK_LIBS=%LINK_LIBS% %%~nxf
+        set LINK_LIBS=%LINK_LIBS% opencv_world4130.lib
     )
 )
 
@@ -153,9 +153,15 @@ echo ---- DLL Exports ----
 dumpbin /exports calimerge_cuda.dll 2>nul | findstr "pt_"
 
 echo.
-echo ---- Building test program (pt_main.exe) ----
+echo ---- Building test program (pt_main.exe) - monolithic build ----
+echo      (links .obj files directly, bypasses DLL boundary)
 
-cl %CFLAGS% %CL_INCLUDES% /Fe:pt_main.exe pt_main.cpp /link calimerge_cuda.lib
+cl %CFLAGS% %CL_INCLUDES% /Fe:pt_main.exe pt_main.cpp ^
+    pt_arena.obj pt_kernels.obj ^
+    pt_tensorrt.obj pt_nvdec.obj pt_matching.obj ^
+    pt_triangulation.obj pt_tracker.obj pt_export.obj ^
+    pt_pipeline.obj ^
+    /link %LINK_LIBS% %LINK_PATHS%
 
 if errorlevel 1 (
     echo WARNING: pt_main.exe build failed (non-fatal)

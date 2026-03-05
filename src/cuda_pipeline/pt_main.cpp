@@ -284,7 +284,7 @@ int main(int argc, char **argv) {
         strncpy(config.vitpose_onnx_path, args.vitpose_path, 511);
     } else {
         snprintf(config.vitpose_onnx_path, sizeof(config.vitpose_onnx_path),
-                 "%s/vitpose_base_coco_wholebody.onnx", args.recording_dir);
+                 "%s/vitpose_base_coco.onnx", args.recording_dir);
     }
 
     /* Engine cache */

@@ -1,16 +1,10 @@
 /*
  * pt_tracker.cpp - Multi-person track management and candidate-to-track assignment.
  *
- * Translates the Python algorithms from tracker.py:
- *   - PersonTrack class (state management, COM computation, ring buffer history)
- *   - generate_3d_candidates_from_groups()
- *   - assign_3d_candidates_to_tracks() (Hungarian on COM distance)
- *
- * The Python version has elaborate logic for choosing view subsets and scoring
- * new track candidates. We simplify:
- *   - Triangulate using all views in a group (more views = better SVD)
- *   - New tracks: pick unmatched candidates closest to existing tracks
- *     but above min_new_track_distance
+ * Faithful port of Python process_synced_poses.py:
+ *   - generate_3d_candidates_from_groups() -- all view subsets via itertools.combinations
+ *   - assign_3d_candidates_to_tracks()     -- Hungarian with exact view-set constraint
+ *   - PersonTrack class                     -- ring buffer history, COM, view tracking
  */
 
 #include "pt_tracker.h"
@@ -18,6 +12,12 @@
 #include "pt_matching.h"  /* For pt_hungarian */
 #include <math.h>
 #include <string.h>
+
+/* Python default: min_new_track_distance = 0.3m (process_synced_poses.py:322) */
+#define PT_MIN_NEW_TRACK_DISTANCE  0.3
+
+/* Python default: max_new_track_distance = 5.0m (process_synced_poses.py:322) */
+#define PT_MAX_NEW_TRACK_DISTANCE  5.0
 
 /* ============================================================================
  * Internal helpers
@@ -30,6 +30,32 @@ static double dist3d(const double a[3], const double b[3])
     double dy = a[1] - b[1];
     double dz = a[2] - b[2];
     return sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+/* popcount for int (number of set bits) */
+static int popcount(unsigned int x)
+{
+    int c = 0;
+    while (x) { c += x & 1; x >>= 1; }
+    return c;
+}
+
+/*
+ * Check if two view sets are identical (order-independent).
+ * Views are stored as sorted arrays of camera indices.
+ */
+static int views_match(const int *a, int na, const int *b, int nb)
+{
+    int i, j;
+    if (na != nb) return 0;
+    for (i = 0; i < na; i++) {
+        int found = 0;
+        for (j = 0; j < nb; j++) {
+            if (a[i] == b[j]) { found = 1; break; }
+        }
+        if (!found) return 0;
+    }
+    return 1;
 }
 
 /* Write one frame of data into a track's ring buffer */
@@ -122,7 +148,7 @@ void pt_track_init(PT_TrackState *state)
 }
 
 /* ============================================================================
- * Candidate generation
+ * Candidate generation — all view subsets (port of itertools.combinations)
  * ============================================================================ */
 
 int pt_generate_candidates(
@@ -130,21 +156,19 @@ int pt_generate_candidates(
     const PT_Detection2D detections[PT_MAX_CAMERAS][PT_MAX_DETECTIONS],
     const PT_CameraConstants *constants,
     float keypoint_confidence,
-    PT_Candidate3D *out_candidates,
-    int max_candidates)
+    PT_CandidateGroup *out_groups,
+    int max_groups)
 {
     int gi, mi;
-    int n_candidates = 0;
+    int n_out = 0;
 
-    for (gi = 0; gi < num_groups; gi++) {
-        if (n_candidates >= max_candidates) break;
-
+    for (gi = 0; gi < num_groups && n_out < max_groups; gi++) {
         const PT_Group *group = &groups[gi];
         if (group->num_members < 2) continue;
 
-        /* Collect detection pointers and camera indices for this group */
-        const PT_Detection2D *det_ptrs[PT_MAX_CAMERAS];
-        int cam_indices[PT_MAX_CAMERAS];
+        /* Collect valid detection pointers and camera indices for this group */
+        const PT_Detection2D *all_dets[PT_MAX_CAMERAS];
+        int all_cams[PT_MAX_CAMERAS];
         int n_views = 0;
 
         for (mi = 0; mi < group->num_members; mi++) {
@@ -153,66 +177,114 @@ int pt_generate_candidates(
 
             if (!detections[pi][di].valid) continue;
 
-            det_ptrs[n_views] = &detections[pi][di];
-            cam_indices[n_views] = pi;
+            all_dets[n_views] = &detections[pi][di];
+            all_cams[n_views] = pi;
             n_views++;
         }
 
         if (n_views < 2) continue;
 
-        /* Triangulate all keypoints for this person */
-        PT_Candidate3D *cand = &out_candidates[n_candidates];
-        int ok = pt_triangulate_person(
-            det_ptrs,
-            cam_indices,
-            n_views,
-            constants,
-            keypoint_confidence,
-            cand
-        );
+        /*
+         * Enumerate all subsets of size 2..n_views using bitmasks.
+         * Python: for num_views in range(2, len(active_ports)+1):
+         *             for combo in itertools.combinations(active_ports, num_views):
+         *
+         * Bitmask approach: iterate mask from 3 to (1<<n_views)-1,
+         * skip masks with popcount < 2.
+         */
+        PT_CandidateGroup *cg = &out_groups[n_out];
+        cg->num_candidates = 0;
 
-        if (ok && cand->com_valid) {
-            n_candidates++;
+        unsigned int max_mask = (1u << n_views) - 1;
+        unsigned int mask;
+
+        for (mask = 3; mask <= max_mask; mask++) {
+            if (popcount(mask) < 2) continue;
+            if (cg->num_candidates >= PT_MAX_VIEW_SUBSETS) break;
+
+            /* Extract subset views */
+            const PT_Detection2D *sub_dets[PT_MAX_CAMERAS];
+            int sub_cams[PT_MAX_CAMERAS];
+            int n_sub = 0;
+            int b;
+
+            for (b = 0; b < n_views; b++) {
+                if (mask & (1u << b)) {
+                    sub_dets[n_sub] = all_dets[b];
+                    sub_cams[n_sub] = all_cams[b];
+                    n_sub++;
+                }
+            }
+
+            /* Triangulate this view subset */
+            PT_Candidate3D *cand = &cg->candidates[cg->num_candidates];
+            int ok = pt_triangulate_person(
+                sub_dets, sub_cams, n_sub,
+                constants, keypoint_confidence, cand
+            );
+
+            if (ok && cand->com_valid) {
+                cg->num_candidates++;
+            }
+        }
+
+        if (cg->num_candidates > 0) {
+            n_out++;
         }
     }
 
-    return n_candidates;
+    return n_out;
 }
 
 /* ============================================================================
- * Per-frame track update
+ * Per-frame track update — faithful port of assign_3d_candidates_to_tracks()
  * ============================================================================ */
 
 void pt_track_frame(
     PT_TrackState *state,
-    const PT_Candidate3D *candidates, int num_candidates,
+    const PT_CandidateGroup *groups, int num_groups,
     int sync_index,
     float max_distance,
     int max_persons,
     int patience)
 {
-    int i, j;
+    int i, j, ci;
 
     /*
      * Special case: no existing tracks.
-     * Create new tracks from candidates (up to max_persons).
+     * Python (line 360-379): pick candidates matching default_views (first group's first
+     * candidate's views).  We pick the candidate with the most views from each group.
      */
     if (state->num_tracks == 0 || pt_track_count_active(state) == 0) {
-        int n_to_create = num_candidates;
-        if (n_to_create > max_persons) n_to_create = max_persons;
+        /* Determine default views from first group's first candidate */
+        const int *default_views = NULL;
+        int n_default = 0;
 
-        for (i = 0; i < n_to_create; i++) {
-            if (candidates[i].com_valid) {
-                track_create(state, &candidates[i], sync_index, patience);
+        for (i = 0; i < num_groups; i++) {
+            if (groups[i].num_candidates > 0) {
+                default_views = groups[i].candidates[0].views_used;
+                n_default = groups[i].candidates[0].num_views;
+                break;
+            }
+        }
+
+        int n_created = 0;
+        for (i = 0; i < num_groups && n_created < max_persons; i++) {
+            const PT_CandidateGroup *cg = &groups[i];
+            /* Find candidate matching default views */
+            for (ci = 0; ci < cg->num_candidates; ci++) {
+                const PT_Candidate3D *c = &cg->candidates[ci];
+                if (c->com_valid &&
+                    (default_views == NULL ||
+                     views_match(c->views_used, c->num_views, default_views, n_default))) {
+                    track_create(state, c, sync_index, patience);
+                    n_created++;
+                    break;
+                }
             }
         }
         return;
     }
-
-    /*
-     * Build cost matrix: active_tracks x candidates.
-     * cost[t][c] = ||track[t].com - candidate[c].com|| if < max_distance, else 1000.0
-     */
 
     /* Collect active track indices */
     int active_indices[PT_MAX_TRACKS];
@@ -223,39 +295,71 @@ void pt_track_frame(
         }
     }
 
-    if (n_active == 0 && num_candidates == 0) return;
+    if (n_active == 0 && num_groups == 0) return;
 
-    /* If no active tracks, just create new ones */
+    /* If no active tracks, create new ones (same as above) */
     if (n_active == 0) {
-        int n_to_create = num_candidates;
-        if (n_to_create > max_persons) n_to_create = max_persons;
-        for (i = 0; i < n_to_create; i++) {
-            if (candidates[i].com_valid) {
-                track_create(state, &candidates[i], sync_index, patience);
+        int n_created = 0;
+        for (i = 0; i < num_groups && n_created < max_persons; i++) {
+            const PT_CandidateGroup *cg = &groups[i];
+            /* Pick the candidate with most views */
+            int best_ci = -1, best_nv = 0;
+            for (ci = 0; ci < cg->num_candidates; ci++) {
+                if (cg->candidates[ci].com_valid && cg->candidates[ci].num_views > best_nv) {
+                    best_nv = cg->candidates[ci].num_views;
+                    best_ci = ci;
+                }
+            }
+            if (best_ci >= 0) {
+                track_create(state, &cg->candidates[best_ci], sync_index, patience);
+                n_created++;
             }
         }
         return;
     }
 
-    /* Build cost matrix */
-    double cost[PT_MAX_TRACKS * PT_MAX_GROUPS]; /* flat: n_active x num_candidates */
+    /*
+     * Build cost matrix: n_active tracks x num_groups.
+     *
+     * Python (line 388-420): For each (track, group), find the candidate in the
+     * group whose view set EXACTLY matches the track's last views.  Among matching
+     * candidates, pick the one with smallest COM distance.  Hard constraint: if no
+     * candidate matches the track's views, cost = HI.
+     */
     int n_rows = n_active;
-    int n_cols = num_candidates;
+    int n_cols = num_groups;
+    double cost[PT_MAX_TRACKS * PT_MAX_GROUPS]; /* flat: n_rows x n_cols */
+
+    /* best_cand_idx[i * n_cols + j] = which candidate in group j matches track i */
+    int best_cand_idx[PT_MAX_TRACKS * PT_MAX_GROUPS];
 
     for (i = 0; i < n_rows; i++) {
         PT_PersonTrack *track = &state->tracks[active_indices[i]];
         for (j = 0; j < n_cols; j++) {
-            if (!candidates[j].com_valid) {
-                cost[i * n_cols + j] = 1000.0;
-                continue;
+            const PT_CandidateGroup *cg = &groups[j];
+
+            double best_dist = 1000.0;
+            int best_ci_local = -1;
+
+            for (ci = 0; ci < cg->num_candidates; ci++) {
+                const PT_Candidate3D *c = &cg->candidates[ci];
+                if (!c->com_valid) continue;
+
+                /* Hard constraint: exact view set match (Python line 405-406) */
+                if (!views_match(c->views_used, c->num_views,
+                                 track->last_views, track->num_last_views)) {
+                    continue;
+                }
+
+                double d = dist3d(track->last_com_3d, c->com_3d);
+                if (d < (double)max_distance && d < best_dist) {
+                    best_dist = d;
+                    best_ci_local = ci;
+                }
             }
 
-            double d = dist3d(track->last_com_3d, candidates[j].com_3d);
-            if (d < (double)max_distance) {
-                cost[i * n_cols + j] = d;
-            } else {
-                cost[i * n_cols + j] = 1000.0;
-            }
+            cost[i * n_cols + j] = (best_ci_local >= 0) ? best_dist : 1000.0;
+            best_cand_idx[i * n_cols + j] = best_ci_local;
         }
     }
 
@@ -265,24 +369,32 @@ void pt_track_frame(
     memset(row_assign, -1, sizeof(int) * (size_t)n_rows);
     memset(col_assign, -1, sizeof(int) * (size_t)n_cols);
 
-    if (n_rows > 0 && n_cols > 0) {
+    /* Check if all costs are HI (no valid matches at all) */
+    int any_valid = 0;
+    for (i = 0; i < n_rows * n_cols; i++) {
+        if (cost[i] < 999.0) { any_valid = 1; break; }
+    }
+
+    if (any_valid && n_rows > 0 && n_cols > 0) {
         pt_hungarian(cost, n_rows, n_cols, row_assign, col_assign);
     }
 
     /* Process matches */
     int track_matched[PT_MAX_TRACKS];
-    int cand_matched[PT_MAX_GROUPS];
+    int group_matched[PT_MAX_GROUPS];
     memset(track_matched, 0, sizeof(track_matched));
-    memset(cand_matched, 0, sizeof(cand_matched));
+    memset(group_matched, 0, sizeof(group_matched));
 
     for (i = 0; i < n_rows; i++) {
         j = row_assign[i];
         if (j >= 0 && j < n_cols && cost[i * n_cols + j] < (double)max_distance) {
-            /* Valid match: update track */
-            int ti = active_indices[i];
-            track_update(&state->tracks[ti], &candidates[j], sync_index);
-            track_matched[i] = 1;
-            cand_matched[j] = 1;
+            int bci = best_cand_idx[i * n_cols + j];
+            if (bci >= 0) {
+                int ti = active_indices[i];
+                track_update(&state->tracks[ti], &groups[j].candidates[bci], sync_index);
+                track_matched[i] = 1;
+                group_matched[j] = 1;
+            }
         }
     }
 
@@ -294,37 +406,72 @@ void pt_track_frame(
         }
     }
 
-    /* Create new tracks from unmatched candidates */
+    /*
+     * Create new tracks from unmatched groups.
+     * Python (line 441-551): elaborate scoring with min_new_track_distance=0.3m
+     * and max_new_track_distance=5.0m relative to a reference position.
+     *
+     * We port the essential constraints:
+     *   - Must be >= min_new_track_distance from all active tracks and assigned candidates
+     *   - Must be <= max_new_track_distance from a reference position (first track)
+     *   - Among qualifying candidates, prefer the one with best view count
+     */
     int current_active = pt_track_count_active(state);
-    if (current_active < max_persons) {
-        for (j = 0; j < n_cols; j++) {
-            if (cand_matched[j]) continue;
-            if (!candidates[j].com_valid) continue;
-            if (current_active >= max_persons) break;
-
-            /*
-             * Check that this candidate is not too close to any existing track.
-             * The Python code uses min_new_track_distance = 0.3m.
-             * We use max_distance as the minimum separation threshold --
-             * if a candidate is within max_distance of any active track, it
-             * would have been assigned. Being here means it is far from all
-             * tracks, so it is safe to create.
-             */
-            int too_close = 0;
-            int t;
-            for (t = 0; t < state->num_tracks; t++) {
-                if (!state->tracks[t].is_active) continue;
-                double d = dist3d(state->tracks[t].last_com_3d,
-                                  candidates[j].com_3d);
-                if (d < (double)max_distance) {
-                    too_close = 1;
-                    break;
-                }
+    if (current_active < max_persons && num_groups > 0) {
+        /* Reference position: first active track's COM (Python line 446-453) */
+        double ref_pos[3] = {0, 0, 0};
+        int have_ref = 0;
+        for (i = 0; i < state->num_tracks; i++) {
+            if (state->tracks[i].is_active) {
+                ref_pos[0] = state->tracks[i].last_com_3d[0];
+                ref_pos[1] = state->tracks[i].last_com_3d[1];
+                ref_pos[2] = state->tracks[i].last_com_3d[2];
+                have_ref = 1;
+                break;
             }
+        }
 
-            if (!too_close) {
-                track_create(state, &candidates[j], sync_index, patience);
-                current_active++;
+        if (have_ref) {
+            for (j = 0; j < n_cols; j++) {
+                if (group_matched[j]) continue;
+                if (current_active >= max_persons) break;
+
+                const PT_CandidateGroup *cg = &groups[j];
+                int best_ci_new = -1;
+                int best_nv_new = 0;
+
+                for (ci = 0; ci < cg->num_candidates; ci++) {
+                    const PT_Candidate3D *c = &cg->candidates[ci];
+                    if (!c->com_valid) continue;
+
+                    /* Check max distance from reference */
+                    double d_ref = dist3d(ref_pos, c->com_3d);
+                    if (d_ref > PT_MAX_NEW_TRACK_DISTANCE) continue;
+
+                    /* Check min distance from ALL active tracks */
+                    int too_close = 0;
+                    int t;
+                    for (t = 0; t < state->num_tracks; t++) {
+                        if (!state->tracks[t].is_active) continue;
+                        double d = dist3d(state->tracks[t].last_com_3d, c->com_3d);
+                        if (d < PT_MIN_NEW_TRACK_DISTANCE) {
+                            too_close = 1;
+                            break;
+                        }
+                    }
+                    if (too_close) continue;
+
+                    /* Prefer more views */
+                    if (c->num_views > best_nv_new) {
+                        best_nv_new = c->num_views;
+                        best_ci_new = ci;
+                    }
+                }
+
+                if (best_ci_new >= 0) {
+                    track_create(state, &cg->candidates[best_ci_new], sync_index, patience);
+                    current_active++;
+                }
             }
         }
     }
@@ -356,20 +503,6 @@ int pt_track_get_history(
     const PT_PersonTrack *track = &state->tracks[ti];
     int count = track->history_count;
     if (count > max_frames) count = max_frames;
-
-    /*
-     * The ring buffer write index points to the next slot to write.
-     * The oldest entry is at (write_idx - history_count + RING_SIZE) % RING_SIZE.
-     * We read from oldest to newest.
-     */
-    int start;
-    if (track->history_count >= PT_TRACK_HISTORY_SIZE) {
-        /* Buffer is full: oldest is at write_idx */
-        start = track->history_write_idx;
-    } else {
-        /* Buffer is not full: oldest is at 0 */
-        start = 0;
-    }
 
     /* We want the most recent 'count' frames.
      * Most recent is at (write_idx - 1 + RING_SIZE) % RING_SIZE.
