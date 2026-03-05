@@ -120,13 +120,18 @@ echo.
 echo ---- Linking DLL ----
 
 :: Build link flags with optional OpenCV lib
-set LINK_LIBS=cuda.lib cudart.lib nvinfer.lib
+set LINK_LIBS=cuda.lib cudart.lib nvinfer.lib nvonnxparser.lib
 set LINK_PATHS=/LIBPATH:"%CUDA_PATH%\lib\x64" /LIBPATH:"%TENSORRT_PATH%\lib"
 
 if defined OPENCV_PATH (
-    set LINK_PATHS=%LINK_PATHS% /LIBPATH:"%OPENCV_PATH%\lib"
-    :: Find opencv_world4*.lib (e.g. opencv_world490.lib)
-    for %%f in ("%OPENCV_PATH%\lib\opencv_world4*.lib") do set LINK_LIBS=%LINK_LIBS% %%~nxf
+    :: OpenCV Windows layout: build/x64/vc16/lib/ or build/lib/
+    if exist "%OPENCV_PATH%\x64\vc16\lib" (
+        set LINK_PATHS=%LINK_PATHS% /LIBPATH:"%OPENCV_PATH%\x64\vc16\lib"
+        for %%f in ("%OPENCV_PATH%\x64\vc16\lib\opencv_world4*.lib") do set LINK_LIBS=%LINK_LIBS% %%~nxf
+    ) else (
+        set LINK_PATHS=%LINK_PATHS% /LIBPATH:"%OPENCV_PATH%\lib"
+        for %%f in ("%OPENCV_PATH%\lib\opencv_world4*.lib") do set LINK_LIBS=%LINK_LIBS% %%~nxf
+    )
 )
 
 link /DLL /DEF:calimerge_cuda.def /OUT:calimerge_cuda.dll ^
