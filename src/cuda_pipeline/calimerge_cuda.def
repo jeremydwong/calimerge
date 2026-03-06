@@ -6,3 +6,10 @@ EXPORTS
     pt_pipeline_run
     pt_pipeline_get_stats
     pt_pipeline_destroy
+    pt_load_calibration
+    pt_stream_create
+    pt_stream_destroy
+    pt_stream_process_frame
+    pt_stream_get_stats
+    pt_stream_reset_tracks
+    pt_stream_export_csv

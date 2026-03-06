@@ -254,6 +254,114 @@ cl /LD /EHsc /Zi /DEBUG calimerge_win32.cpp mfplat.lib mfreadwrite.lib mfuuid.li
 
 Not yet implemented. Will use V4L2.
 
+## CUDA Pose Tracking (Optional)
+
+When CUDA, TensorRT, and OpenCV are available, calimerge can run GPU-accelerated 3D pose tracking that is **~15x faster** than the Python pipeline.
+
+### Prerequisites
+
+- NVIDIA GPU (Compute Capability >= 7.0)
+- [CUDA Toolkit 12.x](https://developer.nvidia.com/cuda-toolkit)
+- [TensorRT 10.x](https://developer.nvidia.com/tensorrt)
+- [OpenCV 4.x](https://opencv.org/) with FFmpeg support
+- MSVC Build Tools 2022
+
+### Building the CUDA Pipeline
+
+```bash
+set TENSORRT_PATH=C:\TensorRT
+set OPENCV_PATH=C:\OpenCV\opencv\build
+src\cuda_pipeline\build_cuda_win32.bat release
+```
+
+Produces `pt_main.exe` (CLI) and `calimerge_cuda.dll` (for Python integration).
+
+### Offline Processing (Recorded Videos)
+
+Process pre-recorded multi-camera videos through the full pipeline:
+
+```bash
+pt_main.exe <recording_dir> <calibration.toml> [options]
+
+Options:
+  --batch-size N       Sync indices per batch (default 8)
+  --skip N             Process every Nth sync index (default 1)
+  --max-persons N      Max tracked persons (default 2)
+  --person-conf F      YOLO detection threshold (default 0.1)
+  --yolo PATH          Path to YOLO ONNX model
+  --vitpose PATH       Path to VitPose ONNX model
+```
+
+**Pipeline stages:**
+
+```
+Video Decode (NVDEC or CPU fallback)
+  → NV12 → BGR (CUDA kernel, BT.601)
+  → Letterbox + Normalize to FP16 640x640 (CUDA kernel, writes __half directly)
+  → YOLO v10s Person Detection (TensorRT, FP16 input, FP32 output)
+  → Filter Detections (CUDA kernel, class=0 person, undo letterbox)
+  → VitPose Crop + Normalize 192x256 (CUDA kernel, 1.25x box expansion, ImageNet stats)
+  → VitPose Base COCO (TensorRT, 17 keypoints)
+  → Heatmap Decode with DARK Refinement (CUDA kernel, sub-pixel via Taylor expansion)
+  → Cross-View Epipolar Matching (CPU, Hungarian algorithm + union-find)
+  → SVD Triangulation (CPU, Jacobi eigendecomposition)
+  → Multi-Person Tracking (CPU, 3D COM distance matching)
+  → CSV Export (52-marker SynthPose format, NaN-padded beyond 17 COCO keypoints)
+```
+
+**Performance:** 796 frames x 3 cameras in 12 seconds (199 camera-frames/s). Validated against the Python posetrack pipeline with mean 3D Euclidean error of 4cm across 753 overlapping frames.
+
+### Online Processing (Real-Time Streaming)
+
+A streaming C API accepts live BGR camera frames and returns 3D tracked poses
+synchronously. Designed for use with `cm_capture_synced()` from the native
+camera module.
+
+```c
+PT_Stream *stream;
+pt_stream_create(&stream, &config);   // allocate GPU, build engines (~5-30s)
+
+// Per-frame loop (called from capture thread):
+PT_StreamResult result;
+pt_stream_process_frame(stream, &frameset, &result);  // ~10ms
+
+pt_stream_destroy(stream);
+```
+
+Test with recorded videos:
+```bash
+pt_stream_main.exe <recording_dir> <calibration.toml> [options]
+```
+
+**Performance:** 796 frames x 3 cameras in 8.2s (10.0 ms/frame, ~100 sync-frames/s).
+Batch vs stream agreement: 0.93 cm mean 3D distance (sub-centimeter).
+
+### Architecture
+
+#### GPU Arena: Single-Allocation Pattern
+
+All GPU memory comes from **one `cudaMalloc`** call. All pinned host memory comes from **one `cudaMallocHost`** call. Every buffer (decode, YOLO input/output, VitPose input/output, keypoints, detection boxes) is carved out of these two blocks via pointer arithmetic with 256-byte alignment. This eliminates GPU memory fragmentation, simplifies the lifecycle (one alloc, one free), and ensures all buffers are naturally aligned for coalesced access. Total allocation: ~100MB GPU + ~18KB pinned host for 3 cameras at 640x480 with batch size 8.
+
+#### Batching Strategy
+
+YOLO inference is batched across multiple sync indices: 8 sync indices x 3 cameras = 24 images processed in a single TensorRT call. VitPose runs **per sync index** (inside the batch loop) because it depends on YOLO detection results that vary per frame. Max VitPose batch = num_cameras x 16 max detections = 48 crops. This split maximizes GPU utilization for YOLO while respecting the data dependency for VitPose.
+
+#### TensorRT FP16 I/O
+
+The letterbox CUDA kernel writes `__half` (FP16) values directly into the arena's YOLO input buffer -- no FP32-to-FP16 conversion step. The TensorRT engine's input tensor type is explicitly set to `kHALF` during engine build so it accepts the FP16 data natively. Output is left as FP32 (the `filter_detections` kernel reads FP32). TensorRT engines are cached to disk with keys encoding `{model_name}_{sm_version}_{max_batch}_{precision}.engine`, so engine rebuilds only happen when the model, GPU, or config changes.
+
+#### Pinned Memory for Async GPU-to-CPU Transfer
+
+Detection counts (a few integers) are copied GPU-to-CPU first via `cudaMemcpyAsync` into pinned host memory, then the stream is synchronized to read the counts on CPU (needed to determine VitPose batch size). Larger transfers (2D keypoints, detection boxes, scores) are also async into pinned buffers. This lets CPU math overlap with pending GPU work when possible.
+
+#### CPU Triangulation (Not GPU)
+
+3D triangulation uses Jacobi eigendecomposition of a 4x4 `A^T*A` matrix (smallest eigenvector = homogeneous 3D point) plus iterative Newton-Raphson undistortion. Each keypoint for each person is a separate tiny matrix problem -- too fine-grained for GPU kernel dispatch overhead. CPU handles it in ~1ms per person per frame. Cross-view matching uses the Hungarian algorithm O(n^3) for n <= 16 (max detections per camera), also better suited to CPU.
+
+#### Precomputed Fundamental Matrices
+
+Fundamental matrices `F[i][j]` for all camera pairs are computed once at startup from the calibration data (via null-space decomposition of the projection matrices, rank-2 enforcement via SVD). Per-frame cross-view matching uses these precomputed matrices for epipolar distance calculations -- no per-frame recomputation as the Python pipeline does.
+
 ## Project Structure
 
 ```
@@ -278,10 +386,25 @@ calimerge/
 │   │       ├── tabs/           # Cameras, Record, Intrinsic, Extrinsic, Process
 │   │       └── widgets/        # CameraGrid, VideoPlayer
 │   │
-│   └── native/                 # C++ camera module
-│       ├── calimerge_platform.h
-│       ├── calimerge_macos.mm
-│       └── build_macos.sh
+│   ├── native/                 # C++ camera module
+│   │   ├── calimerge_platform.h
+│   │   ├── calimerge_macos.mm
+│   │   └── build_macos.sh
+│   │
+│   └── cuda_pipeline/          # CUDA pose tracking (optional)
+│       ├── pt_pipeline.cpp/h   # Batch pipeline orchestrator
+│       ├── pt_arena.cu/h       # Single-allocation GPU arena
+│       ├── pt_kernels.cu/h     # CUDA kernels (letterbox, crop, heatmap)
+│       ├── pt_tensorrt.cpp/h   # TensorRT engine lifecycle
+│       ├── pt_nvdec.cpp/h      # Video decode (NVDEC + CPU fallback)
+│       ├── pt_matching.cpp/h   # Cross-view epipolar matching
+│       ├── pt_triangulation.cpp/h # SVD 3D reconstruction
+│       ├── pt_tracker.cpp/h    # Multi-person tracking
+│       ├── pt_export.cpp/h     # CSV export
+│       ├── pt_stream.cpp/h     # Real-time streaming API
+│       ├── pt_common.h         # Shared constants and structs
+│       ├── pt_main.cpp         # Batch pipeline CLI test
+│       └── pt_stream_main.cpp  # Streaming pipeline test
 │
 ├── tests/                      # Test suite
 ├── recordings/                 # Output directory

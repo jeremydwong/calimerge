@@ -685,6 +685,24 @@ extern "C" int pt_pipeline_load_calibration(PT_Pipeline *p, const char *toml_pat
 }
 
 /* ============================================================================
+ * Standalone calibration loader (shared with pt_stream)
+ * ============================================================================ */
+
+extern "C" int pt_load_calibration(PT_CameraConstants *constants, const char *toml_path) {
+    if (!constants || !toml_path) return PT_ERR_INVALID_PARAM;
+
+    memset(constants, 0, sizeof(PT_CameraConstants));
+
+    int rc = load_calibration_toml(constants, toml_path);
+    if (rc != PT_OK) return rc;
+
+    pt_compute_projection_matrices(constants);
+    pt_precompute_fundamentals(constants);
+
+    return PT_OK;
+}
+
+/* ============================================================================
  * Load sync table
  * ============================================================================ */
 

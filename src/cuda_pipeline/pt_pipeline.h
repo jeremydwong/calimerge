@@ -133,6 +133,22 @@ int pt_pipeline_run(PT_Pipeline *p);
  */
 void pt_pipeline_get_stats(const PT_Pipeline *p, PT_Stats *out);
 
+/* ============================================================================
+ * Standalone calibration loader (shared with pt_stream)
+ * ============================================================================ */
+
+/*
+ * pt_load_calibration - Load camera calibration from a TOML file into a
+ * standalone PT_CameraConstants struct.
+ *
+ * Parses the TOML, then computes projection matrices and fundamental matrices.
+ * This is the same operation as pt_pipeline_load_calibration() but does not
+ * require a PT_Pipeline instance.
+ *
+ * Returns PT_OK on success.
+ */
+int pt_load_calibration(PT_CameraConstants *constants, const char *toml_path);
+
 #ifdef __cplusplus
 }
 #endif

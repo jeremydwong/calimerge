@@ -116,6 +116,9 @@ if errorlevel 1 ( echo BUILD FAILED: pt_export.cpp & popd & exit /b 1 )
 cl /c %CFLAGS% %CL_INCLUDES% /Fo:pt_pipeline.obj pt_pipeline.cpp
 if errorlevel 1 ( echo BUILD FAILED: pt_pipeline.cpp & popd & exit /b 1 )
 
+cl /c %CFLAGS% %CL_INCLUDES% /Fo:pt_stream.obj pt_stream.cpp
+if errorlevel 1 ( echo BUILD FAILED: pt_stream.cpp & popd & exit /b 1 )
+
 echo.
 echo ---- Linking DLL ----
 
@@ -138,7 +141,7 @@ link /DLL /DEF:calimerge_cuda.def /OUT:calimerge_cuda.dll ^
     pt_arena.obj pt_kernels.obj ^
     pt_tensorrt.obj pt_nvdec.obj pt_matching.obj ^
     pt_triangulation.obj pt_tracker.obj pt_export.obj ^
-    pt_pipeline.obj ^
+    pt_pipeline.obj pt_stream.obj ^
     %LINK_LIBS% ^
     %LINK_PATHS%
 
@@ -160,13 +163,29 @@ cl %CFLAGS% %CL_INCLUDES% /Fe:pt_main.exe pt_main.cpp ^
     pt_arena.obj pt_kernels.obj ^
     pt_tensorrt.obj pt_nvdec.obj pt_matching.obj ^
     pt_triangulation.obj pt_tracker.obj pt_export.obj ^
-    pt_pipeline.obj ^
+    pt_pipeline.obj pt_stream.obj ^
     /link %LINK_LIBS% %LINK_PATHS%
 
 if errorlevel 1 (
     echo WARNING: pt_main.exe build failed (non-fatal)
 ) else (
     echo pt_main.exe built successfully
+)
+
+echo.
+echo ---- Building streaming test program (pt_stream_main.exe) ----
+
+cl %CFLAGS% %CL_INCLUDES% /Fe:pt_stream_main.exe pt_stream_main.cpp ^
+    pt_arena.obj pt_kernels.obj ^
+    pt_tensorrt.obj pt_nvdec.obj pt_matching.obj ^
+    pt_triangulation.obj pt_tracker.obj pt_export.obj ^
+    pt_pipeline.obj pt_stream.obj ^
+    /link %LINK_LIBS% %LINK_PATHS%
+
+if errorlevel 1 (
+    echo WARNING: pt_stream_main.exe build failed (non-fatal)
+) else (
+    echo pt_stream_main.exe built successfully
 )
 
 popd
