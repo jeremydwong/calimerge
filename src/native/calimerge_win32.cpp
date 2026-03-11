@@ -22,7 +22,7 @@
 #include <mfidl.h>
 #include <mfreadwrite.h>
 #include <mferror.h>
-#include <strmif.h>
+#include <dshow.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -34,6 +34,7 @@
 #pragma comment(lib, "mfuuid.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "strmiids.lib")
+#pragma comment(lib, "oleaut32.lib")
 
 /* ============================================================================
  * QPC Timestamp (global, thread-safe after first call)
@@ -486,6 +487,9 @@ typedef struct {
     /* Native pixel format from camera */
     GUID             native_format;
 
+    /* Device identification (for DirectShow property fallback) */
+    WCHAR            device_symlink[512];
+
     /* State */
     bool             is_open;
     int              camera_index;
@@ -706,7 +710,7 @@ static int find_best_media_type(IMFSourceReader *reader, int target_w, int targe
                                 int target_fps, GUID *out_format) {
     int best_index = -1;
     bool best_has_fps_match = false;
-    int best_format_rank = 0;  /* 3=RGB32, 2=NV12, 1=YUY2 */
+    int best_format_rank = 0;
 
     for (DWORD i = 0; ; i++) {
         IMFMediaType *type = NULL;
@@ -716,23 +720,24 @@ static int find_best_media_type(IMFSourceReader *reader, int target_w, int targe
         UINT32 w = 0, h = 0;
         MFGetAttributeSize(type, MF_MT_FRAME_SIZE, &w, &h);
 
-        if ((int)w == target_w && (int)h == target_h) {
-            GUID subtype = {0};
-            type->GetGUID(MF_MT_SUBTYPE, &subtype);
+        GUID subtype = {0};
+        type->GetGUID(MF_MT_SUBTYPE, &subtype);
 
+        if ((int)w == target_w && (int)h == target_h) {
             int rank = 0;
-            if (IsEqualGUID(subtype, MFVideoFormat_RGB32)) rank = 3;
-            else if (IsEqualGUID(subtype, MFVideoFormat_NV12)) rank = 2;
-            else if (IsEqualGUID(subtype, MFVideoFormat_YUY2)) rank = 1;
+            if (IsEqualGUID(subtype, MFVideoFormat_NV12))  rank = 3;
+            else if (IsEqualGUID(subtype, MFVideoFormat_YUY2))  rank = 2;
+            else if (IsEqualGUID(subtype, MFVideoFormat_RGB32)) rank = 1;
+            /* MJPEG: rank 0 (skipped — we clamp resolution to avoid needing it) */
 
             if (rank > 0) {
                 /* Check FPS match */
                 bool fps_match = false;
                 if (target_fps > 0) {
-                    UINT32 num = 0, den = 0;
-                    MFGetAttributeRatio(type, MF_MT_FRAME_RATE, &num, &den);
-                    if (den > 0) {
-                        int type_fps = (int)(num / den);
+                    UINT32 fr_num = 0, fr_den = 0;
+                    MFGetAttributeRatio(type, MF_MT_FRAME_RATE, &fr_num, &fr_den);
+                    if (fr_den > 0) {
+                        int type_fps = (int)(fr_num / fr_den);
                         fps_match = (type_fps == target_fps);
                     }
                 }
@@ -995,6 +1000,42 @@ int cm_open_camera(CM_Camera *camera) {
 
     ring_buffer_init(&handle->ring_buffer);
     handle->camera_index = camera->device_index;
+
+    /* Store device symbolic link for DirectShow property fallback */
+    {
+        WCHAR *symlink = NULL;
+        UINT32 link_len = 0;
+        if (SUCCEEDED(target_activate->GetAllocatedString(
+                MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK,
+                &symlink, &link_len)) && symlink) {
+            wcsncpy(handle->device_symlink, symlink, 511);
+            handle->device_symlink[511] = L'\0';
+            CoTaskMemFree(symlink);
+        }
+    }
+
+    /*
+     * Clamp resolution to 1920x1080 max for USB bandwidth reliability.
+     * Uncompressed NV12/YUY2 at higher resolutions (e.g., 2560x1440 = ~166 MB/s)
+     * exceeds USB 2.0 bandwidth (~40 MB/s), causing ReadSample failures.
+     */
+    if (camera->width > 1920 || camera->height > 1080) {
+        /* Find largest supported format <= 1080p */
+        int best_w = 640, best_h = 480;
+        for (int i = 0; i < camera->supported_format_count; i++) {
+            int fw = camera->supported_formats[i].width;
+            int fh = camera->supported_formats[i].height;
+            if (fw <= 1920 && fh <= 1080 && (fw * fh) > (best_w * best_h)) {
+                best_w = fw;
+                best_h = fh;
+            }
+        }
+        printf("[calimerge] Camera %d: clamping %dx%d -> %dx%d (USB bandwidth)\n",
+               camera->device_index, camera->width, camera->height, best_w, best_h);
+        camera->width = best_w;
+        camera->height = best_h;
+    }
+
     handle->width = camera->width;
     handle->height = camera->height;
 
@@ -1157,25 +1198,171 @@ int cm_set_exposure(CM_Camera *camera, int exposure) {
     if (!camera->platform_handle) return CM_OK;
 
     Win32CameraHandle *handle = (Win32CameraHandle *)camera->platform_handle;
-    if (!handle->media_source) return CM_OK;
+    int success = 0;
+    HRESULT hr;
 
-    IAMVideoProcAmp *proc_amp = NULL;
-    HRESULT hr = handle->media_source->QueryInterface(IID_IAMVideoProcAmp,
-                                                       (void **)&proc_amp);
-    if (SUCCEEDED(hr) && proc_amp) {
-        /* Disable auto-exposure, set manual value */
-        hr = proc_amp->Set(VideoProcAmp_Exposure, (long)exposure,
-                           VideoProcAmp_Flags_Manual);
-        if (SUCCEEDED(hr)) {
-            printf("[calimerge] Camera %d: exposure set to %d\n",
-                   camera->device_index, exposure);
-        } else {
-            printf("[calimerge] Camera %d: exposure set failed (hr=0x%08lx)\n",
-                   camera->device_index, (unsigned long)hr);
+    /*
+     * Approach 1: IMFSourceReader::GetServiceForStream (OpenCV MSMF pattern).
+     * This traverses internal MF topology to find IAMCameraControl, which
+     * direct QueryInterface on IMFMediaSource often misses.
+     */
+    if (!success && handle->source_reader) {
+        IAMCameraControl *cam_ctrl = NULL;
+        hr = handle->source_reader->GetServiceForStream(
+            (DWORD)MF_SOURCE_READER_MEDIASOURCE,
+            GUID_NULL,
+            IID_IAMCameraControl,
+            (void **)&cam_ctrl);
+        if (SUCCEEDED(hr) && cam_ctrl) {
+            hr = cam_ctrl->Set(CameraControl_Exposure, (long)exposure,
+                               CameraControl_Flags_Manual);
+            if (SUCCEEDED(hr)) {
+                printf("[calimerge] Camera %d: exposure=%d (GetServiceForStream)\n",
+                       camera->device_index, exposure);
+                success = 1;
+            }
+            cam_ctrl->Release();
         }
-        proc_amp->Release();
-    } else {
-        printf("[calimerge] Camera %d: IAMVideoProcAmp not supported\n",
+    }
+
+    /* Approach 2: Direct QueryInterface on IMFMediaSource (some drivers) */
+    if (!success && handle->media_source) {
+        IAMCameraControl *cam_ctrl = NULL;
+        hr = handle->media_source->QueryInterface(IID_IAMCameraControl,
+                                                   (void **)&cam_ctrl);
+        if (SUCCEEDED(hr) && cam_ctrl) {
+            hr = cam_ctrl->Set(CameraControl_Exposure, (long)exposure,
+                               CameraControl_Flags_Manual);
+            if (SUCCEEDED(hr)) {
+                printf("[calimerge] Camera %d: exposure=%d (direct QI)\n",
+                       camera->device_index, exposure);
+                success = 1;
+            }
+            cam_ctrl->Release();
+        }
+    }
+
+    /*
+     * Approach 3: DirectShow fallback.
+     * Some cameras (e.g., Nuroum) only expose IAMCameraControl through the
+     * DirectShow capture filter, not through MF's GetServiceForStream.
+     * We enumerate DShow devices, match by symbolic link, bind to the filter
+     * (without streaming), and set the property.
+     */
+    if (!success && handle->device_symlink[0] != L'\0') {
+        ICreateDevEnum *dev_enum = NULL;
+        hr = CoCreateInstance(CLSID_SystemDeviceEnum, NULL, CLSCTX_INPROC_SERVER,
+                              IID_ICreateDevEnum, (void **)&dev_enum);
+        if (SUCCEEDED(hr) && dev_enum) {
+            IEnumMoniker *enum_mon = NULL;
+            hr = dev_enum->CreateClassEnumerator(CLSID_VideoInputDeviceCategory,
+                                                  &enum_mon, 0);
+            if (hr == S_OK && enum_mon) {
+                IMoniker *moniker = NULL;
+                while (!success && enum_mon->Next(1, &moniker, NULL) == S_OK) {
+                    IPropertyBag *prop_bag = NULL;
+                    hr = moniker->BindToStorage(NULL, NULL, IID_IPropertyBag,
+                                                 (void **)&prop_bag);
+                    if (SUCCEEDED(hr) && prop_bag) {
+                        VARIANT var_path;
+                        VariantInit(&var_path);
+                        if (SUCCEEDED(prop_bag->Read(L"DevicePath", &var_path, NULL))) {
+                            /*
+                             * Compare device paths ignoring the trailing
+                             * interface GUID. MF uses KSCATEGORY_VIDEO_CAMERA
+                             * while DShow uses KSCATEGORY_VIDEO_CAPTURE.
+                             * Match up to the last '{'.
+                             */
+                            const WCHAR *mf_end = wcsrchr(handle->device_symlink, L'{');
+                            const WCHAR *ds_end = wcsrchr(var_path.bstrVal, L'{');
+                            int mf_prefix_len = mf_end ? (int)(mf_end - handle->device_symlink) : (int)wcslen(handle->device_symlink);
+                            int ds_prefix_len = ds_end ? (int)(ds_end - var_path.bstrVal) : (int)wcslen(var_path.bstrVal);
+                            if (mf_prefix_len == ds_prefix_len &&
+                                _wcsnicmp(var_path.bstrVal,
+                                          handle->device_symlink, mf_prefix_len) == 0) {
+                                IBaseFilter *filter = NULL;
+                                hr = moniker->BindToObject(NULL, NULL,
+                                                            IID_IBaseFilter,
+                                                            (void **)&filter);
+                                if (SUCCEEDED(hr) && filter) {
+                                    /* Try CameraControl_Exposure via DShow */
+                                    IAMCameraControl *cam_ctrl = NULL;
+                                    hr = filter->QueryInterface(
+                                        IID_IAMCameraControl,
+                                        (void **)&cam_ctrl);
+                                    if (SUCCEEDED(hr) && cam_ctrl) {
+                                        hr = cam_ctrl->Set(
+                                            CameraControl_Exposure,
+                                            (long)exposure,
+                                            CameraControl_Flags_Manual);
+                                        if (SUCCEEDED(hr)) {
+                                            printf("[calimerge] Camera %d: "
+                                                   "exposure=%d (DirectShow)\n",
+                                                   camera->device_index,
+                                                   exposure);
+                                            success = 1;
+                                        }
+                                        cam_ctrl->Release();
+                                    }
+                                    /*
+                                     * Fallback: VideoProcAmp_Brightness.
+                                     * Some cameras (e.g., Nuroum V11) have no
+                                     * exposure control at all — confirmed via
+                                     * UVC probe (no Camera Terminal properties,
+                                     * no extension units, no extended controls).
+                                     * Brightness is the only lightness control.
+                                     * Map exposure (-10..0) → brightness range.
+                                     */
+                                    if (!success) {
+                                        IAMVideoProcAmp *vpa = NULL;
+                                        hr = filter->QueryInterface(
+                                            IID_IAMVideoProcAmp, (void **)&vpa);
+                                        if (SUCCEEDED(hr) && vpa) {
+                                            long bmin, bmax, bstep, bdef, bcaps;
+                                            hr = vpa->GetRange(
+                                                VideoProcAmp_Brightness,
+                                                &bmin, &bmax, &bstep,
+                                                &bdef, &bcaps);
+                                            if (SUCCEEDED(hr) && bmax > bmin) {
+                                                int clamped = exposure;
+                                                if (clamped < -10) clamped = -10;
+                                                if (clamped > 0) clamped = 0;
+                                                long brightness = bmin +
+                                                    (long)((clamped + 10) *
+                                                           (bmax - bmin) / 10);
+                                                hr = vpa->Set(
+                                                    VideoProcAmp_Brightness,
+                                                    brightness,
+                                                    VideoProcAmp_Flags_Manual);
+                                                if (SUCCEEDED(hr)) {
+                                                    printf("[calimerge] Camera %d: "
+                                                           "exposure=%d -> brightness=%ld "
+                                                           "(DShow fallback)\n",
+                                                           camera->device_index,
+                                                           exposure, brightness);
+                                                    success = 1;
+                                                }
+                                            }
+                                            vpa->Release();
+                                        }
+                                    }
+                                    filter->Release();
+                                }
+                            }
+                        }
+                        VariantClear(&var_path);
+                        prop_bag->Release();
+                    }
+                    moniker->Release();
+                }
+                enum_mon->Release();
+            }
+            dev_enum->Release();
+        }
+    }
+
+    if (!success) {
+        printf("[calimerge] Camera %d: exposure control not available\n",
                camera->device_index);
     }
 

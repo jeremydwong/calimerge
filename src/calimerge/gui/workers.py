@@ -44,25 +44,35 @@ class CameraPreviewWorker(QThread):
     frame_captured = Signal(int, object)  # port, np.ndarray
     error = Signal(str)
 
-    def __init__(self, cameras: list, fps: int = 30):
+    def __init__(self, cameras: list, ports: list[int], fps: int = 30):
         super().__init__()
         self.cameras = cameras
+        self.ports = ports
         self.fps = fps
         self.running = True
+        self._paused = False
 
     def run(self):
         from ..camera_binding import capture_synced
 
         frame_interval = 1.0 / self.fps
+        consecutive_errors = 0
+        max_retries = 5
 
         while self.running:
+            if self._paused:
+                time.sleep(0.05)
+                continue
+
             try:
                 start = time.perf_counter()
 
                 frameset = capture_synced(self.cameras)
-                for port, frame in frameset.frames.items():
+                consecutive_errors = 0  # reset on success
+
+                for i, (_, frame) in enumerate(frameset.frames.items()):
                     if frame is not None:
-                        self.frame_captured.emit(port, frame.pixels)
+                        self.frame_captured.emit(self.ports[i], frame.pixels)
 
                 # Pace to target FPS
                 elapsed = time.perf_counter() - start
@@ -71,11 +81,23 @@ class CameraPreviewWorker(QThread):
                     time.sleep(sleep_time)
 
             except Exception as e:
-                self.error.emit(str(e))
-                break
+                consecutive_errors += 1
+                if consecutive_errors >= max_retries:
+                    self.error.emit(f"Preview failed after {max_retries} retries: {e}")
+                    break
+                # Brief backoff before retry
+                time.sleep(0.1)
 
     def stop(self):
         self.running = False
+
+    def pause(self):
+        """Pause frame capture (cameras stay open)."""
+        self._paused = True
+
+    def resume(self):
+        """Resume frame capture."""
+        self._paused = False
 
 
 class RecordingWorker(QThread):
@@ -90,6 +112,7 @@ class RecordingWorker(QThread):
     def __init__(
         self,
         cameras: list,
+        ports: list[int],
         output_path: Path,
         duration: float,
         fps: int,
@@ -97,6 +120,7 @@ class RecordingWorker(QThread):
     ):
         super().__init__()
         self.cameras = cameras
+        self.ports = ports
         self.output_path = output_path
         self.duration = duration
         self.fps = fps
@@ -112,7 +136,7 @@ class RecordingWorker(QThread):
             frame_interval = 1.0 / self.fps
 
             writers = {}
-            frame_counts = {i: 0 for i in range(len(self.cameras))}
+            frame_counts = {port: 0 for port in self.ports}
             frame_times = []
 
             # Log encoder info
@@ -139,35 +163,40 @@ class RecordingWorker(QThread):
                 current_time = time.perf_counter()
                 frame_time = current_time - start_time
 
-                for cam_idx, frame in frameset.frames.items():
+                for i, (_, frame) in enumerate(frameset.frames.items()):
                     if frame is None:
                         continue
 
+                    port = self.ports[i]
+                    serial = self.cameras[i].serial_number
+                    sanitized_serial = serial.replace("&", "-")
+
                     # Initialize writer on first frame
-                    if cam_idx not in writers:
-                        video_path = self.output_path / f"port_{cam_idx}.mp4"
-                        writers[cam_idx] = create_video_writer(
+                    if port not in writers:
+                        video_path = self.output_path / f"port_{port}_{sanitized_serial}.mp4"
+                        writers[port] = create_video_writer(
                             video_path,
                             frame.width,
                             frame.height,
                             self.fps,
                             codec=self.codec,
+                            metadata={"comment": f"serial:{serial}"},
                         )
                         self.log_message.emit(
-                            f"  Camera {cam_idx}: {frame.width}x{frame.height}"
+                            f"  Port {port} [{serial}]: {frame.width}x{frame.height}"
                         )
 
-                    write_frame(writers[cam_idx], frame.pixels)
-                    frame_counts[cam_idx] += 1
+                    write_frame(writers[port], frame.pixels)
+                    frame_counts[port] += 1
 
                     # Emit for preview/FPS tracking
-                    self.frame_captured.emit(cam_idx, frame.pixels)
+                    self.frame_captured.emit(port, frame.pixels)
 
                     frame_times.append(
                         {
                             "sync_index": sync_index,
-                            "port": cam_idx,
-                            "frame_index": frame_counts[cam_idx] - 1,
+                            "port": port,
+                            "frame_index": frame_counts[port] - 1,
                             "frame_time": frame_time,
                         }
                     )
@@ -195,8 +224,8 @@ class RecordingWorker(QThread):
                 "sync_count": sync_index,
                 "duration": time.perf_counter() - start_time,
                 "cameras": {
-                    idx: {"frame_count": count, "video_file": f"port_{idx}.mp4"}
-                    for idx, count in frame_counts.items()
+                    port: {"frame_count": count}
+                    for port, count in frame_counts.items()
                 },
             }
             self.recording_finished.emit(stats)
@@ -208,7 +237,7 @@ class RecordingWorker(QThread):
         csv_path = self.output_path / "frame_time_history.csv"
         with open(csv_path, "w", newline="") as f:
             serial_mapping = ",".join(
-                f"{i}={cam.serial_number}" for i, cam in enumerate(self.cameras)
+                f"{self.ports[i]}={cam.serial_number}" for i, cam in enumerate(self.cameras)
             )
             f.write(f"# cameras: {serial_mapping}\n")
 
@@ -230,7 +259,7 @@ class RecordingWorker(QThread):
             writer = csv.writer(f)
             writer.writerow(["port", "serial_number", "display_name"])
             for i, cam in enumerate(self.cameras):
-                writer.writerow([i, cam.serial_number, cam.display_name])
+                writer.writerow([self.ports[i], cam.serial_number, cam.display_name])
 
     def stop(self):
         self.running = False

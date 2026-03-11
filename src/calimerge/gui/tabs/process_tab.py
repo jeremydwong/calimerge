@@ -188,6 +188,26 @@ class ProcessTab(QWidget):
 
         left_layout.addWidget(export_group)
 
+        # Live keypoint overlay (requires intrinsic + extrinsic calibration)
+        live_group = QGroupBox("Live Overlay")
+        live_layout = QVBoxLayout(live_group)
+
+        self.live_overlay_button = QPushButton("Live Keypoint Projection")
+        self.live_overlay_button.setToolTip(
+            "Project 3D keypoints onto live camera feed (requires intrinsic + extrinsic calibration)"
+        )
+        self.live_overlay_button.setMinimumHeight(36)
+        self.live_overlay_button.setEnabled(False)
+        self.live_overlay_button.clicked.connect(self._toggle_live_overlay)
+        live_layout.addWidget(self.live_overlay_button)
+
+        self.live_status_label = QLabel("Requires intrinsic + extrinsic calibration")
+        self.live_status_label.setStyleSheet("color: #888;")
+        self.live_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        live_layout.addWidget(self.live_status_label)
+
+        left_layout.addWidget(live_group)
+
         splitter.addWidget(left_panel)
 
         # Right: video preview
@@ -208,6 +228,7 @@ class ProcessTab(QWidget):
 
     def _connect_signals(self):
         self.state_manager.processing_changed.connect(self._on_processing_changed)
+        self.state_manager.calibration_changed.connect(self._on_calibration_changed)
 
     def _log(self, message: str):
         """Append to log."""
@@ -375,3 +396,28 @@ class ProcessTab(QWidget):
             self._log(f"Exporting to {path}")
             # TODO: Implement C3D export
             self.status_message.emit(f"Exported to {path}")
+
+    def _on_calibration_changed(self, cal_state):
+        """Enable live overlay button when both intrinsic and extrinsic are done."""
+        has_intrinsics = bool(cal_state.intrinsics)
+        has_extrinsics = bool(cal_state.calibrated_cameras)
+
+        ready = has_intrinsics and has_extrinsics
+        self.live_overlay_button.setEnabled(ready)
+
+        if ready:
+            n_cams = len(cal_state.calibrated_cameras)
+            self.live_status_label.setText(f"Ready ({n_cams} calibrated cameras)")
+            self.live_status_label.setStyleSheet("color: #50c878;")
+        elif has_intrinsics:
+            self.live_status_label.setText("Intrinsics done, needs extrinsic calibration")
+            self.live_status_label.setStyleSheet("color: #ffaa00;")
+        else:
+            self.live_status_label.setText("Requires intrinsic + extrinsic calibration")
+            self.live_status_label.setStyleSheet("color: #888;")
+
+    def _toggle_live_overlay(self):
+        """Toggle live keypoint projection overlay."""
+        # TODO: Implement live overlay - open camera, run pose estimation, project keypoints
+        self._log("Live keypoint projection: not yet implemented")
+        self.status_message.emit("Live overlay coming soon")

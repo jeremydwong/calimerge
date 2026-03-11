@@ -157,9 +157,9 @@ class IntrinsicTab(QWidget):
         cameras_layout = QVBoxLayout(cameras_group)
 
         self.camera_table = QTableWidget()
-        self.camera_table.setColumnCount(6)
+        self.camera_table.setColumnCount(7)
         self.camera_table.setHorizontalHeaderLabels(
-            ["", "Port", "Camera", "Video", "Status", "Error"]
+            ["", "Port", "Camera", "Serial", "Video", "Status", "Error"]
         )
         header = self.camera_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
@@ -167,12 +167,14 @@ class IntrinsicTab(QWidget):
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
         header.resizeSection(1, 40)  # Port
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
-        header.resizeSection(2, 150)  # Camera name
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)  # Video
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
-        header.resizeSection(4, 100)  # Status
+        header.resizeSection(2, 120)  # Camera name
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
+        header.resizeSection(3, 140)  # Serial
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)  # Video
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
-        header.resizeSection(5, 70)  # Error
+        header.resizeSection(5, 100)  # Status
+        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
+        header.resizeSection(6, 70)  # Error
         self.camera_table.setSelectionBehavior(
             QTableWidget.SelectionBehavior.SelectRows
         )
@@ -381,23 +383,30 @@ class IntrinsicTab(QWidget):
             port_item.setFlags(port_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.camera_table.setItem(row, 1, port_item)
 
-            # Camera name + FULL serial (column 2)
+            # Camera name + nickname (column 2)
             serial = cam_state.info.serial_number
-            name_text = f"{cam_state.info.display_name}\n{serial}"
+            nickname = cam_state.nickname
+            name_text = f"{nickname} - {cam_state.info.display_name}" if nickname else cam_state.info.display_name
             name_item = QTableWidgetItem(name_text)
             name_item.setData(Qt.ItemDataRole.UserRole, port)
             name_item.setData(Qt.ItemDataRole.UserRole + 1, serial)  # Store serial for lookup
             name_item.setFlags(name_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.camera_table.setItem(row, 2, name_item)
 
-            # Video path (column 3)
+            # Serial (column 3) - dedicated column for readability
+            serial_item = QTableWidgetItem(serial)
+            serial_item.setFont(QFont("monospace", 9))
+            serial_item.setFlags(serial_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.camera_table.setItem(row, 3, serial_item)
+
+            # Video path (column 4)
             video_path = self.video_paths.get(port)
             video_text = video_path.name if video_path else "Not loaded"
             video_item = QTableWidgetItem(video_text)
             video_item.setFlags(video_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            self.camera_table.setItem(row, 3, video_item)
+            self.camera_table.setItem(row, 4, video_item)
 
-            # Status (column 4) - use serial for intrinsics lookup
+            # Status (column 5) - use serial for intrinsics lookup
             cal_state = self.state_manager.state.calibration
             camera_res = (cam_state.info.width, cam_state.info.height)
 
@@ -418,15 +427,15 @@ class IntrinsicTab(QWidget):
                 status = db_status if db_status else "Pending"
             status_item = QTableWidgetItem(status)
             status_item.setFlags(status_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            self.camera_table.setItem(row, 4, status_item)
+            self.camera_table.setItem(row, 5, status_item)
 
-            # Error (column 5) - use serial for intrinsics lookup
+            # Error (column 6) - use serial for intrinsics lookup
             error_text = ""
             if serial in cal_state.intrinsics:
                 error_text = f"{cal_state.intrinsics[serial].error:.4f}"
             error_item = QTableWidgetItem(error_text)
             error_item.setFlags(error_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            self.camera_table.setItem(row, 5, error_item)
+            self.camera_table.setItem(row, 6, error_item)
 
     def _check_db_intrinsics(self, info) -> str:
         """Check if intrinsics exist in database for this camera at current resolution."""

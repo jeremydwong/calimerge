@@ -25,16 +25,17 @@ def find_video_for_port(
     Find a video file for a given camera port, with backwards-compatible matching.
 
     Search order:
-    1. New format with exact serial: port{N}_{serial}.ext
+    1. New format with exact serial: port_{N}_{sanitized_serial}.ext
     2. Legacy format: port_{N}.ext
-    3. New format with any serial: port{N}_*.ext
+    3. New format with any serial: port_{N}_*.ext
 
     Returns the first match found, or None.
     """
     for ext in extensions:
         # 1. New format, exact serial match
         if serial:
-            path = folder / f"port{port}_{serial}.{ext}"
+            sanitized = serial.replace("&", "-")
+            path = folder / f"port_{port}_{sanitized}.{ext}"
             if path.exists():
                 return path
 
@@ -44,7 +45,7 @@ def find_video_for_port(
             return path
 
         # 3. New format, any serial
-        matches = sorted(folder.glob(f"port{port}_*.{ext}"))
+        matches = sorted(folder.glob(f"port_{port}_*.{ext}"))
         if matches:
             return matches[0]
 
@@ -74,17 +75,8 @@ def discover_videos(
             if path:
                 result[port] = path
     else:
-        # Discover all videos in folder
+        # Discover all videos in folder (both new and legacy formats)
         for ext in extensions:
-            # New format: port{N}_{serial}.ext
-            for video_file in folder.glob(f"port*_*.{ext}"):
-                parsed = parse_video_filename(video_file.name)
-                if parsed is not None:
-                    port, _ = parsed
-                    if port not in result:
-                        result[port] = video_file
-
-            # Legacy format: port_{N}.ext
             for video_file in folder.glob(f"port_*.{ext}"):
                 parsed = parse_video_filename(video_file.name)
                 if parsed is not None:
@@ -100,15 +92,15 @@ def parse_video_filename(filename: str) -> tuple[int, str] | None:
     Parse a video filename to extract port number and serial.
 
     Handles:
-    - New format: "port{N}_{serial}.mp4" -> (N, serial)
+    - New format: "port_{N}_{serial}.mp4" -> (N, serial)
     - Legacy format: "port_{N}.mp4" -> (N, "")
 
     Returns (port, serial) or None if not a valid port video filename.
     """
     stem = Path(filename).stem
 
-    # New format: port0_ABC123DEF
-    m = re.match(r"^port(\d+)_(.+)$", stem)
+    # New format: port_0_7-1b959837-0-0000
+    m = re.match(r"^port_(\d+)_(.+)$", stem)
     if m:
         return int(m.group(1)), m.group(2)
 
@@ -239,6 +231,7 @@ def _pick_encoder(codec: Codec, bitrate: str) -> tuple[str, list[str]]:
 def _open_ffmpeg_writer(
     output_path: Path, width: int, height: int, fps: int,
     codec: Codec, bitrate: str,
+    metadata: dict[str, str] | None = None,
 ) -> VideoWriterHandle:
     """Start an ffmpeg subprocess that accepts raw BGR24 on stdin."""
     info = detect_encoders()
@@ -246,6 +239,11 @@ def _open_ffmpeg_writer(
         raise RuntimeError("ffmpeg not found")
 
     encoder, encoder_args = _pick_encoder(codec, bitrate)
+
+    metadata_args = []
+    if metadata:
+        for key, value in metadata.items():
+            metadata_args.extend(["-metadata", f"{key}={value}"])
 
     cmd = [
         info.ffmpeg_path,
@@ -259,6 +257,7 @@ def _open_ffmpeg_writer(
         "-c:v", encoder,
         *encoder_args,
         "-pix_fmt", "yuv420p",
+        *metadata_args,
         str(output_path),
     ]
 
@@ -290,18 +289,24 @@ def create_video_writer(
     codec: Codec = "h264",
     bitrate: str = "8M",
     prefer_hardware: bool = True,
+    metadata: dict[str, str] | None = None,
 ) -> VideoWriterHandle:
     """
     Create a video writer with automatic encoder selection.
 
     Prefers ffmpeg (hw or sw H.264) when available,
     falls back to cv2 with mp4v (no openh264 dependency).
+
+    metadata: optional dict of key=value pairs embedded in the MP4 container
+    (ffmpeg only; ignored for cv2 fallback).
     """
     info = detect_encoders()
 
     if prefer_hardware and info.ffmpeg_path:
         try:
-            return _open_ffmpeg_writer(output_path, width, height, fps, codec, bitrate)
+            return _open_ffmpeg_writer(
+                output_path, width, height, fps, codec, bitrate, metadata
+            )
         except Exception:
             pass
 

@@ -7,6 +7,7 @@ Merges camera detection/preview with recording functionality.
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import replace
 from pathlib import Path
 from datetime import datetime
 import time
@@ -30,6 +31,7 @@ from PySide6.QtWidgets import (
     QTextEdit,
     QFileDialog,
     QSizePolicy,
+    QLineEdit,
 )
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QFont, QPainter, QColor, QPen
@@ -196,10 +198,12 @@ class CamerasTab(QWidget):
         self.preview_worker: CameraPreviewWorker | None = None
         self.recording_worker: RecordingWorker | None = None
         self.opened_cameras: list = []
+        self.opened_ports: list[int] = []
         self.base_output_path = Path("recordings")
         self.output_path: Path | None = None
         self._is_recording = False
         self._updating_table = False
+        self._cap_1080p = True  # default: hide resolutions above 1080p
 
         # Per-camera last-frame timestamp for FPS computation
         self._last_frame_time: dict[int, float] = {}
@@ -234,6 +238,12 @@ class CamerasTab(QWidget):
         self.stop_button.clicked.connect(self._stop_all)
         self.stop_button.setEnabled(False)
         toolbar.addWidget(self.stop_button)
+
+        self.cap_1080p_checkbox = QCheckBox("Cap 1080p")
+        self.cap_1080p_checkbox.setChecked(self._cap_1080p)
+        self.cap_1080p_checkbox.setToolTip("Hide resolutions above 1920x1080")
+        self.cap_1080p_checkbox.stateChanged.connect(self._on_cap_1080p_changed)
+        toolbar.addWidget(self.cap_1080p_checkbox)
 
         toolbar.addStretch()
 
@@ -296,22 +306,24 @@ class CamerasTab(QWidget):
         camera_layout = QVBoxLayout(camera_group)
 
         self.camera_table = QTableWidget()
-        self.camera_table.setColumnCount(6)
+        self.camera_table.setColumnCount(7)
         self.camera_table.setHorizontalHeaderLabels(
-            ["", "Port", "Name", "Resolution", "Exposure", "Enabled"]
+            ["", "Port", "Nickname", "Name", "Resolution", "Exposure", "Enabled"]
         )
         header = self.camera_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
         header.resizeSection(0, 24)  # Color
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
         header.resizeSection(1, 40)  # Port
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)  # Name
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
-        header.resizeSection(3, 100)  # Resolution
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        header.resizeSection(2, 60)  # Nickname
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)  # Name
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
-        header.resizeSection(4, 80)  # Exposure
+        header.resizeSection(4, 100)  # Resolution
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
-        header.resizeSection(5, 60)  # Enabled
+        header.resizeSection(5, 80)  # Exposure
+        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
+        header.resizeSection(6, 60)  # Enabled
         self.camera_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         camera_layout.addWidget(self.camera_table)
 
@@ -370,10 +382,15 @@ class CamerasTab(QWidget):
         self.enumerate_worker.start()
 
     def _on_cameras_found(self, cameras: list):
+        # Load nicknames from DB
+        from ...config import load_all_nicknames
+        nicknames = load_all_nicknames()
+
         camera_states = {}
-        for cam in cameras:
-            camera_states[cam.device_index] = CameraState(
-                info=cam, enabled=True, is_open=False
+        for port, cam in enumerate(cameras):
+            nickname = nicknames.get(cam.serial_number, "")
+            camera_states[port] = CameraState(
+                info=cam, enabled=True, is_open=False, nickname=nickname
             )
 
         self.state_manager.set_cameras(camera_states)
@@ -390,12 +407,49 @@ class CamerasTab(QWidget):
 
     # ── Camera table ──
 
+    def _save_table_settings(self) -> dict[int, dict]:
+        """Save current resolution/exposure/enabled/nickname from table widgets."""
+        settings = {}
+        cameras = self.state_manager.state.cameras
+        for row, (port, _) in enumerate(sorted(cameras.items())):
+            if row >= self.camera_table.rowCount():
+                break
+            entry = {}
+            nick_widget = self.camera_table.cellWidget(row, 2)
+            if nick_widget and isinstance(nick_widget, QLineEdit):
+                entry["nickname"] = nick_widget.text()
+            res_widget = self.camera_table.cellWidget(row, 4)
+            if res_widget and isinstance(res_widget, QComboBox):
+                entry["resolution"] = res_widget.currentData()
+            exp_widget = self.camera_table.cellWidget(row, 5)
+            if exp_widget and isinstance(exp_widget, QSpinBox):
+                entry["exposure"] = exp_widget.value()
+            en_widget = self.camera_table.cellWidget(row, 6)
+            if en_widget:
+                cb = en_widget.findChild(QCheckBox)
+                if cb:
+                    entry["enabled"] = cb.isChecked()
+            settings[port] = entry
+        return settings
+
+    def _get_filtered_resolutions(self, resolutions: list[tuple[int, int]]) -> list[tuple[int, int]]:
+        """Filter resolutions based on the 1080p cap toggle."""
+        if self._cap_1080p:
+            filtered = [(w, h) for w, h in resolutions if w <= 1920 and h <= 1080]
+            return filtered if filtered else resolutions[:1]  # keep at least one
+        return resolutions
+
     def _update_camera_table(self, cameras: dict[int, CameraState]):
         self._updating_table = True
+
+        # Save current user selections before rebuilding
+        saved = self._save_table_settings() if self.camera_table.rowCount() > 0 else {}
+
         self.camera_table.setRowCount(len(cameras))
 
         for row, (port, cam_state) in enumerate(sorted(cameras.items())):
             info = cam_state.info
+            prev = saved.get(port, {})
 
             # Color indicator
             color = camera_color(port)
@@ -416,45 +470,59 @@ class CamerasTab(QWidget):
             port_item.setFlags(port_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.camera_table.setItem(row, 1, port_item)
 
+            # Nickname (editable)
+            nickname_edit = QLineEdit()
+            nickname_edit.setPlaceholderText("A")
+            prev_nick = prev.get("nickname", cam_state.nickname)
+            nickname_edit.setText(prev_nick)
+            nickname_edit.setMaxLength(16)
+            nickname_edit.editingFinished.connect(
+                lambda p=port, le=nickname_edit: self._on_nickname_changed(p, le.text())
+            )
+            self.camera_table.setCellWidget(row, 2, nickname_edit)
+
             # Name (brand + serial for unique identification)
             name_text = f"{info.display_name} [{info.serial_number}]"
             name_item = QTableWidgetItem(name_text)
             name_item.setFlags(name_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            self.camera_table.setItem(row, 2, name_item)
+            self.camera_table.setItem(row, 3, name_item)
 
             # Resolution dropdown
             res_combo = QComboBox()
-            resolutions = info.supported_resolutions
+            all_resolutions = info.supported_resolutions
+            resolutions = self._get_filtered_resolutions(all_resolutions)
             for w, h in resolutions:
                 res_combo.addItem(f"{w}x{h}", (w, h))
-            # Select 640x480 by default (fast preview), fallback to current
-            selected_idx = 0
-            for idx in range(res_combo.count()):
-                res = res_combo.itemData(idx)
-                if res == (640, 480):
-                    selected_idx = idx
-                    break
-                elif res == (info.width, info.height):
-                    selected_idx = idx
+
+            # Restore previous selection, or default to lowest resolution
+            selected_idx = res_combo.count() - 1  # lowest resolution (list is sorted largest-first)
+            prev_res = prev.get("resolution")
+            if prev_res:
+                for idx in range(res_combo.count()):
+                    if res_combo.itemData(idx) == prev_res:
+                        selected_idx = idx
+                        break
             res_combo.setCurrentIndex(selected_idx)
             res_combo.currentIndexChanged.connect(
                 lambda idx, p=port, cb=res_combo: self._on_resolution_changed(p, cb)
             )
-            self.camera_table.setCellWidget(row, 3, res_combo)
+            self.camera_table.setCellWidget(row, 4, res_combo)
 
             # Exposure spinbox
             exposure_spin = QSpinBox()
             exposure_spin.setRange(-13, 0)
-            exposure_spin.setValue(info.exposure)
+            prev_exp = prev.get("exposure", info.exposure)
+            exposure_spin.setValue(prev_exp)
             exposure_spin.setToolTip("Exposure (log2 seconds, e.g. -4 = 1/16s)")
             exposure_spin.valueChanged.connect(
                 lambda val, p=port: self._on_exposure_changed(p, val)
             )
-            self.camera_table.setCellWidget(row, 4, exposure_spin)
+            self.camera_table.setCellWidget(row, 5, exposure_spin)
 
             # Enabled checkbox
             checkbox = QCheckBox()
-            checkbox.setChecked(cam_state.enabled)
+            prev_en = prev.get("enabled", cam_state.enabled)
+            checkbox.setChecked(prev_en)
             checkbox.stateChanged.connect(
                 lambda state, p=port: self._on_enabled_changed(p, state)
             )
@@ -463,13 +531,40 @@ class CamerasTab(QWidget):
             checkbox_layout.addWidget(checkbox)
             checkbox_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
             checkbox_layout.setContentsMargins(0, 0, 0, 0)
-            self.camera_table.setCellWidget(row, 5, checkbox_widget)
+            self.camera_table.setCellWidget(row, 6, checkbox_widget)
 
         self._updating_table = False
 
+        # Sync enabled states from widgets back to state manager (without triggering rebuild)
+        if saved:
+            needs_sync = False
+            new_cameras = dict(cameras)
+            for port, cam_state in cameras.items():
+                prev = saved.get(port, {})
+                prev_en = prev.get("enabled")
+                if prev_en is not None and prev_en != cam_state.enabled:
+                    new_cameras[port] = replace(cam_state, enabled=prev_en)
+                    needs_sync = True
+            if needs_sync:
+                self._updating_table = True
+                self.state_manager.set_cameras(new_cameras)
+                self._updating_table = False
+
     def _on_enabled_changed(self, port: int, state: int):
+        if self._updating_table:
+            return
         enabled = state == Qt.CheckState.Checked.value
         self.state_manager.update_camera(port, enabled=enabled)
+
+    def _on_nickname_changed(self, port: int, nickname: str):
+        if self._updating_table:
+            return
+        self.state_manager.update_camera(port, nickname=nickname)
+        # Persist to DB
+        cam_state = self.state_manager.state.cameras.get(port)
+        if cam_state:
+            from ...config import save_nickname
+            save_nickname(cam_state.info.serial_number, nickname)
 
     def _on_resolution_changed(self, port: int, combo: QComboBox):
         if self._updating_table:
@@ -507,6 +602,12 @@ class CamerasTab(QWidget):
         else:
             self.status_message.emit(f"Port {port}: exposure set to {value} (will apply on preview)")
 
+    def _on_cap_1080p_changed(self, state: int):
+        self._cap_1080p = state == Qt.CheckState.Checked.value
+        cameras = self.state_manager.state.cameras
+        if cameras:
+            self._update_camera_table(cameras)
+
     def _browse_output(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Output Folder")
         if folder:
@@ -520,51 +621,79 @@ class CamerasTab(QWidget):
         cameras = self.state_manager.state.cameras
         for row, (p, _) in enumerate(sorted(cameras.items())):
             if p == port:
-                res_widget = self.camera_table.cellWidget(row, 3)
+                res_widget = self.camera_table.cellWidget(row, 4)
                 if res_widget and isinstance(res_widget, QComboBox):
                     res = res_widget.currentData()
                     if res:
                         return res
-        return (1280, 720)
+        return (640, 480)
 
     def _get_exposure_for_port(self, port: int) -> int:
         """Get selected exposure from table for a port."""
         cameras = self.state_manager.state.cameras
         for row, (p, _) in enumerate(sorted(cameras.items())):
             if p == port:
-                exp_widget = self.camera_table.cellWidget(row, 4)
+                exp_widget = self.camera_table.cellWidget(row, 5)
                 if exp_widget and isinstance(exp_widget, QSpinBox):
                     return exp_widget.value()
         return -4
 
+    def _is_camera_enabled_in_table(self, port: int) -> bool:
+        """Read enabled state directly from the table checkbox widget."""
+        cameras = self.state_manager.state.cameras
+        for row, (p, _) in enumerate(sorted(cameras.items())):
+            if p == port:
+                en_widget = self.camera_table.cellWidget(row, 6)
+                if en_widget:
+                    cb = en_widget.findChild(QCheckBox)
+                    if cb:
+                        return cb.isChecked()
+        return True  # default enabled if widget not found
+
     def _open_cameras(self) -> dict[int, str]:
-        """Open enabled cameras. Returns camera_info dict."""
+        """Open enabled cameras and apply table settings. Returns camera_info dict."""
         from ...camera_binding import open_camera, set_resolution, set_exposure
 
         cameras = self.state_manager.state.cameras
         self.opened_cameras = []
+        self.opened_ports = []
         camera_info = {}
+        opened_ports = []
 
-        for port, cam_state in cameras.items():
-            if not cam_state.enabled:
+        for port, cam_state in sorted(cameras.items()):
+            if not self._is_camera_enabled_in_table(port):
                 continue
             try:
                 cam = cam_state.info
                 open_camera(cam)
-
-                # Apply selected resolution
-                w, h = self._get_resolution_for_port(port)
-                set_resolution(cam, w, h)
-
-                # Apply selected exposure
-                exposure = self._get_exposure_for_port(port)
-                set_exposure(cam, exposure)
-
                 self.opened_cameras.append(cam)
+                self.opened_ports.append(port)
                 camera_info[port] = cam.display_name
-                self.state_manager.update_camera(port, is_open=True)
+                opened_ports.append(port)
             except Exception as e:
                 self.status_message.emit(f"Failed to open camera {port}: {e}")
+
+        # Apply settings from the table widgets AFTER all cameras are open
+        for port in opened_ports:
+            cam_state = cameras[port]
+            cam = cam_state.info
+            try:
+                w, h = self._get_resolution_for_port(port)
+                set_resolution(cam, w, h)
+            except Exception as e:
+                self.status_message.emit(f"Port {port}: resolution failed: {e}")
+            try:
+                exposure = self._get_exposure_for_port(port)
+                set_exposure(cam, exposure)
+            except Exception as e:
+                self.status_message.emit(f"Port {port}: exposure failed: {e}")
+
+        # Batch-update state (triggers one table rebuild, which preserves settings)
+        if opened_ports:
+            new_cameras = dict(cameras)
+            for port in opened_ports:
+                new_cameras[port] = replace(cameras[port], is_open=True)
+            self.state_manager.set_cameras(new_cameras)
 
         return camera_info
 
@@ -581,6 +710,7 @@ class CamerasTab(QWidget):
             self.state_manager.update_camera(port, is_open=False)
 
         self.opened_cameras = []
+        self.opened_ports = []
 
     # ── Preview ──
 
@@ -604,7 +734,7 @@ class CamerasTab(QWidget):
         self._last_frame_time.clear()
 
         fps = self.fps_spin.value()
-        self.preview_worker = CameraPreviewWorker(self.opened_cameras, fps=fps)
+        self.preview_worker = CameraPreviewWorker(self.opened_cameras, self.opened_ports, fps=fps)
         self.preview_worker.frame_captured.connect(self._on_frame_received)
         self.preview_worker.error.connect(self._on_preview_error)
         self.preview_worker.start()
@@ -679,7 +809,7 @@ class CamerasTab(QWidget):
         # Start worker
         codec = self.codec_combo.currentData()
         self.recording_worker = RecordingWorker(
-            self.opened_cameras, self.output_path, duration, fps, codec=codec
+            self.opened_cameras, self.opened_ports, self.output_path, duration, fps, codec=codec
         )
         self.recording_worker.log_message.connect(self._log)
         self.recording_worker.progress_update.connect(self._on_record_progress)
@@ -758,8 +888,14 @@ class CamerasTab(QWidget):
         super().showEvent(event)
         if not self.state_manager.state.cameras:
             self.refresh_cameras()
+        elif self.preview_worker and not self._is_recording:
+            # Resume preview when returning to this tab
+            self.preview_worker.resume()
+            self.status_message.emit("Preview resumed")
 
     def hideEvent(self, event):
         super().hideEvent(event)
         if self.preview_worker and not self._is_recording:
-            self.stop_preview()
+            # Pause preview when leaving tab (cameras stay open)
+            self.preview_worker.pause()
+            self.status_message.emit("Preview paused")

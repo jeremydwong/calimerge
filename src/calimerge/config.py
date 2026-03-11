@@ -217,6 +217,12 @@ def init_intrinsics_db(db_path: Path = DEFAULT_INTRINSICS_DB) -> None:
             PRIMARY KEY (serial_number, width, height)
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS nicknames (
+            serial_number TEXT PRIMARY KEY,
+            nickname TEXT NOT NULL
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -477,6 +483,52 @@ def delete_intrinsics(
     conn.close()
 
     return deleted
+
+
+# ============================================================================
+# Camera Nicknames
+# ============================================================================
+
+
+def save_nickname(
+    serial_number: str,
+    nickname: str,
+    db_path: Path = DEFAULT_INTRINSICS_DB,
+) -> None:
+    """Save a camera nickname to the database."""
+    init_intrinsics_db(db_path)
+
+    conn = sqlite3.connect(db_path)
+    if nickname.strip():
+        conn.execute(
+            "INSERT OR REPLACE INTO nicknames (serial_number, nickname) VALUES (?, ?)",
+            (serial_number, nickname.strip()),
+        )
+    else:
+        conn.execute(
+            "DELETE FROM nicknames WHERE serial_number = ?",
+            (serial_number,),
+        )
+    conn.commit()
+    conn.close()
+
+
+def load_all_nicknames(
+    db_path: Path = DEFAULT_INTRINSICS_DB,
+) -> dict[str, str]:
+    """Load all nicknames from the database. Returns {serial_number: nickname}."""
+    if not db_path.exists():
+        return {}
+
+    try:
+        init_intrinsics_db(db_path)
+        conn = sqlite3.connect(db_path)
+        cursor = conn.execute("SELECT serial_number, nickname FROM nicknames")
+        result = {row[0]: row[1] for row in cursor.fetchall()}
+        conn.close()
+        return result
+    except Exception:
+        return {}
 
 
 # ============================================================================

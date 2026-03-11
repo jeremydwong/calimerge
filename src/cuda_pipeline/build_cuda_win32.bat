@@ -90,7 +90,7 @@ echo.
 echo ---- Compiling C++ sources (.cpp) ----
 
 :: Build cl flags with optional OpenCV include
-set CL_INCLUDES=/I"%CUDA_PATH%\include" /I"%TENSORRT_PATH%\include"
+set CL_INCLUDES=/I"%CUDA_PATH%\include" /I"%TENSORRT_PATH%\include" /I"..\pt_shared"
 if defined OPENCV_PATH (
     set CL_INCLUDES=%CL_INCLUDES% /I"%OPENCV_PATH%\include" /DHAS_OPENCV
 )
@@ -101,16 +101,16 @@ if errorlevel 1 ( echo BUILD FAILED: pt_tensorrt.cpp & popd & exit /b 1 )
 cl /c %CFLAGS% %CL_INCLUDES% /Fo:pt_nvdec.obj pt_nvdec.cpp
 if errorlevel 1 ( echo BUILD FAILED: pt_nvdec.cpp & popd & exit /b 1 )
 
-cl /c %CFLAGS% %CL_INCLUDES% /Fo:pt_matching.obj pt_matching.cpp
+cl /c %CFLAGS% %CL_INCLUDES% /Fo:pt_matching.obj ..\pt_shared\pt_matching.cpp
 if errorlevel 1 ( echo BUILD FAILED: pt_matching.cpp & popd & exit /b 1 )
 
-cl /c %CFLAGS% %CL_INCLUDES% /Fo:pt_triangulation.obj pt_triangulation.cpp
+cl /c %CFLAGS% %CL_INCLUDES% /Fo:pt_triangulation.obj ..\pt_shared\pt_triangulation.cpp
 if errorlevel 1 ( echo BUILD FAILED: pt_triangulation.cpp & popd & exit /b 1 )
 
-cl /c %CFLAGS% %CL_INCLUDES% /Fo:pt_tracker.obj pt_tracker.cpp
+cl /c %CFLAGS% %CL_INCLUDES% /Fo:pt_tracker.obj ..\pt_shared\pt_tracker.cpp
 if errorlevel 1 ( echo BUILD FAILED: pt_tracker.cpp & popd & exit /b 1 )
 
-cl /c %CFLAGS% %CL_INCLUDES% /Fo:pt_export.obj pt_export.cpp
+cl /c %CFLAGS% %CL_INCLUDES% /Fo:pt_export.obj ..\pt_shared\pt_export.cpp
 if errorlevel 1 ( echo BUILD FAILED: pt_export.cpp & popd & exit /b 1 )
 
 cl /c %CFLAGS% %CL_INCLUDES% /Fo:pt_pipeline.obj pt_pipeline.cpp

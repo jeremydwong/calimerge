@@ -2,71 +2,174 @@
 
 Unified multi-camera motion capture: synchronized recording, calibration, and 3D pose estimation.
 
-> **Status:** Early development. Core calibration pipeline complete. macOS camera module working. Windows/Linux WIP.
+> **Status:** Active development. Camera capture, calibration pipeline, and GPU pose tracking working on Windows and macOS.
 
-## Quick Start (macOS)
+Note: this work is heavily-inspired by both Jon Matthis' Freemocap project, and Mac Prible's caliscope -= in fact so inspired by the latter that this name is an attempt to respect his efforts. 
+
+the main goals of this work are:
+- a single app for simple use (and minimal collisions with file ownership)
+- multi person recording
+- support for cuda/mps rapid keypoint detection.
+---
+
+## Implementation Languages
+
+Calimerge splits work between two languages based on what each does best:
+
+### Python — interactivity and orchestration
+
+The GUI, calibration math, configuration, and data pipeline are all Python (`src/calimerge/`). Python is the right choice here because these paths are not frame-rate-sensitive and benefit from rapid iteration, NumPy/SciPy/OpenCV integration, and PySide6 for the interface. The package is managed with **uv** (not pip, not Poetry).
+
+Key libraries: **PySide6** (GUI), **OpenCV** (calibration, video I/O), **NumPy/SciPy** (linear algebra, optimization), **Numba** (JIT-compiled triangulation).
+
+### C++ — performance-critical capture and inference
+
+Camera capture (`src/native/`) and GPU pose tracking (`src/cuda_pipeline/`) are plain C++. No classes, no templates, no CMake — just C structs, free functions, and a single-file unity build per platform. This keeps frame delivery latency low (sub-millisecond ring buffer access) and GPU inference fast (TensorRT FP16, CUDA kernels, zero-copy pipelines).
+
+The C++ code exposes a flat C API. Python calls it via **ctypes** (`camera_binding.py`). The boundary is intentionally narrow: Python sends commands (open, set resolution, capture), C++ returns pixel buffers.
+
+| Layer | Language | Why |
+|-------|----------|-----|
+| GUI, state, config | Python (PySide6) | Rapid iteration, Qt bindings |
+| Calibration (intrinsic, extrinsic, bundle adjustment) | Python (OpenCV, SciPy) | Existing battle-tested implementations |
+| Triangulation | Python (Numba JIT) | NumPy-compatible, near-C speed |
+| Camera capture + sync | C++ (per-platform) | Sub-ms latency, OS-native APIs |
+| GPU pose tracking | C++/CUDA (TensorRT) | 10ms/frame, single GPU allocation |
+
+---
+
+## Executables
+
+### Python CLI
 
 ```bash
-# Clone and setup
-git clone <repo>
-cd calimerge
+uv run calimerge              # Launch unified GUI (default)
+uv run calimerge gui          # Same as above
+uv run calimerge clock        # Sync verification clock (10ms updates)
+uv run calimerge record       # Legacy recording GUI
+```
+
+### Native camera tests (after building `src/native/`)
+
+| Executable | Purpose |
+|------------|---------|
+| `test_enumerate` | List detected cameras with serial numbers and supported formats |
+| `test_capture <idx>` | Single-camera frame capture test |
+| `test_multi` | Multi-camera synchronized capture |
+| `test_sync_log` | Log frame timing data for sync analysis |
+| `test_uvc_probe` | Deep UVC/DirectShow property diagnostic (Windows) |
+
+### CUDA pipeline (after building `src/cuda_pipeline/`, optional)
+
+| Executable | Purpose |
+|------------|---------|
+| `pt_main.exe <dir> <calib.toml>` | Batch offline processing: video → 2D poses → 3D tracking → CSV |
+| `pt_stream_main.exe <dir> <calib.toml>` | Streaming mode: simulates real-time frame-by-frame processing |
+| `calimerge_cuda.dll` | Shared library for Python integration (streaming API) |
+
+---
+
+## Data Structure Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  CAPTURE                                                            │
+│                                                                     │
+│  CM_Camera[] ──cm_capture_synced()──► CM_SyncedFrameSet             │
+│  (C structs)     ring buffer            frames[]: BGR pixels        │
+│                  per camera              timestamp_ns, arrival_ns    │
+│                                          dropped_mask (bit per cam) │
+└───────────────────────────┬─────────────────────────────────────────┘
+                            │ ctypes copy to numpy
+                            ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  RECORDING                                                          │
+│                                                                     │
+│  SyncedFrameSet ──► cv2.VideoWriter (per port)                      │
+│  (Python)            ├── port_0.mp4                                  │
+│                      ├── port_1.mp4                                  │
+│                      ├── frame_time_history.csv                      │
+│                      └── camera_mapping.csv                          │
+└───────────────────────────┬─────────────────────────────────────────┘
+                            │ recorded videos
+                            ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  CALIBRATION                                                        │
+│                                                                     │
+│  Video frames ──detect_charuco_points()──► PointPacket              │
+│                                             point_id: (n,)          │
+│                                             img_loc:  (n, 2)        │
+│                                             obj_loc:  (n, 3)        │
+│                                             confidence: (n,)        │
+│                                                                     │
+│  PointPacket[] ──calibrate_intrinsics()──► CameraIntrinsics         │
+│                                             matrix: 3×3             │
+│                                             distortion: (5,)        │
+│                                             error: RMSE             │
+│                     saved to ~/.calimerge/intrinsics.db (SQLite)    │
+│                                                                     │
+│  SyncedPoints[] ──stereo_calibrate_pair()──► pairwise R, T          │
+│                 ──bundle_adjustment()──────► CameraExtrinsics       │
+│                                               rotation: 3×3         │
+│                                               translation: (3,)     │
+│                     saved to <project>/calibration.toml              │
+└───────────────────────────┬─────────────────────────────────────────┘
+                            │ CalibratedCamera[] (intrinsics + extrinsics)
+                            ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  3D RECONSTRUCTION                                                  │
+│                                                                     │
+│  Python path (Numba):                                               │
+│    FramePoints ──triangulate_frame()──► XYZPoints                   │
+│    (per camera)    SVD, ≥2 views          xyz: (n, 3)               │
+│                                           point_ids: (n,)           │
+│                                                                     │
+│  CUDA path (TensorRT, optional):                                    │
+│    BGR frames ──YOLO──► person boxes ──VitPose──► 2D keypoints      │
+│              ──epipolar matching──► cross-view associations          │
+│              ──SVD triangulation──► 3D poses ──tracker──► CSV        │
+│    (all on GPU except matching/triangulation/tracking)               │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+All intermediate data structures are **frozen dataclasses** (`@dataclass(frozen=True, slots=True)`) defined in `src/calimerge/types.py`. No methods beyond computed properties — all logic lives in standalone pure functions.
+
+---
+
+## Quick Start
+
+### macOS
+
+```bash
+git clone <repo> && cd calimerge
 uv sync
-
-# Build the native camera library
-cd src/native
-./build_macos.sh release
-cd ../..
-
-# Launch the unified GUI
+cd src/native && ./build_macos.sh release && cd ../..
 uv run calimerge
 ```
 
-## Commands
+### Windows
 
-| Command | Description |
-|---------|-------------|
-| `uv run calimerge` | Launch unified GUI (cameras, record, calibrate, process) |
-| `uv run calimerge gui` | Same as above |
-| `uv run calimerge clock` | Display sync verification clock (10ms updates) |
-| `uv run calimerge record` | Launch legacy recording GUI |
-| `uv run calimerge --help` | Show all commands |
+```bash
+git clone <repo> && cd calimerge
+uv sync
+cd src/native && build_win32.bat release && cd ../..
+uv run calimerge gui
+```
 
-## Unified GUI
+Prerequisites: [uv](https://astral.sh/uv), [Visual Studio Build Tools 2022](https://visualstudio.microsoft.com/visual-cpp-build-tools/) (Desktop C++ workload).
 
-The main application (`uv run calimerge`) provides a tabbed workflow:
+---
 
-### 1. Cameras Tab
-- **Detect cameras** connected to your system
-- **Preview** live feeds from each camera
-- **Enable/disable** specific cameras for recording
-- Cameras identified by unique serial numbers
+## GUI Tabs
 
-### 2. Record Tab
-- **Synchronized multi-camera recording** with frame timing
-- Configure **FPS and duration**
-- Output: timestamped folders with per-camera videos
-
-### 3. Intrinsic Tab (Per-Camera Calibration)
-- Load calibration videos showing **ChArUco board**
-- Configure board: **columns × rows**, **square size (cm)**, dictionary
-- Run calibration to compute lens parameters (focal length, distortion)
-- **Auto-saves to database** (`~/.calimerge/intrinsics.db`)
-- View results: fx, fy, cx, cy, reprojection error
-
-### 4. Extrinsic Tab (Multi-Camera Calibration)
-- Load synchronized videos of ChArUco board from all cameras
-- Configure **extrinsic board** (typically larger for visibility)
-- Run bundle adjustment to compute camera positions
-- Export camera rig to TOML file
-
-### 5. Process Tab
-- Load multi-camera recordings
-- Run 2D tracking → triangulation → 3D export
-- (Pose estimation backends: charuco, mediapipe, vitpose)
+| Tab | Name | Purpose |
+|-----|------|---------|
+| 1 | Record | Camera detection, live preview, settings (resolution/FPS/exposure), FPS graph, synchronized recording |
+| 2 | Intrinsic | Per-camera lens calibration from ChArUco board videos |
+| 3 | Extrinsic | Multi-camera spatial calibration via bundle adjustment |
+| 4 | Process | 2D tracking + triangulation → 3D export |
 
 ## ChArUco Board Configuration
-
-Calimerge uses separate board configurations for intrinsic and extrinsic calibration:
 
 | Purpose | Default Size | Square Size | Rationale |
 |---------|--------------|-------------|-----------|
@@ -75,89 +178,25 @@ Calimerge uses separate board configurations for intrinsic and extrinsic calibra
 
 The marker size is automatically computed as **75% of square size** (standard ratio).
 
-Configure in TOML:
-```toml
-[charuco_intrinsic]
-columns = 7
-rows = 5
-square_size_cm = 3.0
-dictionary = "DICT_4X4_50"
+## Workflow
 
-[charuco_extrinsic]
-columns = 4
-rows = 3
-square_size_cm = 5.0
-dictionary = "DICT_4X4_50"
-```
-
-## Workflow: Camera Calibration
-
-### Step 1: Intrinsic Calibration (per camera)
+### 1. Intrinsic Calibration (per camera)
 
 1. Print a ChArUco board (7×5, 3cm squares recommended)
-2. Record video of the board from each camera:
-   - Move board through entire frame
-   - Vary distance and angle
-   - Capture 50+ frames with good detections
-3. In **Intrinsic Tab**:
-   - Load video for each camera
-   - Set board parameters to match your print
-   - Click "Calibrate"
-   - Results auto-save to database
+2. Record video of the board from each camera (move through entire frame, vary distance/angle)
+3. In **Intrinsic Tab**: load video, set board parameters, click "Calibrate"
+4. Results auto-save to `~/.calimerge/intrinsics.db`
 
-### Step 2: Extrinsic Calibration (multi-camera)
+### 2. Extrinsic Calibration (multi-camera)
 
-1. Print a larger ChArUco board (4×3, 5cm squares recommended)
-2. Record synchronized video from all cameras:
-   - Move board so it's visible from at least 2 cameras
-   - Cover the capture volume
-3. In **Extrinsic Tab**:
-   - Ensure intrinsics are ready for all cameras
-   - Load synchronized videos
-   - Set extrinsic board parameters
-   - Click "Run Extrinsic Calibration"
-   - Export camera rig
+1. Print a larger ChArUco board (4×3, 5cm squares)
+2. Record synchronized video — board visible from ≥2 cameras
+3. In **Extrinsic Tab**: load videos, click "Run Extrinsic Calibration", export rig
 
-### Step 3: Process Recordings
+### 3. Process Recordings
 
 1. Record synchronized motion capture session
-2. In **Process Tab**:
-   - Load videos
-   - Run tracking + triangulation
-   - Export 3D points
-
-## Workflow: Verifying Camera Synchronization
-
-1. **Run the clock display:**
-   ```bash
-   uv run calimerge clock
-   ```
-   This shows a real-time clock with millisecond precision.
-
-2. **Point all cameras at the clock display**
-
-3. **In another terminal, start recording:**
-   ```bash
-   uv run calimerge record
-   ```
-
-4. **Record a few seconds, then stop**
-
-5. **Check recordings in `recordings/<timestamp>/`:**
-   - `port_X.mp4` - Video files per camera
-   - `frame_time_history.csv` - Frame timing data
-   - `camera_mapping.csv` - Camera serial → port mapping
-
-## Native Test Executables
-
-After building, these tests are available in `src/native/`:
-
-```bash
-./test_enumerate    # List detected cameras with serial numbers
-./test_capture      # Capture frames from single camera
-./test_multi        # Multi-camera capture test
-./test_sync_log     # Log synchronization timing data
-```
+2. In **Process Tab**: load videos, run tracking + triangulation, export 3D points
 
 ## Building the Native Library
 

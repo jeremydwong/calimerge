@@ -36,6 +36,7 @@ class CameraState:
     info: "CameraInfo"
     enabled: bool = True
     is_open: bool = False
+    nickname: str = ""
     last_frame: "np.ndarray | None" = None
 
 

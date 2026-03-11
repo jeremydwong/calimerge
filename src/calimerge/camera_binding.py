@@ -456,9 +456,11 @@ def capture_synced(cameras: list[CameraInfo]) -> SyncedFrameSet:
     if result != CM_OK:
         raise RuntimeError(f"Failed to capture synced frames: {result}")
 
-    # Convert frames to Python
+    # Convert frames to Python — key by device_index so ports stay stable
+    # when a subset of cameras is opened (e.g. user disables one camera)
     frames = {}
     for i in range(len(cameras)):
+        port = cameras[i].device_index
         c_frame = c_frameset.frames[i]
         if c_frame.pixels:
             size = c_frame.height * c_frame.width * 3
@@ -467,7 +469,7 @@ def capture_synced(cameras: list[CameraInfo]) -> SyncedFrameSet:
                 (c_frame.height, c_frame.width, 3)
             ).copy()
 
-            frames[i] = Frame(
+            frames[port] = Frame(
                 pixels=pixels,
                 width=c_frame.width,
                 height=c_frame.height,
@@ -477,7 +479,7 @@ def capture_synced(cameras: list[CameraInfo]) -> SyncedFrameSet:
                 camera_index=c_frame.camera_index,
             )
         else:
-            frames[i] = None
+            frames[port] = None
 
     frameset = SyncedFrameSet(
         frames=frames,
