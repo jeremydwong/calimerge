@@ -57,6 +57,9 @@ class ExtrinsicTab(QWidget):
         self.calibration_worker: ExtrinsicCalibrationWorker | None = None
         self.video_paths: dict[int, Path] = {}
         self.frame_time_csv: Path | None = None
+        # Collected detection frames: dict[sync_key] -> dict[port -> BGR frame with overlay]
+        self._detection_groups: dict[int, dict[int, any]] = {}
+        self._detection_order: list[int] = []  # ordered sync keys
 
         self._init_ui()
         self._connect_signals()
@@ -150,15 +153,16 @@ class ExtrinsicTab(QWidget):
         top_splitter.addWidget(preview_group)
 
         top_splitter.setSizes([400, 300])
-        layout.addWidget(top_splitter)
 
-        # Main splitter
-        splitter = QSplitter(Qt.Orientation.Horizontal)
+        # Outer vertical splitter: charuco row on top, main content below
+        outer_splitter = QSplitter(Qt.Orientation.Vertical)
+        outer_splitter.addWidget(top_splitter)
 
-        # Left: camera list and controls
-        left_panel = QWidget()
-        left_layout = QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(0, 0, 0, 0)
+        # Main horizontal splitter: left panels | video preview
+        main_splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # Left: vertical splitter for cameras / calibration / results
+        left_splitter = QSplitter(Qt.Orientation.Vertical)
 
         # Camera table
         cameras_group = QGroupBox("Cameras (Enabled Only)")
@@ -175,11 +179,11 @@ class ExtrinsicTab(QWidget):
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
         header.resizeSection(1, 40)  # Port
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)  # Camera name
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
         header.resizeSection(3, 70)  # Intrinsics
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
         header.resizeSection(4, 120)  # Video
-        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Interactive)
         header.resizeSection(5, 90)  # Status
         self.camera_table.setSelectionBehavior(
             QTableWidget.SelectionBehavior.SelectRows
@@ -199,7 +203,7 @@ class ExtrinsicTab(QWidget):
         video_controls.addWidget(self.load_single_button)
 
         cameras_layout.addLayout(video_controls)
-        left_layout.addWidget(cameras_group)
+        left_splitter.addWidget(cameras_group)
 
         # Calibration controls
         calibration_group = QGroupBox("Calibration")
@@ -214,7 +218,7 @@ class ExtrinsicTab(QWidget):
         self.progress_bar.setVisible(False)
         calibration_layout.addWidget(self.progress_bar)
 
-        left_layout.addWidget(calibration_group)
+        left_splitter.addWidget(calibration_group)
 
         # Results
         results_group = QGroupBox("Results")
@@ -223,7 +227,6 @@ class ExtrinsicTab(QWidget):
         self.results_text = QTextEdit()
         self.results_text.setReadOnly(True)
         self.results_text.setFont(QFont("monospace", 10))
-        self.results_text.setMaximumHeight(200)
         self.results_text.setPlaceholderText("Calibration results will appear here...")
         results_layout.addWidget(self.results_text)
 
@@ -235,29 +238,53 @@ class ExtrinsicTab(QWidget):
         export_layout.addStretch()
 
         results_layout.addLayout(export_layout)
-        left_layout.addWidget(results_group)
+        left_splitter.addWidget(results_group)
 
-        splitter.addWidget(left_panel)
+        left_splitter.setSizes([200, 60, 350])
+        main_splitter.addWidget(left_splitter)
 
         # Right: video preview
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-
-        video_preview_group = QGroupBox("Video Preview")
+        video_preview_group = QGroupBox("Extrinsic Cal Results")
         video_preview_layout = QVBoxLayout(video_preview_group)
         self.video_player = VideoPlayer()
         video_preview_layout.addWidget(self.video_player)
-        right_layout.addWidget(video_preview_group)
 
-        splitter.addWidget(right_panel)
-        splitter.setSizes([400, 400])
+        main_splitter.addWidget(video_preview_group)
+        main_splitter.setSizes([400, 400])
 
-        layout.addWidget(splitter, stretch=1)
+        outer_splitter.addWidget(main_splitter)
+        outer_splitter.setSizes([150, 500])
+
+        layout.addWidget(outer_splitter, stretch=1)
 
     def _connect_signals(self):
         self.state_manager.cameras_changed.connect(self._on_cameras_changed)
         self.state_manager.calibration_changed.connect(self._on_calibration_changed)
+
+    # ── Project settings ──
+
+    def apply_project_settings(self, settings: dict) -> None:
+        """Apply loaded project settings to this tab's UI controls."""
+        ext = settings.get("charuco_extrinsic", {})
+        if "columns" in ext:
+            self.cols_spin.setValue(int(ext["columns"]))
+        if "rows" in ext:
+            self.rows_spin.setValue(int(ext["rows"]))
+        if "square_size_cm" in ext:
+            self.square_spin.setValue(float(ext["square_size_cm"]))
+        if "inverted" in ext:
+            self.inverted_checkbox.setChecked(bool(ext["inverted"]))
+
+    def get_project_settings(self) -> dict:
+        """Return this tab's contribution to the project settings dict."""
+        return {
+            "charuco_extrinsic": {
+                "columns": self.cols_spin.value(),
+                "rows": self.rows_spin.value(),
+                "square_size_cm": self.square_spin.value(),
+                "inverted": self.inverted_checkbox.isChecked(),
+            },
+        }
 
     # ── ChArUco preview ──
 
@@ -280,6 +307,17 @@ class ExtrinsicTab(QWidget):
                 self.board_preview_label.setPixmap(scaled)
         except Exception:
             self.board_preview_label.setText("Preview unavailable")
+
+    # ── Helpers ──
+
+    @staticmethod
+    def _camera_label(cam_state) -> str:
+        """Format a camera label as 'nickname (serial)' or just 'serial'."""
+        serial = cam_state.info.serial_number
+        nick = getattr(cam_state, "nickname", "")
+        if nick:
+            return f"{nick} ({serial})"
+        return serial
 
     # ── Camera table ──
 
@@ -319,7 +357,8 @@ class ExtrinsicTab(QWidget):
 
             # Camera name + FULL serial (column 2)
             serial = cam_state.info.serial_number
-            name_text = f"{cam_state.info.display_name}\n{serial}"
+            label = self._camera_label(cam_state)
+            name_text = f"{label}\n{cam_state.info.display_name}"
             name_item = QTableWidgetItem(name_text)
             name_item.setData(Qt.ItemDataRole.UserRole, port)
             name_item.setData(Qt.ItemDataRole.UserRole + 1, serial)  # Store serial for lookup
@@ -430,7 +469,9 @@ class ExtrinsicTab(QWidget):
             self.video_paths[port] = Path(path)
             self.video_player.load_video(Path(path))
             self._on_cameras_changed(self.state_manager.state.cameras)
-            self.status_message.emit(f"Loaded video for camera {port}")
+            cam = self.state_manager.state.cameras.get(port)
+            label = self._camera_label(cam) if cam else str(port)
+            self.status_message.emit(f"Loaded video for {label}")
 
     # ── Calibration ──
 
@@ -461,9 +502,9 @@ class ExtrinsicTab(QWidget):
         # Check all enabled cameras have intrinsics (using serial number lookup)
         missing_intrinsics = []
         for port in enabled_ports:
-            serial = cameras[port].info.serial_number
-            if serial not in cal_state.intrinsics:
-                missing_intrinsics.append(f"port {port} ({serial[-8:]})")
+            cam = cameras[port]
+            if cam.info.serial_number not in cal_state.intrinsics:
+                missing_intrinsics.append(self._camera_label(cam))
         if missing_intrinsics:
             self.status_message.emit(
                 f"Missing intrinsics for: {', '.join(missing_intrinsics)}"
@@ -471,9 +512,12 @@ class ExtrinsicTab(QWidget):
             return
 
         # Check all enabled cameras have videos
-        missing_videos = [port for port in enabled_ports if port not in self.video_paths]
+        missing_videos = [
+            self._camera_label(cameras[port])
+            for port in enabled_ports if port not in self.video_paths
+        ]
         if missing_videos:
-            self.status_message.emit(f"Missing videos for cameras: {missing_videos}")
+            self.status_message.emit(f"Missing videos for: {', '.join(missing_videos)}")
             return
 
         charuco_config = self._get_charuco_config()
@@ -483,6 +527,8 @@ class ExtrinsicTab(QWidget):
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
         self.results_text.clear()
+        self._detection_groups.clear()
+        self._detection_order.clear()
 
         # Build port->intrinsics mapping from serial-based storage
         port_to_intrinsics = {}
@@ -503,12 +549,34 @@ class ExtrinsicTab(QWidget):
         self.calibration_worker.progress_update.connect(
             lambda p: self.progress_bar.setValue(int(p * 100))
         )
+        self.calibration_worker.detection_frame.connect(self._on_detection_frame)
         self.calibration_worker.calibration_finished.connect(self._on_calibration_done)
         self.calibration_worker.error.connect(self._on_calibration_error)
         self.calibration_worker.finished.connect(self._on_worker_finished)
         self.calibration_worker.start()
 
         self.status_message.emit("Running extrinsic calibration...")
+
+    def _on_detection_frame(self, port: int, frame_index: int, frame, corner_count: int):
+        """Collect detection overlay frame grouped by sync key (frame_index)."""
+        if frame_index not in self._detection_groups:
+            self._detection_groups[frame_index] = {}
+            self._detection_order.append(frame_index)
+        self._detection_groups[frame_index][port] = frame.copy()
+
+        # Show latest frame live during calibration
+        pixmap = bgr_to_pixmap(frame)
+        if pixmap is not None:
+            scaled = pixmap.scaled(
+                self.video_player.frame_label.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            self.video_player.frame_label.setPixmap(scaled)
+            total_detections = sum(len(g) for g in self._detection_groups.values())
+            self.video_player.frame_label_info.setText(
+                f"{total_detections} detections"
+            )
 
     def _on_calibration_done(self, cameras: dict, error: float):
         """Handle calibration completion - auto-saves to project directory."""
@@ -532,10 +600,34 @@ class ExtrinsicTab(QWidget):
             except Exception as e:
                 self.results_text.append(f"\nFailed to save calibration: {e}")
 
+        # Save charuco board PDF at exact dimensions
+        self._save_charuco_pdf()
+
         if saved_path:
             self.status_message.emit(f"Extrinsic calibration complete (error: {error:.4f}), saved to {saved_path.name}")
         else:
             self.status_message.emit(f"Extrinsic calibration complete, error: {error:.4f}")
+
+    def _save_charuco_pdf(self) -> None:
+        """Save a PDF of the extrinsic charuco board at exact physical dimensions."""
+        try:
+            from ...calibration.charuco import create_charuco_pdf
+            main_window = self.window()
+            if hasattr(main_window, "cameras_tab"):
+                folder = main_window.cameras_tab.base_output_path
+            else:
+                folder = None
+            if folder is None:
+                return
+            folder.mkdir(parents=True, exist_ok=True)
+            config = self._get_charuco_config()
+            style = "W" if config.inverted else "K"
+            size_str = str(config.square_size_cm).replace(".", "p")
+            pdf_path = folder / f"charuco_c{config.columns}r{config.rows}s{size_str}cm_{style}.pdf"
+            create_charuco_pdf(config, pdf_path)
+            self.results_text.append(f"Saved charuco board PDF: {pdf_path}")
+        except Exception as e:
+            self.results_text.append(f"Failed to save charuco PDF: {e}")
 
     def _on_calibration_error(self, error: str):
         """Handle calibration error."""
@@ -543,17 +635,107 @@ class ExtrinsicTab(QWidget):
         self.results_text.append(f"ERROR: {error}")
 
     def _on_worker_finished(self):
-        """Clean up after worker."""
+        """Clean up after worker and load detection frames into player."""
         self.calibrate_button.setEnabled(True)
         self.progress_bar.setVisible(False)
         self.calibration_worker = None
+
+        # Build side-by-side composite frames from synced detection groups
+        if self._detection_groups:
+            self._load_detection_composites()
+
+    def _load_detection_composites(self):
+        """Compose per-sync-index grid of camera frames and load into video player."""
+        import cv2
+        import numpy as np
+        import math
+
+        composites = []
+        ports = sorted({p for g in self._detection_groups.values() for p in g})
+        n_cams = len(ports)
+        if n_cams == 0:
+            return
+
+        # Grid layout: e.g. 2 cams = 1x2, 3 cams = 2x2, 4 cams = 2x2
+        cols = math.ceil(math.sqrt(n_cams))
+        rows = math.ceil(n_cams / cols)
+
+        # Look up camera labels
+        cameras = self.state_manager.state.cameras
+        port_labels = {}
+        for port in ports:
+            cam = cameras.get(port)
+            if cam:
+                port_labels[port] = self._camera_label(cam)
+            else:
+                port_labels[port] = f"Port {port}"
+
+        # Target tile size: scale each camera frame to a fixed size for the grid
+        sample = next(iter(next(iter(self._detection_groups.values())).values()))
+        tile_h = sample.shape[0]
+        tile_w = sample.shape[1]
+
+        pad = 4  # border between tiles
+
+        for sync_key in self._detection_order:
+            group = self._detection_groups[sync_key]
+            if not group:
+                continue
+
+            grid_h = rows * tile_h + (rows - 1) * pad
+            grid_w = cols * tile_w + (cols - 1) * pad
+            grid = np.full((grid_h, grid_w, 3), 30, dtype=np.uint8)
+
+            for idx, port in enumerate(ports):
+                r = idx // cols
+                c = idx % cols
+                y = r * (tile_h + pad)
+                x = c * (tile_w + pad)
+
+                if port in group:
+                    f = group[port].copy()
+                else:
+                    f = np.full((tile_h, tile_w, 3), 40, dtype=np.uint8)
+
+                # Resize if needed
+                if f.shape[0] != tile_h or f.shape[1] != tile_w:
+                    f = cv2.resize(f, (tile_w, tile_h))
+
+                # Camera label at top-left
+                cv2.putText(
+                    f, port_labels[port], (8, 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 220, 255), 1, cv2.LINE_AA,
+                )
+
+                # "no detection" for missing cameras
+                if port not in group:
+                    cv2.putText(
+                        f, "no detection", (8, tile_h // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 80, 80), 1, cv2.LINE_AA,
+                    )
+
+                grid[y:y + tile_h, x:x + tile_w] = f
+
+            composites.append(grid)
+
+        if composites:
+            self.video_player.load_frames(composites, fps=3.0)
+
+    def _calibrated_camera_label(self, serial: str) -> str:
+        """Look up nickname for a serial from live camera state, return 'nick (serial)' or 'serial'."""
+        for cam_state in self.state_manager.state.cameras.values():
+            if cam_state.info.serial_number == serial:
+                nick = getattr(cam_state, "nickname", "")
+                if nick:
+                    return f"{nick} ({serial})"
+                break
+        return serial
 
     def _show_results(self, cameras: dict, error: float | None):
         """Display calibration results with camera positions and pairwise distances."""
         import numpy as np
 
-        self.results_text.clear()
-        self.results_text.append("=== Extrinsic Calibration Results ===\n")
+        self.results_text.append("\n=== Extrinsic Calibration Results ===\n")
 
         if error is not None:
             self.results_text.append(f"Reprojection error: {error:.4f}")
@@ -563,8 +745,9 @@ class ExtrinsicTab(QWidget):
         for port, cam in sorted(cameras.items()):
             t = cam.extrinsics.translation
             dist_from_origin = np.linalg.norm(t)
+            label = self._calibrated_camera_label(cam.serial_number)
             self.results_text.append(
-                f"Port {port} ({cam.serial_number[-8:]}): "
+                f"{label}: "
                 f"[{t[0]:.3f}, {t[1]:.3f}, {t[2]:.3f}] "
                 f"({dist_from_origin:.2f}m from origin)"
             )
@@ -574,12 +757,14 @@ class ExtrinsicTab(QWidget):
             self.results_text.append("\n--- Camera Distances ---")
             sorted_ports = sorted(cameras.keys())
             for i, port_a in enumerate(sorted_ports):
+                label_a = self._calibrated_camera_label(cameras[port_a].serial_number)
                 for port_b in sorted_ports[i + 1:]:
+                    label_b = self._calibrated_camera_label(cameras[port_b].serial_number)
                     t_a = cameras[port_a].extrinsics.translation
                     t_b = cameras[port_b].extrinsics.translation
                     distance = np.linalg.norm(t_a - t_b)
                     self.results_text.append(
-                        f"  Port {port_a} <-> Port {port_b}: {distance:.3f}m"
+                        f"  {label_a} <-> {label_b}: {distance:.3f}m"
                     )
 
     def _export_rig(self):

@@ -28,7 +28,7 @@ class CameraConfig:
     serial_number: str
     port: int
     enabled: bool = True
-    resolution: tuple[int, int] = (1280, 720)  # (width, height)
+    resolution: tuple[int, int] = (640, 480)  # (width, height)
     rotation_count: int = 0  # 0, 1, 2, 3 for 0, 90, 180, 270 degrees
     exposure: int = -4  # Platform-specific units
 
@@ -288,27 +288,18 @@ def scale_intrinsics(
     Camera matrix parameters (fx, fy, cx, cy) scale linearly with resolution.
     Distortion coefficients are dimensionless and unchanged.
 
+    Works for both same-aspect-ratio rescaling and cross-aspect-ratio cases
+    (e.g. 640×480 → 640×360 when the camera uses full-sensor subsampling).
+
     Args:
         intrinsics: Original intrinsics
         new_resolution: Target (width, height)
 
     Returns:
         New CameraIntrinsics scaled to the target resolution
-
-    Raises:
-        ValueError: If aspect ratios don't match
     """
     old_w, old_h = intrinsics.resolution
     new_w, new_h = new_resolution
-
-    # Verify aspect ratios match
-    if not same_aspect_ratio(intrinsics.resolution, new_resolution):
-        old_ar = get_aspect_ratio(intrinsics.resolution)
-        new_ar = get_aspect_ratio(new_resolution)
-        raise ValueError(
-            f"Cannot scale intrinsics: aspect ratio mismatch "
-            f"({old_ar[0]}:{old_ar[1]} -> {new_ar[0]}:{new_ar[1]})"
-        )
 
     # Compute scale factors
     scale_x = new_w / old_w

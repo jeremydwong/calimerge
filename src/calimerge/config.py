@@ -4,10 +4,12 @@ Configuration loading/saving.
 Pure functions operating on dataclasses.
 - TOML for project configuration
 - SQLite for camera intrinsics (keyed by serial_number + resolution)
+- JSON for app settings (last project folder) and per-project settings
 """
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -622,3 +624,100 @@ def load_calibration_from_toml(
         )
 
     return cameras
+
+
+# ============================================================================
+# App Settings  (~/.calimerge/app_settings.json)
+# ============================================================================
+
+_APP_SETTINGS_PATH = Path.home() / ".calimerge" / "app_settings.json"
+
+_APP_SETTINGS_DEFAULTS: dict = {
+    "last_project_folder": None,
+}
+
+
+def load_app_settings() -> dict:
+    """Load application-level settings (persists across projects)."""
+    if not _APP_SETTINGS_PATH.exists():
+        return dict(_APP_SETTINGS_DEFAULTS)
+    try:
+        with open(_APP_SETTINGS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return {**_APP_SETTINGS_DEFAULTS, **data}
+    except Exception:
+        return dict(_APP_SETTINGS_DEFAULTS)
+
+
+def save_app_settings(settings: dict) -> None:
+    """Save application-level settings."""
+    _APP_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(_APP_SETTINGS_PATH, "w", encoding="utf-8") as f:
+        json.dump(settings, f, indent=2)
+
+
+# ============================================================================
+# Project Settings  (<project_folder>/settings.json)
+# ============================================================================
+
+_PROJECT_SETTINGS_FILENAME = "settings.json"
+
+_PROJECT_SETTINGS_DEFAULTS: dict = {
+    "fps": 30,
+    "codec": "h264",
+    "intrinsic_max_frames": 40,
+    "cameras": {},
+    "charuco_intrinsic": {
+        "columns": 7,
+        "rows": 5,
+        "square_size_cm": 3.0,
+        "inverted": False,
+    },
+    "charuco_extrinsic": {
+        "columns": 4,
+        "rows": 3,
+        "square_size_cm": 5.0,
+        "inverted": False,
+    },
+}
+
+
+def load_project_settings(project_folder: Path) -> dict:
+    """
+    Load per-project settings from <project_folder>/settings.json.
+
+    Returns defaults merged with whatever is stored on disk.
+    """
+    path = project_folder / _PROJECT_SETTINGS_FILENAME
+    if not path.exists():
+        return _deep_copy_defaults(_PROJECT_SETTINGS_DEFAULTS)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        result = _deep_copy_defaults(_PROJECT_SETTINGS_DEFAULTS)
+        _deep_merge(result, data)
+        return result
+    except Exception:
+        return _deep_copy_defaults(_PROJECT_SETTINGS_DEFAULTS)
+
+
+def save_project_settings(settings: dict, project_folder: Path) -> None:
+    """Save per-project settings to <project_folder>/settings.json."""
+    project_folder.mkdir(parents=True, exist_ok=True)
+    path = project_folder / _PROJECT_SETTINGS_FILENAME
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(settings, f, indent=2)
+
+
+def _deep_copy_defaults(d: dict) -> dict:
+    import copy
+    return copy.deepcopy(d)
+
+
+def _deep_merge(base: dict, override: dict) -> None:
+    """Merge override into base in-place (nested dicts merged, not replaced)."""
+    for k, v in override.items():
+        if k in base and isinstance(base[k], dict) and isinstance(v, dict):
+            _deep_merge(base[k], v)
+        else:
+            base[k] = v

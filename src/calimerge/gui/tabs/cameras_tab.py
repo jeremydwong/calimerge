@@ -33,12 +33,12 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QLineEdit,
 )
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtGui import QFont, QPainter, QColor, QPen
 
 from ..widgets.camera_grid import CameraGrid
 from ..state import StateManager, CameraState
-from ..workers import CameraEnumerateWorker, CameraPreviewWorker, RecordingWorker
+from ..workers import CameraEnumerateWorker, CameraPreviewWorker, RecordingWorker, PoseDetectionWorker
 
 
 # ── Camera Colors ──
@@ -189,6 +189,8 @@ class CamerasTab(QWidget):
     """
 
     status_message = Signal(str)
+    project_folder_changed = Signal(Path)  # emitted when the project folder changes
+    save_settings_requested = Signal()     # emitted when settings should be persisted
 
     def __init__(self, state_manager: StateManager, parent: QWidget | None = None):
         super().__init__(parent)
@@ -197,11 +199,26 @@ class CamerasTab(QWidget):
         self.enumerate_worker: CameraEnumerateWorker | None = None
         self.preview_worker: CameraPreviewWorker | None = None
         self.recording_worker: RecordingWorker | None = None
+        self.detection_worker: PoseDetectionWorker | None = None
         self.opened_cameras: list = []
         self.opened_ports: list[int] = []
         self.base_output_path = Path("recordings")
         self.output_path: Path | None = None
         self._is_recording = False
+        # Per-serial camera preferences loaded from project settings
+        self._serial_prefs: dict[str, dict] = {}
+
+        # Restore last project folder from app settings
+        try:
+            from ...config import load_app_settings
+            app_settings = load_app_settings()
+            last = app_settings.get("last_project_folder")
+            if last:
+                p = Path(last)
+                if p.is_dir():
+                    self.base_output_path = p
+        except Exception:
+            pass
         self._updating_table = False
         self._cap_1080p = True  # default: hide resolutions above 1080p
 
@@ -245,6 +262,12 @@ class CamerasTab(QWidget):
         self.cap_1080p_checkbox.stateChanged.connect(self._on_cap_1080p_changed)
         toolbar.addWidget(self.cap_1080p_checkbox)
 
+        self.detect_checkbox = QCheckBox("Live Detection")
+        self.detect_checkbox.setChecked(False)
+        self.detect_checkbox.setToolTip("Overlay 2D pose detection on preview (YOLO + VitPose)")
+        self.detect_checkbox.toggled.connect(self._on_detect_toggled)
+        toolbar.addWidget(self.detect_checkbox)
+
         toolbar.addStretch()
 
         self.camera_count_label = QLabel("No cameras")
@@ -257,7 +280,7 @@ class CamerasTab(QWidget):
         settings_layout = QHBoxLayout(settings_group)
 
         settings_layout.addWidget(QLabel("Project:"))
-        self.output_label = QLabel("./recordings/")
+        self.output_label = QLabel(str(self.base_output_path) + "/")
         self.output_label.setFont(QFont("monospace", 9))
         self.output_label.setMinimumWidth(150)
         settings_layout.addWidget(self.output_label)
@@ -364,7 +387,9 @@ class CamerasTab(QWidget):
         layout.addWidget(self.log_text)
 
     def _connect_signals(self):
-        self.state_manager.cameras_changed.connect(self._on_cameras_changed)
+        # NOTE: cameras_changed is NOT connected here — cameras_tab owns the table
+        # and rebuilds it explicitly (on enumerate, settings load, cap-1080p toggle).
+        # Connecting it caused every update_camera() call to destroy/recreate combos.
         self.state_manager.frame_received.connect(self._on_frame_received)
 
     # ── Camera enumeration ──
@@ -389,8 +414,14 @@ class CamerasTab(QWidget):
         camera_states = {}
         for port, cam in enumerate(cameras):
             nickname = nicknames.get(cam.serial_number, "")
+            # Seed selected_resolution from saved prefs so intrinsic tab sees it immediately
+            pref = self._serial_prefs.get(cam.serial_number, {})
+            raw_res = pref.get("resolution")
+            initial_res = tuple(raw_res) if raw_res else None
+            pref_enabled = pref.get("enabled", True)
             camera_states[port] = CameraState(
-                info=cam, enabled=True, is_open=False, nickname=nickname
+                info=cam, enabled=pref_enabled, is_open=False, nickname=nickname,
+                selected_resolution=initial_res,
             )
 
         self.state_manager.set_cameras(camera_states)
@@ -420,7 +451,7 @@ class CamerasTab(QWidget):
                 entry["nickname"] = nick_widget.text()
             res_widget = self.camera_table.cellWidget(row, 4)
             if res_widget and isinstance(res_widget, QComboBox):
-                entry["resolution"] = res_widget.currentData()
+                entry["resolution"] = tuple(res_widget.currentData())
             exp_widget = self.camera_table.cellWidget(row, 5)
             if exp_widget and isinstance(exp_widget, QSpinBox):
                 entry["exposure"] = exp_widget.value()
@@ -494,12 +525,20 @@ class CamerasTab(QWidget):
             for w, h in resolutions:
                 res_combo.addItem(f"{w}x{h}", (w, h))
 
-            # Restore previous selection, or default to lowest resolution
-            selected_idx = res_combo.count() - 1  # lowest resolution (list is sorted largest-first)
+            # Restore previous selection, fall back to serial-based project prefs,
+            # then default to lowest resolution (list is sorted largest-first)
+            selected_idx = res_combo.count() - 1
             prev_res = prev.get("resolution")
+            if not prev_res:
+                # Check project-settings prefs keyed by serial number
+                serial_pref = self._serial_prefs.get(info.serial_number, {})
+                raw = serial_pref.get("resolution")
+                if raw:
+                    prev_res = tuple(raw)
             if prev_res:
+                prev_res_t = tuple(prev_res)
                 for idx in range(res_combo.count()):
-                    if res_combo.itemData(idx) == prev_res:
+                    if tuple(res_combo.itemData(idx)) == prev_res_t:
                         selected_idx = idx
                         break
             res_combo.setCurrentIndex(selected_idx)
@@ -511,7 +550,8 @@ class CamerasTab(QWidget):
             # Exposure spinbox
             exposure_spin = QSpinBox()
             exposure_spin.setRange(-13, 0)
-            prev_exp = prev.get("exposure", info.exposure)
+            serial_pref_exp = self._serial_prefs.get(info.serial_number, {}).get("exposure")
+            prev_exp = prev.get("exposure", serial_pref_exp if serial_pref_exp is not None else info.exposure)
             exposure_spin.setValue(prev_exp)
             exposure_spin.setToolTip("Exposure (log2 seconds, e.g. -4 = 1/16s)")
             exposure_spin.valueChanged.connect(
@@ -521,7 +561,8 @@ class CamerasTab(QWidget):
 
             # Enabled checkbox
             checkbox = QCheckBox()
-            prev_en = prev.get("enabled", cam_state.enabled)
+            serial_pref_en = self._serial_prefs.get(info.serial_number, {}).get("enabled")
+            prev_en = prev.get("enabled", serial_pref_en if serial_pref_en is not None else cam_state.enabled)
             checkbox.setChecked(prev_en)
             checkbox.stateChanged.connect(
                 lambda state, p=port: self._on_enabled_changed(p, state)
@@ -556,6 +597,11 @@ class CamerasTab(QWidget):
         enabled = state == Qt.CheckState.Checked.value
         self.state_manager.update_camera(port, enabled=enabled)
 
+        # If previewing, restart preview so the change takes effect immediately
+        if self.preview_worker:
+            self.stop_preview()
+            self.start_preview()
+
     def _on_nickname_changed(self, port: int, nickname: str):
         if self._updating_table:
             return
@@ -573,6 +619,10 @@ class CamerasTab(QWidget):
         if res is None:
             return
 
+        # Defer state update to next event loop iteration — avoids destroying the
+        # combo widget synchronously while Qt is still processing the selection event.
+        QTimer.singleShot(0, lambda: self.state_manager.update_camera(port, selected_resolution=res))
+
         # Apply live if camera is open
         cameras = self.state_manager.state.cameras
         cam_state = cameras.get(port)
@@ -585,6 +635,9 @@ class CamerasTab(QWidget):
                 self.status_message.emit(f"Port {port}: resolution change failed: {e}")
         else:
             self.status_message.emit(f"Port {port}: resolution set to {res[0]}x{res[1]} (will apply on preview)")
+
+        # Persist immediately so the choice survives even if the app is force-closed
+        self.save_settings_requested.emit()
 
     def _on_exposure_changed(self, port: int, value: int):
         if self._updating_table:
@@ -602,6 +655,59 @@ class CamerasTab(QWidget):
         else:
             self.status_message.emit(f"Port {port}: exposure set to {value} (will apply on preview)")
 
+    # ── Project settings ──
+
+    def apply_project_settings(self, settings: dict) -> None:
+        """Apply loaded project settings to this tab's UI controls."""
+        # Store per-serial camera preferences for use when table is (re)built
+        self._serial_prefs = settings.get("cameras", {})
+
+        fps = settings.get("fps")
+        if fps is not None:
+            self.fps_spin.setValue(int(fps))
+
+        codec = settings.get("codec", "h264")
+        for i in range(self.codec_combo.count()):
+            if self.codec_combo.itemData(i) == codec:
+                self.codec_combo.setCurrentIndex(i)
+                break
+
+        # Rebuild table so serial prefs take effect immediately
+        cameras = self.state_manager.state.cameras
+        if cameras:
+            self._update_camera_table(cameras)
+
+    def get_project_settings(self) -> dict:
+        """Return this tab's contribution to the project settings dict."""
+        # Start with previously loaded prefs so cameras not currently enumerated
+        # (unplugged, not refreshed) keep their saved settings.
+        cameras_section: dict[str, dict] = {k: dict(v) for k, v in self._serial_prefs.items()}
+
+        cam_states = self.state_manager.state.cameras
+        for row, (port, cam_state) in enumerate(sorted(cam_states.items())):
+            serial = cam_state.info.serial_number
+            entry: dict = {}
+            res_widget = self.camera_table.cellWidget(row, 4)
+            if res_widget and isinstance(res_widget, QComboBox):
+                res = res_widget.currentData()
+                if res:
+                    entry["resolution"] = list(res)
+            en_widget = self.camera_table.cellWidget(row, 6)
+            if en_widget:
+                cb = en_widget.findChild(QCheckBox)
+                if cb:
+                    entry["enabled"] = cb.isChecked()
+            exp_widget = self.camera_table.cellWidget(row, 5)
+            if exp_widget and isinstance(exp_widget, QSpinBox):
+                entry["exposure"] = exp_widget.value()
+            cameras_section[serial] = entry  # overwrite with live table values
+
+        return {
+            "fps": self.fps_spin.value(),
+            "codec": self.codec_combo.currentData() or "h264",
+            "cameras": cameras_section,
+        }
+
     def _on_cap_1080p_changed(self, state: int):
         self._cap_1080p = state == Qt.CheckState.Checked.value
         cameras = self.state_manager.state.cameras
@@ -613,6 +719,15 @@ class CamerasTab(QWidget):
         if folder:
             self.base_output_path = Path(folder)
             self.output_label.setText(str(folder) + "/")
+            # Persist last project folder
+            try:
+                from ...config import load_app_settings, save_app_settings
+                app_settings = load_app_settings()
+                app_settings["last_project_folder"] = str(folder)
+                save_app_settings(app_settings)
+            except Exception:
+                pass
+            self.project_folder_changed.emit(self.base_output_path)
 
     # ── Open/close cameras ──
 
@@ -750,6 +865,12 @@ class CamerasTab(QWidget):
             self.preview_worker.wait()
             self.preview_worker = None
 
+        # Stop detection worker if running
+        self._stop_detection()
+        self.detect_checkbox.blockSignals(True)
+        self.detect_checkbox.setChecked(False)
+        self.detect_checkbox.blockSignals(False)
+
         if not self._is_recording:
             self._close_cameras()
             self.camera_grid.clear_all()
@@ -862,7 +983,13 @@ class CamerasTab(QWidget):
     # ── Frame handling ──
 
     def _on_frame_received(self, port: int, frame):
-        self.camera_grid.update_frame(port, frame)
+        # If live detection is active, send frame to detection worker instead
+        if self.detection_worker is not None and self.detection_worker.isRunning():
+            self.detection_worker.submit_frame(port, frame)
+            # Still show raw frame immediately (detection overlay arrives later)
+            self.camera_grid.update_frame(port, frame)
+        else:
+            self.camera_grid.update_frame(port, frame)
 
         # Compute FPS
         now = time.perf_counter()
@@ -872,12 +999,70 @@ class CamerasTab(QWidget):
                 self.fps_graph.push_fps(port, 1.0 / dt)
         self._last_frame_time[port] = now
 
+    def _on_detection_ready(self, port: int, annotated_frame):
+        """Replace the camera grid frame with the annotated version."""
+        self.camera_grid.update_frame(port, annotated_frame)
+
     def _on_preview_error(self, error: str):
         self.stop_preview()
         self.status_message.emit(f"Preview error: {error}")
 
-    def _on_cameras_changed(self, cameras: dict):
-        self._update_camera_table(cameras)
+    # ── Live Detection ──
+
+    def _on_detect_toggled(self, checked: bool):
+        """Handle live detection checkbox toggle."""
+        import traceback
+        print(f"[detect] toggled checked={checked}")
+        print(f"[detect] caller: {''.join(traceback.format_stack()[-3:-1]).strip()}")
+        if checked:
+            self._start_detection()
+        else:
+            self._stop_detection()
+
+    def _start_detection(self):
+        """Start the pose detection worker."""
+        if self.detection_worker is not None:
+            print("[detect] worker already exists, skipping")
+            return
+
+        print("[detect] creating PoseDetectionWorker...")
+        self.detection_worker = PoseDetectionWorker(device_name="auto")
+        self.detection_worker.models_loaded.connect(
+            lambda: print("[detect] models loaded, live detection active")
+        )
+        self.detection_worker.detection_ready.connect(self._on_detection_ready)
+        self.detection_worker.log_message.connect(lambda msg: print(f"[detect] {msg}"))
+        self.detection_worker.error.connect(self._on_detection_error)
+        self.detection_worker.finished.connect(self._on_detection_finished)
+        self.detection_worker.start()
+        print("[detect] worker started")
+
+    def _stop_detection(self):
+        """Stop the pose detection worker."""
+        if self.detection_worker is not None:
+            print("[detect] stopping worker...")
+            self.detection_worker.stop()
+            self.detection_worker.wait()
+            self.detection_worker = None
+            print("[detect] stopped")
+
+    def _on_detection_finished(self):
+        """Handle detection worker thread finishing (could be normal or crash)."""
+        print("[detect] worker thread finished")
+        if self.detect_checkbox.isChecked():
+            print("[detect] worker died unexpectedly while checkbox was checked")
+            self.detect_checkbox.blockSignals(True)
+            self.detect_checkbox.setChecked(False)
+            self.detect_checkbox.blockSignals(False)
+            self.detection_worker = None
+
+    def _on_detection_error(self, error: str):
+        """Handle detection worker error."""
+        print(f"[detect] ERROR: {error}")
+        self.detect_checkbox.blockSignals(True)
+        self.detect_checkbox.setChecked(False)
+        self.detect_checkbox.blockSignals(False)
+        self._stop_detection()
 
     def _log(self, message: str):
         self.log_text.append(message)

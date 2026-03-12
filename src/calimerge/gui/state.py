@@ -38,6 +38,9 @@ class CameraState:
     is_open: bool = False
     nickname: str = ""
     last_frame: "np.ndarray | None" = None
+    # Resolution selected in the Record tab UI (may differ from info.width/height
+    # until the camera is opened).  Used by the Intrinsic tab for DB status checks.
+    selected_resolution: "tuple[int, int] | None" = None
 
 
 @dataclass(frozen=True)

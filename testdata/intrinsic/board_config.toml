@@ -1,0 +1,5 @@
+columns = 10
+rows = 9
+square_size_cm = 2.0
+dictionary = "DICT_4X4_50"
+inverted = true

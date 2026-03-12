@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QSplitter,
     QComboBox,
     QSizePolicy,
+    QSlider,
     QTextEdit,
 )
 from PySide6.QtCore import Qt, Signal
@@ -125,6 +126,20 @@ class IntrinsicTab(QWidget):
         row3.addStretch()
         charuco_layout.addLayout(row3)
 
+        row4 = QHBoxLayout()
+        row4.addWidget(QLabel("Max frames:"))
+        self.max_frames_slider = QSlider(Qt.Orientation.Horizontal)
+        self.max_frames_slider.setRange(10, 500)
+        self.max_frames_slider.setValue(40)
+        self.max_frames_slider.setTickInterval(50)
+        self.max_frames_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.max_frames_slider.valueChanged.connect(self._on_max_frames_changed)
+        row4.addWidget(self.max_frames_slider, stretch=1)
+        self.max_frames_label = QLabel("40")
+        self.max_frames_label.setFixedWidth(30)
+        row4.addWidget(self.max_frames_label)
+        charuco_layout.addLayout(row4)
+
         charuco_layout.addStretch()
         top_splitter.addWidget(charuco_group)
 
@@ -157,24 +172,26 @@ class IntrinsicTab(QWidget):
         cameras_layout = QVBoxLayout(cameras_group)
 
         self.camera_table = QTableWidget()
-        self.camera_table.setColumnCount(7)
+        self.camera_table.setColumnCount(8)
         self.camera_table.setHorizontalHeaderLabels(
-            ["", "Port", "Camera", "Serial", "Video", "Status", "Error"]
+            ["", "Port", "Nickname", "Camera", "Serial", "Video", "Status", "Error"]
         )
         header = self.camera_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        header.resizeSection(0, 30)  # Color
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        header.resizeSection(0, 30)  # Color (fixed tiny swatch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
         header.resizeSection(1, 40)  # Port
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
-        header.resizeSection(2, 120)  # Camera name
+        header.resizeSection(2, 70)  # Nickname
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
-        header.resizeSection(3, 140)  # Serial
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)  # Video
-        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
-        header.resizeSection(5, 100)  # Status
-        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
-        header.resizeSection(6, 70)  # Error
+        header.resizeSection(3, 120)  # Camera name
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
+        header.resizeSection(4, 140)  # Serial
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)  # Video (fills space)
+        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Interactive)
+        header.resizeSection(6, 100)  # Status
+        header.setSectionResizeMode(7, QHeaderView.ResizeMode.Interactive)
+        header.resizeSection(7, 70)  # Error
         self.camera_table.setSelectionBehavior(
             QTableWidget.SelectionBehavior.SelectRows
         )
@@ -277,12 +294,18 @@ class IntrinsicTab(QWidget):
 
     def _connect_signals(self):
         self.state_manager.cameras_changed.connect(self._on_cameras_changed)
+        self.state_manager.cameras_changed.connect(self._on_cameras_available)
         self.state_manager.calibration_changed.connect(self._on_calibration_changed)
 
     def showEvent(self, event):
         """Called when the tab becomes visible - load intrinsics from database."""
         super().showEvent(event)
         self._load_intrinsics_from_db()
+
+    def _on_cameras_available(self, cameras: dict):
+        """When cameras are enumerated, load any matching DB intrinsics."""
+        if cameras:
+            self._load_intrinsics_from_db()
 
     def _load_intrinsics_from_db(self):
         """Load intrinsics from ~/.calimerge/intrinsics.db for all enabled cameras."""
@@ -291,7 +314,7 @@ class IntrinsicTab(QWidget):
             return
 
         try:
-            from ...config import load_intrinsics, get_default_intrinsics_db
+            from ...config import load_intrinsics, list_intrinsics, get_default_intrinsics_db
 
             db_path = get_default_intrinsics_db()
             if not db_path.exists():
@@ -300,20 +323,44 @@ class IntrinsicTab(QWidget):
             loaded_intrinsics = dict(self.state_manager.state.calibration.intrinsics)
             loaded_count = 0
 
+            # Build a lookup of DB entries once to avoid repeated queries
+            all_db = list_intrinsics(db_path)
+            db_by_serial: dict[str, list[tuple[int, int, float]]] = {}
+            for sn, w, h, err in all_db:
+                db_by_serial.setdefault(sn, []).append((w, h, err))
+
             for port, cam_state in cameras.items():
                 if not cam_state.enabled:
                     continue
 
                 serial = cam_state.info.serial_number
-                resolution = (cam_state.info.width, cam_state.info.height)
 
-                # Skip if already loaded or resolution not set
+                # Skip if already loaded
                 if serial in loaded_intrinsics:
                     continue
-                if resolution[0] == 0 or resolution[1] == 0:
-                    continue
 
-                intrinsics = load_intrinsics(serial, resolution, db_path)
+                # Prefer the resolution the user has selected; fall back to
+                # the camera's reported resolution, then (0,0) if not yet opened.
+                resolution = cam_state.selected_resolution or (cam_state.info.width, cam_state.info.height)
+
+                if resolution[0] > 0 and resolution[1] > 0:
+                    # Try exact / same-AR match first
+                    intrinsics = load_intrinsics(serial, resolution, db_path)
+                    if intrinsics is None:
+                        # No same-AR entry — load best DB entry regardless of AR.
+                        # scale_intrinsics handles cross-AR scaling.
+                        entries = db_by_serial.get(serial, [])
+                        if entries:
+                            best_w, best_h, _ = min(entries, key=lambda x: x[2])
+                            intrinsics = load_intrinsics(serial, (best_w, best_h), db_path)
+                else:
+                    # Camera not yet opened — pick the best (lowest-error) DB entry
+                    entries = db_by_serial.get(serial, [])
+                    if not entries:
+                        continue
+                    best_w, best_h, _ = min(entries, key=lambda x: x[2])
+                    intrinsics = load_intrinsics(serial, (best_w, best_h), db_path)
+
                 if intrinsics is not None:
                     loaded_intrinsics[serial] = intrinsics
                     loaded_count += 1
@@ -325,6 +372,40 @@ class IntrinsicTab(QWidget):
                 self._on_cameras_changed(cameras)
         except Exception as e:
             self.status_message.emit(f"Failed to load intrinsics: {e}")
+
+    # ── Max frames ──
+
+    def _on_max_frames_changed(self, value: int):
+        self.max_frames_label.setText(str(value))
+
+    # ── Project settings ──
+
+    def apply_project_settings(self, settings: dict) -> None:
+        """Apply loaded project settings to this tab's UI controls."""
+        max_frames = settings.get("intrinsic_max_frames", 40)
+        self.max_frames_slider.setValue(int(max_frames))
+
+        intr = settings.get("charuco_intrinsic", {})
+        if "columns" in intr:
+            self.cols_spin.setValue(int(intr["columns"]))
+        if "rows" in intr:
+            self.rows_spin.setValue(int(intr["rows"]))
+        if "square_size_cm" in intr:
+            self.square_spin.setValue(float(intr["square_size_cm"]))
+        if "inverted" in intr:
+            self.inverted_checkbox.setChecked(bool(intr["inverted"]))
+
+    def get_project_settings(self) -> dict:
+        """Return this tab's contribution to the project settings dict."""
+        return {
+            "intrinsic_max_frames": self.max_frames_slider.value(),
+            "charuco_intrinsic": {
+                "columns": self.cols_spin.value(),
+                "rows": self.rows_spin.value(),
+                "square_size_cm": self.square_spin.value(),
+                "inverted": self.inverted_checkbox.isChecked(),
+            },
+        }
 
     # ── ChArUco preview ──
 
@@ -383,38 +464,44 @@ class IntrinsicTab(QWidget):
             port_item.setFlags(port_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.camera_table.setItem(row, 1, port_item)
 
-            # Camera name + nickname (column 2)
+            # Nickname (column 2)
             serial = cam_state.info.serial_number
             nickname = cam_state.nickname
-            name_text = f"{nickname} - {cam_state.info.display_name}" if nickname else cam_state.info.display_name
-            name_item = QTableWidgetItem(name_text)
-            name_item.setData(Qt.ItemDataRole.UserRole, port)
-            name_item.setData(Qt.ItemDataRole.UserRole + 1, serial)  # Store serial for lookup
-            name_item.setFlags(name_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            self.camera_table.setItem(row, 2, name_item)
+            nick_item = QTableWidgetItem(nickname if nickname else "")
+            nick_item.setData(Qt.ItemDataRole.UserRole, port)
+            nick_item.setData(Qt.ItemDataRole.UserRole + 1, serial)
+            nick_item.setFlags(nick_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            if nickname:
+                nick_item.setFont(QFont("sans-serif", 10, QFont.Weight.Bold))
+            self.camera_table.setItem(row, 2, nick_item)
 
-            # Serial (column 3) - dedicated column for readability
+            # Camera name (column 3)
+            name_item = QTableWidgetItem(cam_state.info.display_name)
+            name_item.setData(Qt.ItemDataRole.UserRole, port)
+            name_item.setFlags(name_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.camera_table.setItem(row, 3, name_item)
+
+            # Serial (column 4)
             serial_item = QTableWidgetItem(serial)
             serial_item.setFont(QFont("monospace", 9))
             serial_item.setFlags(serial_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            self.camera_table.setItem(row, 3, serial_item)
+            self.camera_table.setItem(row, 4, serial_item)
 
-            # Video path (column 4)
+            # Video path (column 5)
             video_path = self.video_paths.get(port)
             video_text = video_path.name if video_path else "Not loaded"
             video_item = QTableWidgetItem(video_text)
             video_item.setFlags(video_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            self.camera_table.setItem(row, 4, video_item)
+            self.camera_table.setItem(row, 5, video_item)
 
-            # Status (column 5) - use serial for intrinsics lookup
+            # Status (column 6) - use serial for intrinsics lookup
             cal_state = self.state_manager.state.calibration
-            camera_res = (cam_state.info.width, cam_state.info.height)
+            # Use the user's selected resolution (if known) for DB status checks
+            camera_res = cam_state.selected_resolution or (cam_state.info.width, cam_state.info.height)
 
             if serial in cal_state.intrinsics:
                 intr = cal_state.intrinsics[serial]
-                # Check if intrinsics were scaled from a different resolution
                 if intr.is_scaled:
-                    # Show the original resolution they were scaled from
                     status = f"Scaled from {intr.scaled_from[0]}x{intr.scaled_from[1]}"
                 else:
                     status = "Calibrated"
@@ -422,20 +509,19 @@ class IntrinsicTab(QWidget):
                 progress = cal_state.intrinsic_progress[port]
                 status = f"Processing {progress:.0%}"
             else:
-                # Check database for this camera (any resolution)
-                db_status = self._check_db_intrinsics_any_res(serial)
+                db_status = self._check_db_intrinsics_any_res(serial, camera_res)
                 status = db_status if db_status else "Pending"
             status_item = QTableWidgetItem(status)
             status_item.setFlags(status_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            self.camera_table.setItem(row, 5, status_item)
+            self.camera_table.setItem(row, 6, status_item)
 
-            # Error (column 6) - use serial for intrinsics lookup
+            # Error (column 7) - use serial for intrinsics lookup
             error_text = ""
             if serial in cal_state.intrinsics:
                 error_text = f"{cal_state.intrinsics[serial].error:.4f}"
             error_item = QTableWidgetItem(error_text)
             error_item.setFlags(error_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            self.camera_table.setItem(row, 6, error_item)
+            self.camera_table.setItem(row, 7, error_item)
 
     def _check_db_intrinsics(self, info) -> str:
         """Check if intrinsics exist in database for this camera at current resolution."""
@@ -488,16 +574,15 @@ class IntrinsicTab(QWidget):
         except Exception:
             return ""
 
-    def _check_db_intrinsics_any_res(self, serial: str) -> str:
-        """Check if intrinsics exist in database for this camera at any resolution."""
-        # Get camera resolution if available
-        cameras = self.state_manager.state.cameras
-        resolution = (0, 0)
-        for port, cam_state in cameras.items():
-            if cam_state.info.serial_number == serial:
-                resolution = (cam_state.info.width, cam_state.info.height)
-                break
+    def _check_db_intrinsics_any_res(
+        self, serial: str, resolution: tuple[int, int] = (0, 0)
+    ) -> str:
+        """
+        Check if intrinsics exist in database for this camera.
 
+        If resolution is provided and non-zero, report status relative to it.
+        Otherwise fall back to listing all available resolutions.
+        """
         if resolution[0] > 0 and resolution[1] > 0:
             return self._check_db_intrinsics_status(serial, resolution)
 
@@ -544,7 +629,7 @@ class IntrinsicTab(QWidget):
         if not items:
             return None
         row = items[0].row()
-        # Serial is stored in column 2 as UserRole + 1
+        # Serial is stored in Nickname column (2) as UserRole + 1
         item = self.camera_table.item(row, 2)
         return item.data(Qt.ItemDataRole.UserRole + 1) if item else None
 
@@ -588,9 +673,11 @@ class IntrinsicTab(QWidget):
             )
             # Only allow saving if not scaled (scaled intrinsics are derived, not original)
             self.save_button.setEnabled(not intrinsics.is_scaled)
+            self.load_video_button.setText("Load New Video...")
         else:
             self.results_label.setText("Not calibrated")
             self.save_button.setEnabled(False)
+            self.load_video_button.setText("Load Video...")
 
     # ── Video loading ──
 
@@ -713,6 +800,8 @@ class IntrinsicTab(QWidget):
             video_path=video_path,
             serial_number=serial_number,
             charuco_config=charuco_config,
+            port=port,
+            max_calibration_frames=self.max_frames_slider.value(),
         )
         worker.log_message.connect(self._log)
         worker.progress_update.connect(
@@ -750,8 +839,13 @@ class IntrinsicTab(QWidget):
         }
         self.state_manager.update_calibration(intrinsic_progress=new_progress)
 
-    def _on_detection_frame(self, frame_index: int, frame, corner_count: int):
-        """Show a frame with detected charuco corners overlaid."""
+    def _on_detection_frame(self, port: int, frame_index: int, frame, corner_count: int):
+        """Show a frame with detected charuco corners overlaid for the selected camera."""
+        # Only show detection frames for the currently selected camera
+        selected_port = self._get_selected_port()
+        if selected_port is not None and port != selected_port:
+            return
+
         pixmap = bgr_to_pixmap(frame)
         if not pixmap.isNull():
             scaled = pixmap.scaled(
@@ -760,8 +854,13 @@ class IntrinsicTab(QWidget):
                 Qt.TransformationMode.SmoothTransformation,
             )
             self.detection_label.setPixmap(scaled)
+
+        # Show port nickname or number
+        cameras = self.state_manager.state.cameras
+        cam_state = cameras.get(port)
+        label = cam_state.nickname if cam_state and cam_state.nickname else f"Port {port}"
         self.detection_info.setText(
-            f"Frame {frame_index}: {corner_count} corners detected"
+            f"{label} | Frame {frame_index}: {corner_count} corners"
         )
 
     def _on_calibration_finished(self, port: int, intrinsics):
@@ -795,9 +894,34 @@ class IntrinsicTab(QWidget):
                 f"but failed to save: {e}"
             )
 
+        # Save charuco board PDF at exact dimensions
+        self._save_charuco_pdf("intrinsic")
+
         # Refresh selection
         if self._get_selected_port() == port:
             self._on_camera_selected()
+
+    def _save_charuco_pdf(self, label: str) -> None:
+        """Save a PDF of the charuco board at exact physical dimensions."""
+        try:
+            from ...calibration.charuco import create_charuco_pdf
+            # Access the main window's cameras_tab to get the project folder
+            main_window = self.window()
+            if hasattr(main_window, "cameras_tab"):
+                folder = main_window.cameras_tab.base_output_path
+            else:
+                folder = None
+            if folder is None:
+                return
+            folder.mkdir(parents=True, exist_ok=True)
+            config = self._get_charuco_config()
+            style = "W" if config.inverted else "K"
+            size_str = str(config.square_size_cm).replace(".", "p")
+            pdf_path = folder / f"charuco_c{config.columns}r{config.rows}s{size_str}cm_{style}.pdf"
+            create_charuco_pdf(config, pdf_path)
+            self._log(f"Saved charuco board PDF: {pdf_path}")
+        except Exception as e:
+            self._log(f"Failed to save charuco PDF: {e}")
 
     def _on_calibration_error(self, port: int, error: str):
         """Handle calibration error."""

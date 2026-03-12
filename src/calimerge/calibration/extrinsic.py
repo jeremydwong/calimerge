@@ -22,6 +22,7 @@ from ..types import (
     SyncedPoints,
     extrinsics_from_vector,
     extrinsics_to_vector,
+    scale_intrinsics,
 )
 
 
@@ -141,10 +142,10 @@ def stereo_calibrate_pair(
         obj_points_list,
         img_points_a_list,
         img_points_b_list,
-        intrinsics_a.matrix,
-        intrinsics_a.distortion,
-        intrinsics_b.matrix,
-        intrinsics_b.distortion,
+        intrinsics_a.matrix.copy(),
+        intrinsics_a.distortion.copy(),
+        intrinsics_b.matrix.copy(),
+        intrinsics_b.distortion.copy(),
         imageSize=None,
         criteria=criteria,
         flags=flags,
@@ -548,6 +549,7 @@ def run_extrinsic_from_videos(
     frame_time_csv: "Path | None" = None,
     sample_interval: int = 10,
     progress_callback: "Callable | None" = None,
+    frame_callback: "Callable | None" = None,
 ) -> tuple[dict[int, CalibratedCamera], float]:
     """
     Run the full extrinsic calibration pipeline from video files.
@@ -566,6 +568,7 @@ def run_extrinsic_from_videos(
         frame_time_csv: Optional CSV with sync timing (sync_index, port, frame_index, frame_time)
         sample_interval: Process every Nth frame
         progress_callback: Optional callback(fraction: float, message: str)
+        frame_callback: Optional callback(port, frame_index, frame_bgr, packet) called per detection
 
     Returns:
         (calibrated_cameras, rmse)
@@ -588,6 +591,25 @@ def run_extrinsic_from_videos(
     # per_port_detections[port] = list of (frame_index, PointPacket)
     per_port_detections: dict[int, list[tuple[int, "PointPacket"]]] = {}
 
+    # Scale intrinsics to match video resolution where needed
+    intrinsics = dict(intrinsics)  # shallow copy — don't mutate caller's dict
+    for port in ports:
+        if port not in intrinsics:
+            continue
+        intr = intrinsics[port]
+        probe = cv2.VideoCapture(str(video_paths[port]))
+        vid_w = int(probe.get(cv2.CAP_PROP_FRAME_WIDTH))
+        vid_h = int(probe.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        probe.release()
+        vid_res = (vid_w, vid_h)
+        if intr.resolution != vid_res:
+            intrinsics[port] = scale_intrinsics(intr, vid_res)
+            report(
+                0.0,
+                f"  Port {port}: scaled intrinsics from {intr.resolution} to {vid_res}",
+            )
+
+    total_corners = 0
     for port_i, port in enumerate(ports):
         video_path = video_paths[port]
         cap = cv2.VideoCapture(str(video_path))
@@ -596,6 +618,7 @@ def run_extrinsic_from_videos(
 
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         detections = []
+        port_corners = 0
         frame_idx = 0
 
         while True:
@@ -607,14 +630,20 @@ def run_extrinsic_from_videos(
                 packet = detect_charuco_points(frame, charuco_config, board)
                 if packet.point_id is not None and len(packet.point_id) >= 4:
                     detections.append((frame_idx, packet))
+                    port_corners += len(packet.point_id)
+                    if frame_callback:
+                        frame_callback(port, frame_idx, frame, packet)
 
             frame_idx += 1
 
         cap.release()
         per_port_detections[port] = detections
+        total_corners += port_corners
 
         fraction = 0.3 * (port_i + 1) / len(ports)
-        report(fraction, f"  Port {port}: {len(detections)} detections from {frame_idx} frames")
+        report(fraction, f"  Port {port}: {len(detections)} frames, {port_corners} corners from {frame_idx} frames")
+
+    report(0.3, f"  Total: {total_corners} corner detections across {len(ports)} cameras")
 
     # Step 2: Build SyncedPoints
     report(0.3, "Step 2: Building synchronized point correspondences...")
@@ -624,6 +653,33 @@ def run_extrinsic_from_videos(
     )
 
     report(0.35, f"  {len(synced_points_list)} sync frames with shared observations")
+
+    # Report per-camera corner counts in synced frames
+    for port in ports:
+        frames_with_det = 0
+        corner_sum = 0
+        for sp in synced_points_list:
+            fp = sp.frame_points.get(port)
+            if fp is not None and fp.points is not None and fp.points.point_id is not None:
+                frames_with_det += 1
+                corner_sum += len(fp.points.point_id)
+        report(0.35, f"    Port {port}: {frames_with_det} synced frames, {corner_sum} corners")
+
+    # Report shared corners per camera pair
+    for i, pa in enumerate(ports):
+        for pb in ports[i + 1:]:
+            shared_frames = 0
+            shared_corners = 0
+            for sp in synced_points_list:
+                fp_a = sp.frame_points.get(pa)
+                fp_b = sp.frame_points.get(pb)
+                if (fp_a and fp_a.points and fp_a.points.point_id is not None and
+                    fp_b and fp_b.points and fp_b.points.point_id is not None):
+                    common = len(set(fp_a.points.point_id.tolist()) & set(fp_b.points.point_id.tolist()))
+                    if common >= 4:
+                        shared_frames += 1
+                        shared_corners += common
+            report(0.35, f"    Pair ({pa}, {pb}): {shared_frames} shared frames, {shared_corners} shared corners")
 
     if len(synced_points_list) < 3:
         raise RuntimeError(

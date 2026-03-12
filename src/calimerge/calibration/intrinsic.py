@@ -181,6 +181,12 @@ def calibrate_intrinsics(
         if packet.obj_loc is None or packet.obj_loc.size == 0:
             continue
 
+        # Skip collinear views — all points on a single board row or column
+        # causes findHomography to return empty, crashing calibrateCamera
+        obj_2d = packet.obj_loc[:, :2]
+        if np.unique(obj_2d[:, 0]).size < 2 or np.unique(obj_2d[:, 1]).size < 2:
+            continue
+
         valid_obj.append(packet.obj_loc.astype(np.float32))
         valid_img.append(packet.img_loc.astype(np.float32))
 

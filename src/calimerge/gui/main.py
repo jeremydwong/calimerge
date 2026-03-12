@@ -15,8 +15,6 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QMessageBox,
 )
-from PySide6.QtCore import Qt
-
 from .state import StateManager
 from .tabs import CamerasTab, IntrinsicTab, ExtrinsicTab, ProcessTab
 from .. import __version__
@@ -44,6 +42,7 @@ class MainWindow(QMainWindow):
 
         self._init_ui()
         self._connect_signals()
+        self._load_startup_settings()
 
     def _init_ui(self):
         central = QWidget()
@@ -87,6 +86,59 @@ class MainWindow(QMainWindow):
         self.state_manager.status_message.connect(self._show_status)
         self.state_manager.error_occurred.connect(self._show_error)
 
+        # When project folder changes, load and apply its settings
+        self.cameras_tab.project_folder_changed.connect(self._on_project_folder_changed)
+        # Save settings whenever cameras tab requests it (e.g. resolution change)
+        self.cameras_tab.save_settings_requested.connect(self._save_project_settings)
+
+    def _on_project_folder_changed(self, folder):
+        try:
+            from ..config import load_project_settings
+            settings = load_project_settings(folder)
+            self.setstate(settings)
+            self._show_status(f"Project settings loaded from {folder}")
+        except Exception as e:
+            self._show_status(f"Could not load project settings: {e}")
+
+    def setstate(self, settings: dict) -> None:
+        """
+        Apply a project settings dict to all tabs.
+
+        settings keys (all optional):
+          fps, codec               → cameras tab recording settings
+          cameras                  → {serial: {enabled, resolution, exposure}}
+          intrinsic_max_frames     → intrinsic tab frame-count slider
+          charuco_intrinsic        → intrinsic tab board config
+          charuco_extrinsic        → extrinsic tab board config
+        """
+        self.cameras_tab.apply_project_settings(settings)
+        self.intrinsic_tab.apply_project_settings(settings)
+        self.extrinsic_tab.apply_project_settings(settings)
+
+    def _collect_project_settings(self) -> dict:
+        """Gather current settings from all tabs into one dict."""
+        settings = {}
+        settings.update(self.cameras_tab.get_project_settings())
+        settings.update(self.intrinsic_tab.get_project_settings())
+        settings.update(self.extrinsic_tab.get_project_settings())
+        return settings
+
+    def _save_project_settings(self) -> None:
+        """Save current settings to the active project folder."""
+        try:
+            from ..config import save_project_settings, load_app_settings, save_app_settings
+            folder = self.cameras_tab.base_output_path
+            settings = self._collect_project_settings()
+            save_project_settings(settings, folder)
+            # Ensure app_settings always knows the active project folder
+            app = load_app_settings()
+            resolved = str(folder.resolve())
+            if app.get("last_project_folder") != resolved:
+                app["last_project_folder"] = resolved
+                save_app_settings(app)
+        except Exception:
+            pass
+
     def _on_tab_changed(self, index: int):
         self.state_manager.update_state(current_tab=index)
 
@@ -96,7 +148,21 @@ class MainWindow(QMainWindow):
     def _show_error(self, message: str):
         QMessageBox.warning(self, "Error", message)
 
+    def _load_startup_settings(self) -> None:
+        """Load project settings from the last-used project folder on startup."""
+        try:
+            from ..config import load_project_settings
+            folder = self.cameras_tab.base_output_path
+            if folder.is_dir():
+                settings = load_project_settings(folder)
+                self.setstate(settings)
+        except Exception:
+            pass
+
     def closeEvent(self, event):
+        # Save project settings before exit
+        self._save_project_settings()
+
         # Stop preview/recording
         if hasattr(self.cameras_tab, "stop_preview"):
             self.cameras_tab.stop_preview()

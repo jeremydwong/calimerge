@@ -40,6 +40,9 @@ class VideoPlayer(QWidget):
         self.fps: float = 30.0
         self.is_playing: bool = False
 
+        # In-memory frame list mode (alternative to video file)
+        self._frame_list: list[np.ndarray] | None = None
+
         self._init_ui()
 
         # Playback timer
@@ -82,9 +85,24 @@ class VideoPlayer(QWidget):
 
         layout.addLayout(controls)
 
+    def load_frames(self, frames: list[np.ndarray], fps: float = 5.0) -> None:
+        """Load a list of BGR frames for scrubbing/playback (no video file needed)."""
+        self.unload()
+        self._frame_list = frames
+        self.total_frames = len(frames)
+        self.fps = fps
+        self.current_frame = 0
+
+        self.slider.setRange(0, max(0, self.total_frames - 1))
+        self.slider.setValue(0)
+        self._update_ui_state()
+        if self.total_frames > 0:
+            self._show_frame(0)
+
     def load_video(self, path: Path) -> bool:
         """Load a video file."""
         self.stop()
+        self._frame_list = None
 
         if self.cap is not None:
             self.cap.release()
@@ -109,20 +127,25 @@ class VideoPlayer(QWidget):
         return True
 
     def unload(self):
-        """Unload current video."""
+        """Unload current video or frame list."""
         self.stop()
         if self.cap is not None:
             self.cap.release()
             self.cap = None
         self.video_path = None
+        self._frame_list = None
         self.total_frames = 0
         self.current_frame = 0
         self.frame_label.clear()
         self._update_ui_state()
 
+    @property
+    def _has_source(self) -> bool:
+        return self.cap is not None or self._frame_list is not None
+
     def play(self):
         """Start playback."""
-        if self.cap is None or self.is_playing:
+        if not self._has_source or self.is_playing:
             return
         self.is_playing = True
         interval_ms = int(1000.0 / self.fps)
@@ -138,7 +161,7 @@ class VideoPlayer(QWidget):
     def stop(self):
         """Stop playback and reset to start."""
         self.pause()
-        if self.cap is not None:
+        if self._has_source:
             self.seek(0)
 
     def toggle_play(self):
@@ -150,7 +173,7 @@ class VideoPlayer(QWidget):
 
     def seek(self, frame_index: int):
         """Seek to specific frame."""
-        if self.cap is None:
+        if not self._has_source:
             return
         frame_index = max(0, min(frame_index, self.total_frames - 1))
         self._show_frame(frame_index)
@@ -160,6 +183,10 @@ class VideoPlayer(QWidget):
 
     def get_current_frame(self) -> np.ndarray | None:
         """Get the current frame as BGR array."""
+        if self._frame_list is not None:
+            if 0 <= self.current_frame < len(self._frame_list):
+                return self._frame_list[self.current_frame]
+            return None
         if self.cap is None:
             return None
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.current_frame)
@@ -168,13 +195,20 @@ class VideoPlayer(QWidget):
 
     def _show_frame(self, frame_index: int):
         """Display a specific frame."""
-        if self.cap is None:
+        frame = None
+
+        if self._frame_list is not None:
+            if 0 <= frame_index < len(self._frame_list):
+                frame = self._frame_list[frame_index]
+        elif self.cap is not None:
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+            ret, f = self.cap.read()
+            if ret:
+                frame = f
+        else:
             return
 
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
-        ret, frame = self.cap.read()
-
-        if ret:
+        if frame is not None:
             self.current_frame = frame_index
             pixmap = bgr_to_pixmap(frame)
             if not pixmap.isNull():
@@ -206,12 +240,12 @@ class VideoPlayer(QWidget):
 
     def _update_ui_state(self):
         """Update UI based on current state."""
-        has_video = self.cap is not None
-        self.play_button.setEnabled(has_video)
-        self.slider.setEnabled(has_video)
+        has_source = self._has_source
+        self.play_button.setEnabled(has_source)
+        self.slider.setEnabled(has_source)
         self.play_button.setText("Pause" if self.is_playing else "Play")
 
-        if not has_video:
+        if not has_source:
             self.frame_label_info.setText("0 / 0")
 
     def closeEvent(self, event):

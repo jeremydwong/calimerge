@@ -105,6 +105,152 @@ def generate_board_image(
     return img
 
 
+def create_charuco_pdf(config: CharucoConfig, filename: str | Path) -> None:
+    """
+    Generate a PDF of the ChArUco board at exact physical dimensions.
+
+    The board is rendered at its true size so that when printed at 100% scale,
+    each square measures exactly ``config.square_size_cm`` cm.
+
+    Args:
+        config: CharucoConfig with board parameters
+        filename: Output PDF path
+    """
+    from pathlib import Path
+
+    filename = Path(filename)
+
+    # Board physical dimensions in cm
+    board_width_cm = config.columns * config.square_size_cm
+    board_height_cm = config.rows * config.square_size_cm
+
+    # Convert cm to points (1 inch = 72 pt, 1 inch = 2.54 cm)
+    cm_to_pt = 72.0 / 2.54
+    board_width_pt = board_width_cm * cm_to_pt
+    board_height_pt = board_height_cm * cm_to_pt
+
+    # Add margin (1 cm each side)
+    margin_pt = 1.0 * cm_to_pt
+    page_width_pt = board_width_pt + 2 * margin_pt
+    page_height_pt = board_height_pt + 2 * margin_pt
+
+    # Render at high DPI (300 DPI)
+    dpi = 300
+    px_per_pt = dpi / 72.0
+    img_w = int(board_width_pt * px_per_pt)
+    img_h = int(board_height_pt * px_per_pt)
+
+    img = generate_board_image(config, width=img_w, height=img_h)
+    # Convert BGR to RGB for PDF
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+    # Encode as JPEG for smaller file size
+    _, jpeg_buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    jpeg_bytes = jpeg_buf.tobytes()
+
+    # Build a minimal single-page PDF with the image placed at exact dimensions
+    # Using raw PDF construction to avoid extra dependencies
+    _write_pdf_with_image(
+        filename, jpeg_bytes, img_w, img_h,
+        page_width_pt, page_height_pt,
+        board_width_pt, board_height_pt,
+        margin_pt,
+        config,
+    )
+
+
+def _write_pdf_with_image(
+    filename,
+    jpeg_bytes: bytes,
+    img_w: int, img_h: int,
+    page_w: float, page_h: float,
+    board_w: float, board_h: float,
+    margin: float,
+    config,
+) -> None:
+    """Write a minimal PDF containing the board image at exact dimensions."""
+    from pathlib import Path
+
+    offsets = []
+    parts = []
+
+    def obj(content: str) -> bytes:
+        offsets.append(len(b"".join(parts)))
+        return content.encode("latin-1")
+
+    # Header
+    parts.append(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+
+    # 1: Catalog
+    parts.append(obj("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"))
+
+    # 2: Pages
+    parts.append(obj("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"))
+
+    # 3: Page
+    label_text = (
+        f"ChArUco {config.columns}x{config.rows}, "
+        f"square={config.square_size_cm}cm, "
+        f"{config.dictionary}"
+        f"{', inverted' if config.inverted else ''}"
+    )
+    # Total page height with extra space for label
+    label_space = 14  # points
+    total_page_h = page_h + label_space
+    parts.append(obj(
+        f"3 0 obj\n"
+        f"<< /Type /Page /Parent 2 0 R "
+        f"/MediaBox [0 0 {page_w:.2f} {total_page_h:.2f}] "
+        f"/Contents 4 0 R /Resources << /XObject << /Img 5 0 R >> "
+        f"/Font << /F1 6 0 R >> >> >>\n"
+        f"endobj\n"
+    ))
+
+    # 4: Content stream — place image and label
+    # Image placed at (margin, margin + label_space) with exact board dimensions
+    stream = (
+        f"BT /F1 8 Tf {margin:.2f} {label_space - 2:.2f} Td ({label_text}) Tj ET\n"
+        f"q {board_w:.4f} 0 0 {board_h:.4f} {margin:.4f} {margin + label_space:.4f} cm "
+        f"/Img Do Q\n"
+    )
+    stream_bytes = stream.encode("latin-1")
+    parts.append(obj(
+        f"4 0 obj\n<< /Length {len(stream_bytes)} >>\nstream\n"
+    ))
+    parts.append(stream_bytes)
+    parts.append(b"\nendstream\nendobj\n")
+
+    # 5: Image XObject
+    parts.append(obj(
+        f"5 0 obj\n"
+        f"<< /Type /XObject /Subtype /Image /Width {img_w} /Height {img_h} "
+        f"/ColorSpace /DeviceRGB /BitsPerComponent 8 "
+        f"/Filter /DCTDecode /Length {len(jpeg_bytes)} >>\n"
+        f"stream\n"
+    ))
+    parts.append(jpeg_bytes)
+    parts.append(b"\nendstream\nendobj\n")
+
+    # 6: Font (Helvetica)
+    parts.append(obj(
+        "6 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n"
+    ))
+
+    # Cross-reference table
+    xref_offset = len(b"".join(parts))
+    xref_lines = [f"xref\n0 {len(offsets) + 1}\n0000000000 65535 f \n"]
+    for off in offsets:
+        xref_lines.append(f"{off:010d} 00000 n \n")
+    parts.append("".join(xref_lines).encode("latin-1"))
+
+    parts.append(
+        f"trailer\n<< /Size {len(offsets) + 1} /Root 1 0 R >>\n"
+        f"startxref\n{xref_offset}\n%%EOF\n".encode("latin-1")
+    )
+
+    Path(filename).write_bytes(b"".join(parts))
+
+
 def get_charuco_object_points(board: cv2.aruco.CharucoBoard) -> np.ndarray:
     """
     Get the 3D object points for all corners on the board.

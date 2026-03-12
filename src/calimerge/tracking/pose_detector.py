@@ -88,8 +88,9 @@ def load_models(
 
     # --- Pose Estimation: VitPose-Base (SynthPose) ---
     config_file = VITPOSE_DIR / "config.json"
+    preprocessor_file = VITPOSE_DIR / "preprocessor_config.json"
 
-    if config_file.exists():
+    if config_file.exists() and preprocessor_file.exists():
         log(f"Loading VitPose from local: {VITPOSE_DIR}")
         pose_processor = AutoProcessor.from_pretrained(
             str(VITPOSE_DIR), local_files_only=True
