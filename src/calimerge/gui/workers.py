@@ -580,6 +580,10 @@ class PoseDetectionWorker(QThread):
         self._models = None
         self._device = None
 
+        # Tunable thresholds (set from GUI sliders)
+        self.confidence_threshold = 0.3
+        self.match_threshold = 0.5
+
         # Simple per-camera person tracker: maps port -> list of (track_id, embedding)
         self._tracks: dict[int, list[tuple[int, "np.ndarray"]]] = {}
         self._next_track_id = 0
@@ -674,7 +678,7 @@ class PoseDetectionWorker(QThread):
         # Greedy matching: assign each detection to best unmatched track
         assigned_track_ids = [None] * n_det
         used_tracks = set()
-        threshold = 0.5
+        threshold = self.match_threshold
 
         # Sort by similarity (highest first)
         pairs = []
@@ -731,7 +735,7 @@ class PoseDetectionWorker(QThread):
 
         # Detect persons
         boxes_voc, boxes_coco, scores = detect_persons(
-            pil_image, person_model, self._device, confidence_threshold=0.3
+            pil_image, person_model, self._device, confidence_threshold=self.confidence_threshold
         )
 
         if boxes_voc.size == 0:
@@ -746,6 +750,17 @@ class PoseDetectionWorker(QThread):
 
         # Match to tracks for stable IDs
         track_ids = self._match_embeddings(port, all_embeddings)
+
+        # Log embeddings: port, each person's track ID + embedding norm/hash
+        if all_embeddings:
+            import hashlib
+            parts = []
+            for i, emb in enumerate(all_embeddings):
+                tid = track_ids[i] if i < len(track_ids) else "?"
+                # 8-char hex hash of embedding for cross-camera comparison
+                h = hashlib.md5(emb.tobytes()).hexdigest()[:8]
+                parts.append(f"P{tid}={h}")
+            print(f"[detect] port={port} {' '.join(parts)}")
 
         # Draw on frame
         vis = frame_bgr.copy()

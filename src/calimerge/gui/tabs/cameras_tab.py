@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QSpinBox,
     QDoubleSpinBox,
+    QSlider,
     QSplitter,
     QProgressBar,
     QTextEdit,
@@ -270,6 +271,34 @@ class CamerasTab(QWidget):
         self.detect_checkbox.setToolTip("Overlay 2D pose detection on preview (YOLO + VitPose)")
         self.detect_checkbox.toggled.connect(self._on_detect_toggled)
         toolbar.addWidget(self.detect_checkbox)
+
+        # Detection confidence threshold slider (for YOLO person detector)
+        self.detect_conf_label = QLabel("Det: 0.30")
+        self.detect_conf_label.setToolTip("Person detection confidence threshold")
+        self.detect_conf_label.setEnabled(False)
+        toolbar.addWidget(self.detect_conf_label)
+        self.detect_conf_slider = QSlider(Qt.Horizontal)
+        self.detect_conf_slider.setRange(5, 95)  # 0.05 to 0.95
+        self.detect_conf_slider.setValue(30)
+        self.detect_conf_slider.setFixedWidth(80)
+        self.detect_conf_slider.setEnabled(False)
+        self.detect_conf_slider.setToolTip("Person detection confidence threshold")
+        self.detect_conf_slider.valueChanged.connect(self._on_detect_conf_changed)
+        toolbar.addWidget(self.detect_conf_slider)
+
+        # Cosine similarity threshold slider (for person re-ID matching)
+        self.match_thresh_label = QLabel("Match: 0.50")
+        self.match_thresh_label.setToolTip("Cosine similarity threshold for person re-identification")
+        self.match_thresh_label.setEnabled(False)
+        toolbar.addWidget(self.match_thresh_label)
+        self.match_thresh_slider = QSlider(Qt.Horizontal)
+        self.match_thresh_slider.setRange(5, 95)  # 0.05 to 0.95
+        self.match_thresh_slider.setValue(50)
+        self.match_thresh_slider.setFixedWidth(80)
+        self.match_thresh_slider.setEnabled(False)
+        self.match_thresh_slider.setToolTip("Cosine similarity threshold for person re-identification")
+        self.match_thresh_slider.valueChanged.connect(self._on_match_thresh_changed)
+        toolbar.addWidget(self.match_thresh_slider)
 
         toolbar.addStretch()
 
@@ -1027,10 +1056,29 @@ class CamerasTab(QWidget):
         import traceback
         print(f"[detect] toggled checked={checked}")
         print(f"[detect] caller: {''.join(traceback.format_stack()[-3:-1]).strip()}")
+        # Enable/disable threshold sliders
+        self.detect_conf_label.setEnabled(checked)
+        self.detect_conf_slider.setEnabled(checked)
+        self.match_thresh_label.setEnabled(checked)
+        self.match_thresh_slider.setEnabled(checked)
         if checked:
             self._start_detection()
         else:
             self._stop_detection()
+
+    def _on_detect_conf_changed(self, value: int):
+        """Update person detection confidence threshold."""
+        thresh = value / 100.0
+        self.detect_conf_label.setText(f"Det: {thresh:.2f}")
+        if self.detection_worker is not None:
+            self.detection_worker.confidence_threshold = thresh
+
+    def _on_match_thresh_changed(self, value: int):
+        """Update cosine similarity matching threshold."""
+        thresh = value / 100.0
+        self.match_thresh_label.setText(f"Match: {thresh:.2f}")
+        if self.detection_worker is not None:
+            self.detection_worker.match_threshold = thresh
 
     def _start_detection(self):
         """Start the pose detection worker."""
@@ -1040,6 +1088,8 @@ class CamerasTab(QWidget):
 
         print("[detect] creating PoseDetectionWorker...")
         self.detection_worker = PoseDetectionWorker(device_name="auto")
+        self.detection_worker.confidence_threshold = self.detect_conf_slider.value() / 100.0
+        self.detection_worker.match_threshold = self.match_thresh_slider.value() / 100.0
         self.detection_worker.models_loaded.connect(
             lambda: print("[detect] models loaded, live detection active")
         )
