@@ -561,10 +561,17 @@ class PoseDetectionWorker(QThread):
         (11, 13), (13, 15), (12, 14), (14, 16),  # legs
     ]
 
-    # Color per keypoint region (BGR)
-    _KP_COLOR = (0, 255, 128)   # green-ish for keypoints
-    _LIMB_COLOR = (128, 255, 0)  # lime for limbs
-    _BBOX_COLOR = (255, 180, 0)  # blue-ish for bbox
+    # Per-person color palette (BGR) — 8 distinct colors
+    _PERSON_COLORS = [
+        (120, 200, 80),   # green
+        (255, 160, 100),  # blue
+        (80, 180, 255),   # orange
+        (220, 100, 220),  # purple
+        (100, 100, 255),  # red
+        (220, 220, 100),  # cyan
+        (80, 220, 255),   # yellow
+        (255, 140, 180),  # lavender
+    ]
 
     def __init__(self, device_name: str = "auto"):
         super().__init__()
@@ -572,6 +579,10 @@ class PoseDetectionWorker(QThread):
         self.running = True
         self._models = None
         self._device = None
+
+        # Simple per-camera person tracker: maps port -> list of (track_id, embedding)
+        self._tracks: dict[int, list[tuple[int, "np.ndarray"]]] = {}
+        self._next_track_id = 0
 
         # Frame queue: stores (port, frame_bgr). Only keep latest per port.
         import threading
@@ -622,14 +633,90 @@ class PoseDetectionWorker(QThread):
                 if not self.running:
                     break
                 try:
-                    annotated = self._detect_and_draw(frame_bgr)
+                    annotated = self._detect_and_draw(port, frame_bgr)
                     self.detection_ready.emit(port, annotated)
                 except Exception:
                     # On detection error, just pass through original frame
                     self.detection_ready.emit(port, frame_bgr)
 
-    def _detect_and_draw(self, frame_bgr: "np.ndarray") -> "np.ndarray":
-        """Run detection on a single frame and draw keypoints."""
+    def _match_embeddings(self, port: int, embeddings: list["np.ndarray"]) -> list[int]:
+        """Match current detections to tracked persons using cosine similarity.
+
+        Returns list of track_ids, one per detection. Creates new tracks for
+        unmatched detections, and drops tracks that haven't been seen.
+        """
+        import numpy as np
+
+        tracks = self._tracks.get(port, [])
+        n_det = len(embeddings)
+
+        if n_det == 0:
+            self._tracks[port] = []
+            return []
+
+        if not tracks:
+            # No existing tracks — create new ones
+            new_tracks = []
+            ids = []
+            for emb in embeddings:
+                tid = self._next_track_id
+                self._next_track_id += 1
+                new_tracks.append((tid, emb))
+                ids.append(tid)
+            self._tracks[port] = new_tracks
+            return ids
+
+        # Compute cosine similarity matrix (embeddings are already L2-normalized)
+        track_embs = np.stack([t[1] for t in tracks])  # (T, 768)
+        det_embs = np.stack(embeddings)                  # (D, 768)
+        sim = det_embs @ track_embs.T                    # (D, T)
+
+        # Greedy matching: assign each detection to best unmatched track
+        assigned_track_ids = [None] * n_det
+        used_tracks = set()
+        threshold = 0.5
+
+        # Sort by similarity (highest first)
+        pairs = []
+        for d in range(n_det):
+            for t in range(len(tracks)):
+                pairs.append((sim[d, t], d, t))
+        pairs.sort(reverse=True)
+
+        for score, d, t in pairs:
+            if d in [i for i, v in enumerate(assigned_track_ids) if v is not None]:
+                continue
+            if t in used_tracks:
+                continue
+            if score < threshold:
+                break
+            assigned_track_ids[d] = tracks[t][0]
+            used_tracks.add(t)
+
+        # Create new tracks for unmatched detections
+        new_tracks = []
+        result_ids = []
+        for d in range(n_det):
+            if assigned_track_ids[d] is not None:
+                tid = assigned_track_ids[d]
+                # Update embedding with exponential moving average
+                old_emb = next(t[1] for t in tracks if t[0] == tid)
+                updated = 0.7 * old_emb + 0.3 * embeddings[d]
+                norm = np.linalg.norm(updated)
+                if norm > 1e-8:
+                    updated = updated / norm
+                new_tracks.append((tid, updated))
+            else:
+                tid = self._next_track_id
+                self._next_track_id += 1
+                new_tracks.append((tid, embeddings[d]))
+            result_ids.append(tid)
+
+        self._tracks[port] = new_tracks
+        return result_ids
+
+    def _detect_and_draw(self, port: int, frame_bgr: "np.ndarray") -> "np.ndarray":
+        """Run detection on a single frame and draw keypoints with per-person colors."""
         import cv2
         import numpy as np
         from PIL import Image
@@ -648,21 +735,35 @@ class PoseDetectionWorker(QThread):
         )
 
         if boxes_voc.size == 0:
+            self._tracks[port] = []
             return frame_bgr
 
-        # Estimate poses
-        all_keypoints, all_scores = estimate_poses(
-            pil_image, boxes_coco, pose_processor, pose_model, self._device
+        # Estimate poses with embeddings
+        all_keypoints, all_scores, all_embeddings = estimate_poses(
+            pil_image, boxes_coco, pose_processor, pose_model, self._device,
+            return_embeddings=True,
         )
+
+        # Match to tracks for stable IDs
+        track_ids = self._match_embeddings(port, all_embeddings)
 
         # Draw on frame
         vis = frame_bgr.copy()
+        n_colors = len(self._PERSON_COLORS)
 
         for person_idx, (kps, kp_scores) in enumerate(zip(all_keypoints, all_scores)):
-            # Only draw first 17 (COCO) keypoints
+            # Pick color by track ID
+            if person_idx < len(track_ids):
+                color = self._PERSON_COLORS[track_ids[person_idx] % n_colors]
+            else:
+                color = self._PERSON_COLORS[person_idx % n_colors]
+
+            # Brighter variant for keypoints
+            kp_color = tuple(min(255, int(c * 1.3)) for c in color)
+
             n = min(17, kps.shape[0])
 
-            # Draw limbs first (behind keypoints)
+            # Draw limbs
             for i, j in self._SKELETON:
                 if i >= n or j >= n:
                     continue
@@ -670,20 +771,24 @@ class PoseDetectionWorker(QThread):
                     continue
                 pt1 = (int(kps[i, 0]), int(kps[i, 1]))
                 pt2 = (int(kps[j, 0]), int(kps[j, 1]))
-                cv2.line(vis, pt1, pt2, self._LIMB_COLOR, 2, cv2.LINE_AA)
+                cv2.line(vis, pt1, pt2, color, 2, cv2.LINE_AA)
 
             # Draw keypoints
             for k in range(n):
                 if kp_scores[k] < 0.3:
                     continue
                 pt = (int(kps[k, 0]), int(kps[k, 1]))
-                cv2.circle(vis, pt, 4, self._KP_COLOR, -1, cv2.LINE_AA)
+                cv2.circle(vis, pt, 4, kp_color, -1, cv2.LINE_AA)
 
-            # Draw bounding box
+            # Draw bounding box + track ID
             if person_idx < len(boxes_voc):
                 box = boxes_voc[person_idx].astype(int)
                 cv2.rectangle(vis, (box[0], box[1]), (box[2], box[3]),
-                              self._BBOX_COLOR, 1, cv2.LINE_AA)
+                              color, 1, cv2.LINE_AA)
+                if person_idx < len(track_ids):
+                    label = f"P{track_ids[person_idx]}"
+                    cv2.putText(vis, label, (box[0], box[1] - 4),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
 
         return vis
 

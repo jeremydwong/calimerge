@@ -205,29 +205,43 @@ def estimate_poses(
     pose_processor,
     pose_model,
     device: str,
-) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    return_embeddings: bool = False,
+) -> tuple[list[np.ndarray], list[np.ndarray]] | tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray]]:
     """
     Estimate poses for detected persons in a single image.
 
     Returns:
         (all_keypoints, all_keypoint_scores) where each is a list
         of arrays, one per detected person.
+        If return_embeddings=True, also returns all_embeddings: list of
+        (768,) numpy arrays (CLS token from final ViT layer).
     """
     if person_boxes_coco.size == 0:
-        return [], []
+        return ([], [], []) if return_embeddings else ([], [])
 
     boxes_list = person_boxes_coco.astype(np.float32).tolist()
 
     inputs = pose_processor(image, boxes=[boxes_list], return_tensors="pt").to(device)
     with torch.no_grad():
-        outputs = pose_model(**inputs)
+        outputs = pose_model(**inputs, output_hidden_states=return_embeddings)
+
+    # Extract per-person embeddings from CLS token of final hidden layer
+    all_embeddings = []
+    if return_embeddings and hasattr(outputs, "hidden_states") and outputs.hidden_states:
+        final_hidden = outputs.hidden_states[-1]  # (num_persons, seq_len, 768)
+        cls_tokens = final_hidden[:, 0, :]        # (num_persons, 768)
+        # L2-normalize for cosine similarity
+        norms = torch.norm(cls_tokens, dim=1, keepdim=True).clamp(min=1e-8)
+        cls_tokens = cls_tokens / norms
+        for i in range(cls_tokens.shape[0]):
+            all_embeddings.append(cls_tokens[i].cpu().numpy())
 
     pose_results = pose_processor.post_process_pose_estimation(
         outputs, boxes=[boxes_list]
     )
 
     if not pose_results:
-        return [], []
+        return ([], [], []) if return_embeddings else ([], [])
 
     image_results = pose_results[0]
 
@@ -235,9 +249,10 @@ def estimate_poses(
     all_scores = []
 
     if not isinstance(image_results, list):
-        return [], []
+        return ([], [], []) if return_embeddings else ([], [])
 
-    for person_result in image_results:
+    accepted_indices = []
+    for idx, person_result in enumerate(image_results):
         if not isinstance(person_result, dict):
             continue
 
@@ -255,6 +270,12 @@ def estimate_poses(
         if isinstance(keypoints, np.ndarray) and keypoints.ndim == 2 and keypoints.shape[1] >= 2:
             all_keypoints.append(keypoints)
             all_scores.append(scores)
+            accepted_indices.append(idx)
+
+    if return_embeddings:
+        # Filter embeddings to match accepted keypoints
+        filtered_embeddings = [all_embeddings[i] for i in accepted_indices if i < len(all_embeddings)]
+        return all_keypoints, all_scores, filtered_embeddings
 
     return all_keypoints, all_scores
 
