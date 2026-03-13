@@ -12,6 +12,8 @@ from pathlib import Path
 from datetime import datetime
 import time
 
+import cv2
+
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -200,6 +202,7 @@ class CamerasTab(QWidget):
         self.preview_worker: CameraPreviewWorker | None = None
         self.recording_worker: RecordingWorker | None = None
         self.detection_worker: PoseDetectionWorker | None = None
+        self._last_annotated: dict[int, "np.ndarray"] = {}  # port -> last annotated frame
         self.opened_cameras: list = []
         self.opened_ports: list[int] = []
         self.base_output_path = Path("recordings")
@@ -983,11 +986,20 @@ class CamerasTab(QWidget):
     # ── Frame handling ──
 
     def _on_frame_received(self, port: int, frame):
-        # If live detection is active, send frame to detection worker instead
+        # If live detection is active, send frame to detection worker
         if self.detection_worker is not None and self.detection_worker.isRunning():
             self.detection_worker.submit_frame(port, frame)
-            # Still show raw frame immediately (detection overlay arrives later)
-            self.camera_grid.update_frame(port, frame)
+            # Show last annotated frame (faded) instead of raw to avoid flicker
+            if port in self._last_annotated:
+                # Fade overlay by 5%: blend 95% last annotated + 5% raw
+                blended = cv2.addWeighted(
+                    self._last_annotated[port], 0.95, frame, 0.05, 0
+                )
+                self._last_annotated[port] = blended
+                self.camera_grid.update_frame(port, blended)
+            else:
+                # No annotation yet for this port — show raw
+                self.camera_grid.update_frame(port, frame)
         else:
             self.camera_grid.update_frame(port, frame)
 
@@ -1001,6 +1013,7 @@ class CamerasTab(QWidget):
 
     def _on_detection_ready(self, port: int, annotated_frame):
         """Replace the camera grid frame with the annotated version."""
+        self._last_annotated[port] = annotated_frame.copy()
         self.camera_grid.update_frame(port, annotated_frame)
 
     def _on_preview_error(self, error: str):
@@ -1044,6 +1057,7 @@ class CamerasTab(QWidget):
             self.detection_worker.stop()
             self.detection_worker.wait()
             self.detection_worker = None
+            self._last_annotated.clear()
             print("[detect] stopped")
 
     def _on_detection_finished(self):

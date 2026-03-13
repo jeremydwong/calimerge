@@ -649,17 +649,15 @@ BSD-2-Clause
 
 ## Todo
 <li>
+2026-03-11
+- nickname ghost text should be empty, not 'A'
+- default exposure for non-exposure controlled cams should be -4
+- enabled click does what we want now! great. but can you please make it not take so long? it's really a crazy long delay between click and anything happening. 
+
 - we have no file menu so far! perhaps we won't need one but we'll probably eventually need one. Implement an 'open project' file menu. show the pathname in a 'status bar' which the applciation does currently have, along the bottom of (all of the ) gui tabs. ASSOCIATED WITH THIS, please save all of the files and configurations for each camera and project there.
 
-1. RECORD TAB
-- FPS: 'fps' in settings table for each camera is weird, because you don't usually want to have some cameras running faster than others. moreover, changing one camera changes the framerate of all, suggesting they're locked under the hood. I think this is probably a good way to go, we typically DO want the cameras to all share the same framerate. so, let's remove FPS from the table.
-- COLORS: each entry in the textbox window should also have a color field. can be a square of the color in question.
-- the name of each camera should be name-serial not just name (often you'll have the same kind of camera)
-- the live preview should only show 'enabled' cameras. 
-- TABLE: can you guess at the required size of the table columns so that they don't default to kinda generic bad? 
-- VIDEO PREVIEW the aspect ratio of the cameras by default is not pleasing because everything is quite wide. assume 4x3 and 2x2 grid, make this subsection an appropriate size. squeeze the text sections as necessary. 
-- BUFFERING vs WRITING right now, are we buffering the frames? if so, we could get the required pages of memory ahead of time if using the 'timed' approach. probably best! this is likely best for performance since writing to disk is going to be the limiting performance factor when reading camera frames? 
-- how are we encoding the videos? 264 or otherwise? provide this as an option or make it clear in a hover-over. 
-- EXPOSURE: changes are not doing anything at the moment! suggest that this command isn't effectual for some reason, worth checking. 
+- extrinsic results get blown away by the summary, rather than appended. no amount of scrolling up works 
+- you seem to be concatenating the frames into a single buffer, rather than showing simultaneously matched frames from n buffers for n synced cameras. i'd prefer the latter, it makes sense!
+
 
 
