@@ -812,6 +812,7 @@ class ProcessingWorker(QThread):
         max_persons: int = 2,
         batch_size: int = 8,
         skip_sync_indices: int = 1,
+        person_confidence: float = 0.30,
     ):
         super().__init__()
         self.video_paths = video_paths
@@ -823,6 +824,7 @@ class ProcessingWorker(QThread):
         self.max_persons = max_persons
         self.batch_size = batch_size
         self.skip_sync_indices = skip_sync_indices
+        self.person_confidence = person_confidence
         self.running = True
 
     def run(self):
@@ -838,6 +840,7 @@ class ProcessingWorker(QThread):
                 skip_sync_indices=self.skip_sync_indices,
                 max_persons=self.max_persons,
                 batch_size=self.batch_size,
+                person_confidence=self.person_confidence,
                 progress_callback=lambda step, frac: self.progress_update.emit(step, frac),
                 log_callback=lambda msg: self.log_message.emit(msg),
             )
