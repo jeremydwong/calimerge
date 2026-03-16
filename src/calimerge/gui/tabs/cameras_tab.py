@@ -286,17 +286,17 @@ class CamerasTab(QWidget):
         self.detect_conf_slider.valueChanged.connect(self._on_detect_conf_changed)
         toolbar.addWidget(self.detect_conf_slider)
 
-        # Cosine similarity threshold slider (for person re-ID matching)
-        self.match_thresh_label = QLabel("Match: 0.50")
-        self.match_thresh_label.setToolTip("Cosine similarity threshold for person re-identification")
+        # IoU threshold slider (for person tracking across frames)
+        self.match_thresh_label = QLabel("IoU: 0.20")
+        self.match_thresh_label.setToolTip("Bounding box IoU threshold for person tracking")
         self.match_thresh_label.setEnabled(False)
         toolbar.addWidget(self.match_thresh_label)
         self.match_thresh_slider = QSlider(Qt.Horizontal)
         self.match_thresh_slider.setRange(5, 95)  # 0.05 to 0.95
-        self.match_thresh_slider.setValue(50)
+        self.match_thresh_slider.setValue(20)
         self.match_thresh_slider.setFixedWidth(80)
         self.match_thresh_slider.setEnabled(False)
-        self.match_thresh_slider.setToolTip("Cosine similarity threshold for person re-identification")
+        self.match_thresh_slider.setToolTip("Bounding box IoU threshold for person tracking")
         self.match_thresh_slider.valueChanged.connect(self._on_match_thresh_changed)
         toolbar.addWidget(self.match_thresh_slider)
 
@@ -536,7 +536,8 @@ class CamerasTab(QWidget):
             # Nickname (editable)
             nickname_edit = QLineEdit()
             nickname_edit.setPlaceholderText("A")
-            prev_nick = prev.get("nickname", cam_state.nickname)
+            saved_nick = prev.get("nickname", "")
+            prev_nick = saved_nick if saved_nick else cam_state.nickname
             nickname_edit.setText(prev_nick)
             nickname_edit.setMaxLength(16)
             nickname_edit.editingFinished.connect(
@@ -815,7 +816,8 @@ class CamerasTab(QWidget):
                 open_camera(cam)
                 self.opened_cameras.append(cam)
                 self.opened_ports.append(port)
-                camera_info[port] = cam.display_name
+                nick = cam_state.nickname
+                camera_info[port] = nick if nick else cam.display_name
                 opened_ports.append(port)
             except Exception as e:
                 self.status_message.emit(f"Failed to open camera {port}: {e}")
@@ -1074,9 +1076,9 @@ class CamerasTab(QWidget):
             self.detection_worker.confidence_threshold = thresh
 
     def _on_match_thresh_changed(self, value: int):
-        """Update cosine similarity matching threshold."""
+        """Update IoU matching threshold."""
         thresh = value / 100.0
-        self.match_thresh_label.setText(f"Match: {thresh:.2f}")
+        self.match_thresh_label.setText(f"IoU: {thresh:.2f}")
         if self.detection_worker is not None:
             self.detection_worker.match_threshold = thresh
 

@@ -271,6 +271,7 @@ class IntrinsicCalibrationWorker(QThread):
     log_message = Signal(str)
     progress_update = Signal(int, int)  # current, total
     detection_frame = Signal(int, int, object, int)  # port, frame_index, frame (BGR), corner_count
+    selected_frames = Signal(list)  # list of BGR frames actually used for calibration
     calibration_finished = Signal(object)  # CameraIntrinsics
     error = Signal(str)
 
@@ -292,10 +293,9 @@ class IntrinsicCalibrationWorker(QThread):
         self.max_calibration_frames = max_calibration_frames
         self.running = True
 
-    def _draw_charuco_overlay(self, frame, packet, board):
-        """Draw charuco detection visualization on frame."""
+    def _draw_charuco_overlay(self, frame, packet, board, color=(0, 220, 80)):
+        """Draw charuco detection visualization on frame using a single color."""
         import cv2
-        import numpy as np
 
         vis = frame.copy()
         ids = packet.point_id
@@ -305,48 +305,28 @@ class IntrinsicCalibrationWorker(QThread):
         if n == 0:
             return vis
 
-        # Draw detected corners as colored circles with ID labels
-        # Use a green-to-cyan gradient based on corner ID
         for i in range(n):
             pt = (int(img_loc[i, 0]), int(img_loc[i, 1]))
-            cid = int(ids[i])
-
-            # Color: cycle through hues based on corner ID
-            hue = (cid * 17) % 180
-            color_bgr = cv2.cvtColor(
-                np.array([[[hue, 200, 255]]], dtype=np.uint8), cv2.COLOR_HSV2BGR
-            )[0, 0]
-            color = (int(color_bgr[0]), int(color_bgr[1]), int(color_bgr[2]))
-
-            # Outer ring + filled center
             cv2.circle(vis, pt, 6, color, 2)
             cv2.circle(vis, pt, 2, color, -1)
 
-            # ID label
-            cv2.putText(
-                vis, str(cid), (pt[0] + 8, pt[1] - 4),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1, cv2.LINE_AA,
-            )
-
         # Draw lines connecting adjacent corners (grid structure)
-        cols = self.charuco_config.columns - 1  # charuco inner corners per row
+        cols = self.charuco_config.columns - 1
         for i in range(n):
             cid_i = int(ids[i])
             row_i, col_i = divmod(cid_i, cols)
             for j in range(i + 1, n):
                 cid_j = int(ids[j])
                 row_j, col_j = divmod(cid_j, cols)
-                # Connect horizontally or vertically adjacent corners
                 if (row_i == row_j and abs(col_i - col_j) == 1) or \
                    (col_i == col_j and abs(row_i - row_j) == 1):
                     pt1 = (int(img_loc[i, 0]), int(img_loc[i, 1]))
                     pt2 = (int(img_loc[j, 0]), int(img_loc[j, 1]))
-                    cv2.line(vis, pt1, pt2, (0, 200, 0), 1, cv2.LINE_AA)
+                    cv2.line(vis, pt1, pt2, color, 1, cv2.LINE_AA)
 
-        # Status overlay
         cv2.putText(
-            vis, f"{n} corners detected", (10, 30),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA,
+            vis, f"{n} corners", (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA,
         )
 
         return vis
@@ -377,6 +357,7 @@ class IntrinsicCalibrationWorker(QThread):
 
             board = create_charuco_board(self.charuco_config)
             point_packets = []
+            vis_frames = []  # parallel list of rendered overlay frames
             frame_idx = 0
 
             while self.running:
@@ -387,12 +368,13 @@ class IntrinsicCalibrationWorker(QThread):
                 if frame_idx % self.sample_interval == 0:
                     packet = detect_charuco_points(frame, self.charuco_config, board)
                     if packet.point_id is not None and len(packet.point_id) >= 4:
+                        vis = self._draw_charuco_overlay(frame, packet, board)
                         point_packets.append(packet)
+                        vis_frames.append(vis)
                         corner_count = len(packet.point_id)
                         self.log_message.emit(
                             f"  Frame {frame_idx}: {corner_count} corners"
                         )
-                        vis = self._draw_charuco_overlay(frame, packet, board)
                         self.detection_frame.emit(self.port, frame_idx, vis, corner_count)
 
                 frame_idx += 1
@@ -406,19 +388,20 @@ class IntrinsicCalibrationWorker(QThread):
                 )
                 return
 
-            # Filter to well-distributed subset to avoid slow calibration
+            # Downsample to well-distributed temporal subset
             if len(point_packets) > self.max_calibration_frames:
                 self.log_message.emit(
-                    f"Filtering {len(point_packets)} frames down to ~{self.max_calibration_frames}..."
+                    f"Downsampling to {self.max_calibration_frames} frames..."
                 )
+                # Track which packets survive so we can filter vis_frames in parallel
+                vis_by_id = {id(p): v for p, v in zip(point_packets, vis_frames)}
                 point_packets = filter_frames_for_calibration(
                     point_packets, target_count=self.max_calibration_frames
                 )
-                self.log_message.emit(
-                    f"Using {len(point_packets)} well-distributed frames"
-                )
+                vis_frames = [vis_by_id[id(p)] for p in point_packets if id(p) in vis_by_id]
 
             self.log_message.emit(f"Calibrating from {len(point_packets)} frames...")
+            self.selected_frames.emit(vis_frames)
 
             intrinsics = calibrate_intrinsics(
                 point_packets, resolution, self.serial_number
@@ -582,9 +565,9 @@ class PoseDetectionWorker(QThread):
 
         # Tunable thresholds (set from GUI sliders)
         self.confidence_threshold = 0.3
-        self.match_threshold = 0.5
+        self.match_threshold = 0.2
 
-        # Simple per-camera person tracker: maps port -> list of (track_id, embedding)
+        # Simple per-camera person tracker: maps port -> list of (track_id, bbox)
         self._tracks: dict[int, list[tuple[int, "np.ndarray"]]] = {}
         self._next_track_id = 0
 
@@ -643,81 +626,91 @@ class PoseDetectionWorker(QThread):
                     # On detection error, just pass through original frame
                     self.detection_ready.emit(port, frame_bgr)
 
-    def _match_embeddings(self, port: int, embeddings: list["np.ndarray"]) -> list[int]:
-        """Match current detections to tracked persons using cosine similarity.
+    def _match_boxes(self, port: int, boxes: "np.ndarray") -> list[int]:
+        """Match current detections to tracked persons using bounding box IoU.
 
-        Returns list of track_ids, one per detection. Creates new tracks for
-        unmatched detections, and drops tracks that haven't been seen.
+        Args:
+            boxes: (N, 4) array of [x1, y1, x2, y2] bounding boxes (VOC format).
+
+        Returns list of track_ids, one per detection.
         """
         import numpy as np
 
-        tracks = self._tracks.get(port, [])
-        n_det = len(embeddings)
+        tracks = self._tracks.get(port, [])  # list of (track_id, bbox)
+        n_det = len(boxes)
 
         if n_det == 0:
             self._tracks[port] = []
             return []
 
         if not tracks:
-            # No existing tracks — create new ones
             new_tracks = []
             ids = []
-            for emb in embeddings:
+            for box in boxes:
                 tid = self._next_track_id
                 self._next_track_id += 1
-                new_tracks.append((tid, emb))
+                new_tracks.append((tid, box.copy()))
                 ids.append(tid)
             self._tracks[port] = new_tracks
             return ids
 
-        # Compute cosine similarity matrix (embeddings are already L2-normalized)
-        track_embs = np.stack([t[1] for t in tracks])  # (T, 768)
-        det_embs = np.stack(embeddings)                  # (D, 768)
-        sim = det_embs @ track_embs.T                    # (D, T)
+        # Compute IoU matrix
+        track_boxes = np.stack([t[1] for t in tracks])  # (T, 4)
+        iou = self._compute_iou_matrix(boxes, track_boxes)  # (D, T)
 
-        # Greedy matching: assign each detection to best unmatched track
-        assigned_track_ids = [None] * n_det
+        # Greedy matching by highest IoU
+        assigned = [None] * n_det
         used_tracks = set()
         threshold = self.match_threshold
 
-        # Sort by similarity (highest first)
         pairs = []
         for d in range(n_det):
             for t in range(len(tracks)):
-                pairs.append((sim[d, t], d, t))
+                pairs.append((iou[d, t], d, t))
         pairs.sort(reverse=True)
 
         for score, d, t in pairs:
-            if d in [i for i, v in enumerate(assigned_track_ids) if v is not None]:
+            if assigned[d] is not None:
                 continue
             if t in used_tracks:
                 continue
             if score < threshold:
                 break
-            assigned_track_ids[d] = tracks[t][0]
+            assigned[d] = tracks[t][0]
             used_tracks.add(t)
 
-        # Create new tracks for unmatched detections
+        # Build new track list
         new_tracks = []
         result_ids = []
         for d in range(n_det):
-            if assigned_track_ids[d] is not None:
-                tid = assigned_track_ids[d]
-                # Update embedding with exponential moving average
-                old_emb = next(t[1] for t in tracks if t[0] == tid)
-                updated = 0.7 * old_emb + 0.3 * embeddings[d]
-                norm = np.linalg.norm(updated)
-                if norm > 1e-8:
-                    updated = updated / norm
-                new_tracks.append((tid, updated))
+            if assigned[d] is not None:
+                tid = assigned[d]
             else:
                 tid = self._next_track_id
                 self._next_track_id += 1
-                new_tracks.append((tid, embeddings[d]))
+            new_tracks.append((tid, boxes[d].copy()))
             result_ids.append(tid)
 
         self._tracks[port] = new_tracks
         return result_ids
+
+    @staticmethod
+    def _compute_iou_matrix(boxes_a: "np.ndarray", boxes_b: "np.ndarray") -> "np.ndarray":
+        """Compute IoU between two sets of [x1,y1,x2,y2] boxes. Returns (A, B) matrix."""
+        import numpy as np
+
+        x1 = np.maximum(boxes_a[:, None, 0], boxes_b[None, :, 0])
+        y1 = np.maximum(boxes_a[:, None, 1], boxes_b[None, :, 1])
+        x2 = np.minimum(boxes_a[:, None, 2], boxes_b[None, :, 2])
+        y2 = np.minimum(boxes_a[:, None, 3], boxes_b[None, :, 3])
+
+        inter = np.maximum(0, x2 - x1) * np.maximum(0, y2 - y1)
+
+        area_a = (boxes_a[:, 2] - boxes_a[:, 0]) * (boxes_a[:, 3] - boxes_a[:, 1])
+        area_b = (boxes_b[:, 2] - boxes_b[:, 0]) * (boxes_b[:, 3] - boxes_b[:, 1])
+
+        union = area_a[:, None] + area_b[None, :] - inter
+        return inter / np.maximum(union, 1e-8)
 
     def _detect_and_draw(self, port: int, frame_bgr: "np.ndarray") -> "np.ndarray":
         """Run detection on a single frame and draw keypoints with per-person colors."""
@@ -742,25 +735,13 @@ class PoseDetectionWorker(QThread):
             self._tracks[port] = []
             return frame_bgr
 
-        # Estimate poses with embeddings
-        all_keypoints, all_scores, all_embeddings = estimate_poses(
+        # Match boxes to tracks for stable IDs (IoU-based)
+        track_ids = self._match_boxes(port, boxes_voc)
+
+        # Estimate poses
+        all_keypoints, all_scores = estimate_poses(
             pil_image, boxes_coco, pose_processor, pose_model, self._device,
-            return_embeddings=True,
         )
-
-        # Match to tracks for stable IDs
-        track_ids = self._match_embeddings(port, all_embeddings)
-
-        # Log embeddings: port, each person's track ID + embedding norm/hash
-        if all_embeddings:
-            import hashlib
-            parts = []
-            for i, emb in enumerate(all_embeddings):
-                tid = track_ids[i] if i < len(track_ids) else "?"
-                # 8-char hex hash of embedding for cross-camera comparison
-                h = hashlib.md5(emb.tobytes()).hexdigest()[:8]
-                parts.append(f"P{tid}={h}")
-            print(f"[detect] port={port} {' '.join(parts)}")
 
         # Draw on frame
         vis = frame_bgr.copy()

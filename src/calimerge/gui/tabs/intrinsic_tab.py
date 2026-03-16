@@ -129,13 +129,13 @@ class IntrinsicTab(QWidget):
         row4 = QHBoxLayout()
         row4.addWidget(QLabel("Max frames:"))
         self.max_frames_slider = QSlider(Qt.Orientation.Horizontal)
-        self.max_frames_slider.setRange(10, 500)
-        self.max_frames_slider.setValue(40)
-        self.max_frames_slider.setTickInterval(50)
+        self.max_frames_slider.setRange(10, 100)
+        self.max_frames_slider.setValue(80)
+        self.max_frames_slider.setTickInterval(20)
         self.max_frames_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
         self.max_frames_slider.valueChanged.connect(self._on_max_frames_changed)
         row4.addWidget(self.max_frames_slider, stretch=1)
-        self.max_frames_label = QLabel("40")
+        self.max_frames_label = QLabel("80")
         self.max_frames_label.setFixedWidth(30)
         row4.addWidget(self.max_frames_label)
         charuco_layout.addLayout(row4)
@@ -382,7 +382,7 @@ class IntrinsicTab(QWidget):
 
     def apply_project_settings(self, settings: dict) -> None:
         """Apply loaded project settings to this tab's UI controls."""
-        max_frames = settings.get("intrinsic_max_frames", 40)
+        max_frames = settings.get("intrinsic_max_frames", 80)
         self.max_frames_slider.setValue(int(max_frames))
 
         intr = settings.get("charuco_intrinsic", {})
@@ -808,6 +808,7 @@ class IntrinsicTab(QWidget):
             lambda cur, tot, p=port: self._on_calibration_progress(p, cur, tot)
         )
         worker.detection_frame.connect(self._on_detection_frame)
+        worker.selected_frames.connect(self._on_selected_frames)
         worker.calibration_finished.connect(
             lambda result, p=port: self._on_calibration_finished(p, result)
         )
@@ -862,6 +863,35 @@ class IntrinsicTab(QWidget):
         self.detection_info.setText(
             f"{label} | Frame {frame_index}: {corner_count} corners"
         )
+
+    def _on_selected_frames(self, frames: list):
+        """Show mosaic of all frames selected for calibration."""
+        import cv2
+        import numpy as np
+
+        if not frames:
+            return
+
+        tw, th = 120, 90  # thumbnail size
+        cols = 10
+        rows = (len(frames) + cols - 1) // cols
+        mosaic = np.zeros((rows * th, cols * tw, 3), dtype=np.uint8)
+
+        for i, frame in enumerate(frames):
+            r, c = divmod(i, cols)
+            mosaic[r * th:(r + 1) * th, c * tw:(c + 1) * tw] = cv2.resize(
+                frame, (tw, th), interpolation=cv2.INTER_AREA
+            )
+
+        pixmap = bgr_to_pixmap(mosaic)
+        if not pixmap.isNull():
+            scaled = pixmap.scaled(
+                self.detection_label.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            self.detection_label.setPixmap(scaled)
+        self.detection_info.setText(f"{len(frames)} frames used for calibration")
 
     def _on_calibration_finished(self, port: int, intrinsics):
         """Handle calibration completion - auto-saves to database."""
