@@ -225,16 +225,18 @@ def estimate_poses(
     with torch.no_grad():
         outputs = pose_model(**inputs, output_hidden_states=return_embeddings)
 
-    # Extract per-person embeddings from CLS token of final hidden layer
+    # Extract per-person embeddings from mean-pooled patch tokens of final hidden layer
+    # (CLS token at position 0 is untrained in VitPose — only patch tokens carry signal)
     all_embeddings = []
     if return_embeddings and hasattr(outputs, "hidden_states") and outputs.hidden_states:
         final_hidden = outputs.hidden_states[-1]  # (num_persons, seq_len, 768)
-        cls_tokens = final_hidden[:, 0, :]        # (num_persons, 768)
+        patch_tokens = final_hidden[:, 1:, :]     # (num_persons, 192, 768) — skip CLS
+        pooled = patch_tokens.mean(dim=1)          # (num_persons, 768)
         # L2-normalize for cosine similarity
-        norms = torch.norm(cls_tokens, dim=1, keepdim=True).clamp(min=1e-8)
-        cls_tokens = cls_tokens / norms
-        for i in range(cls_tokens.shape[0]):
-            all_embeddings.append(cls_tokens[i].cpu().numpy())
+        norms = torch.norm(pooled, dim=1, keepdim=True).clamp(min=1e-8)
+        pooled = pooled / norms
+        for i in range(pooled.shape[0]):
+            all_embeddings.append(pooled[i].cpu().numpy())
 
     pose_results = pose_processor.post_process_pose_estimation(
         outputs, boxes=[boxes_list]
