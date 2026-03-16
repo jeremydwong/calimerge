@@ -533,6 +533,7 @@ class PoseDetectionWorker(QThread):
 
     models_loaded = Signal()           # emitted once models are ready
     detection_ready = Signal(int, object)  # port, annotated BGR frame
+    keypoints_3d_ready = Signal(list)  # list[np.ndarray | None] — 3D keypoints (COCO-17)
     log_message = Signal(str)
     error = Signal(str)
 
@@ -556,9 +557,10 @@ class PoseDetectionWorker(QThread):
         (255, 140, 180),  # lavender
     ]
 
-    def __init__(self, device_name: str = "auto"):
+    def __init__(self, device_name: str = "auto", cameras: dict | None = None):
         super().__init__()
         self.device_name = device_name
+        self.cameras = cameras  # dict[port, CalibratedCamera] or None
         self.running = True
         self._models = None
         self._device = None
@@ -570,6 +572,10 @@ class PoseDetectionWorker(QThread):
         # Simple per-camera person tracker: maps port -> list of (track_id, bbox)
         self._tracks: dict[int, list[tuple[int, "np.ndarray"]]] = {}
         self._next_track_id = 0
+
+        # Raw 2D keypoints per port for live triangulation
+        # port -> (keypoints (17,2), scores (17,))
+        self._last_kps_per_port: dict[int, tuple["np.ndarray", "np.ndarray"]] = {}
 
         # Frame queue: stores (port, frame_bgr). Only keep latest per port.
         import threading
@@ -625,6 +631,10 @@ class PoseDetectionWorker(QThread):
                 except Exception:
                     # On detection error, just pass through original frame
                     self.detection_ready.emit(port, frame_bgr)
+
+            # Attempt live triangulation if calibration available
+            if self.cameras is not None and len(self._last_kps_per_port) >= 2:
+                self._triangulate_live()
 
     def _match_boxes(self, port: int, boxes: "np.ndarray") -> list[int]:
         """Match current detections to tracked persons using bounding box IoU.
@@ -733,6 +743,8 @@ class PoseDetectionWorker(QThread):
 
         if boxes_voc.size == 0:
             self._tracks[port] = []
+            # No detections: remove stale keypoints for this port
+            self._last_kps_per_port.pop(port, None)
             return frame_bgr
 
         # Match boxes to tracks for stable IDs (IoU-based)
@@ -742,6 +754,10 @@ class PoseDetectionWorker(QThread):
         all_keypoints, all_scores = estimate_poses(
             pil_image, boxes_coco, pose_processor, pose_model, self._device,
         )
+
+        # Store first person's raw keypoints for live triangulation
+        if all_keypoints:
+            self._last_kps_per_port[port] = (all_keypoints[0], all_scores[0])
 
         # Draw on frame
         vis = frame_bgr.copy()
@@ -787,6 +803,51 @@ class PoseDetectionWorker(QThread):
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
 
         return vis
+
+    def _triangulate_live(self):
+        """Triangulate 3D keypoints from multi-view 2D detections and emit the result."""
+        try:
+            import cv2
+            import numpy as np
+            from ..tracking.triangulation import calculate_projection_matrices, triangulate_keypoints
+
+            # Build camera_params list from self.cameras (dict[port, CalibratedCamera])
+            sorted_ports = sorted(self.cameras.keys())
+            camera_params = []
+            port_to_cam_index = {}
+            for i, port in enumerate(sorted_ports):
+                cam = self.cameras[port]
+                rvec, _ = cv2.Rodrigues(cam.extrinsics.rotation)
+                camera_params.append({
+                    "matrix": cam.intrinsics.matrix,
+                    "distortions": cam.intrinsics.distortion,
+                    "size": np.array(cam.intrinsics.resolution),
+                    "rotation": rvec.flatten(),
+                    "translation": cam.extrinsics.translation,
+                    "port": port,
+                })
+                port_to_cam_index[port] = i
+
+            projection_matrices = calculate_projection_matrices(camera_params)
+
+            # Build person_kp_dict: only ports that have fresh keypoints
+            person_kp_dict = {}
+            for port, (kps, scores) in self._last_kps_per_port.items():
+                if port not in port_to_cam_index:
+                    continue
+                # kps: (17,2), scores: (17,) -> combine to (17,3)
+                kps_with_score = np.concatenate([kps, scores[:, None]], axis=1)
+                person_kp_dict[port] = kps_with_score
+
+            if len(person_kp_dict) < 2:
+                return
+
+            kps_3d = triangulate_keypoints(
+                person_kp_dict, port_to_cam_index, camera_params, projection_matrices
+            )
+            self.keypoints_3d_ready.emit(kps_3d)
+        except Exception:
+            pass
 
     def stop(self):
         self.running = False
