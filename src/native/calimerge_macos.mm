@@ -616,8 +616,8 @@ static NSString *get_usb_serial_for_avf_camera(NSString *avfUniqueID) {
     uint16_t vendorID   = (uint16_t)((avfID >> 16) & 0xFFFF);
     uint16_t productID  = (uint16_t)( avfID        & 0xFFFF);
 
-    NSLog(@"[serial] AVF uniqueID %@ → loc=0x%08x vid=0x%04x pid=0x%04x",
-          avfUniqueID, locationID, vendorID, productID);
+    fprintf(stderr, "[serial] AVF uniqueID %s  loc=0x%08x vid=0x%04x pid=0x%04x\n",
+            [avfUniqueID UTF8String], locationID, vendorID, productID);
 
     CFMutableDictionaryRef matching = IOServiceMatching(kIOUSBDeviceClassName);
     if (!matching) return nil;
@@ -652,18 +652,20 @@ static NSString *get_usb_serial_for_avf_camera(NSString *avfUniqueID) {
                        (locationID == 0 || loc == locationID);
 
         if (matched) {
+            fprintf(stderr, "[serial] matched IOKit device loc=0x%08x vid=0x%04x pid=0x%04x\n",
+                    loc, vid, pid);
             CFStringRef serialRef = (CFStringRef)IORegistryEntryCreateCFProperty(
                 service, CFSTR("USB Serial Number"), kCFAllocatorDefault, 0);
             if (serialRef) {
                 NSString *s = (__bridge_transfer NSString *)serialRef;
                 if (s.length > 0) {
-                    NSLog(@"[serial] USB iSerialNumber: %@", s);
+                    fprintf(stderr, "[serial] USB iSerialNumber: %s\n", [s UTF8String]);
                     result = s;
                 } else {
-                    NSLog(@"[serial] USB Serial Number property is empty");
+                    fprintf(stderr, "[serial] USB Serial Number property is empty\n");
                 }
             } else {
-                NSLog(@"[serial] no USB Serial Number property on device");
+                fprintf(stderr, "[serial] no USB Serial Number property on this device\n");
             }
             IOObjectRelease(service);
             break;
@@ -673,6 +675,10 @@ static NSString *get_usb_serial_for_avf_camera(NSString *avfUniqueID) {
     }
 
     IOObjectRelease(iterator);
+    if (!result) {
+        fprintf(stderr, "[serial] no IOKit match found for %s — using AVF uniqueID\n",
+                [avfUniqueID UTF8String]);
+    }
     return result;
 }
 
@@ -706,9 +712,13 @@ int cm_enumerate_cameras(CM_Camera *out_cameras, int max_cameras) {
             NSString *usbSerial = get_usb_serial_for_avf_camera(device.uniqueID);
             if (usbSerial) {
                 strncpy(cam->serial_number, [usbSerial UTF8String], CM_SERIAL_LEN - 1);
+                fprintf(stderr, "[enum] camera %d '%s'  serial=%s  (from USB iSerialNumber)\n",
+                        count, device.localizedName.UTF8String ?: "?", cam->serial_number);
             } else {
                 const char *uid = [device.uniqueID UTF8String];
                 strncpy(cam->serial_number, uid ? uid : "unknown", CM_SERIAL_LEN - 1);
+                fprintf(stderr, "[enum] camera %d '%s'  serial=%s  (from AVF uniqueID)\n",
+                        count, device.localizedName.UTF8String ?: "?", cam->serial_number);
             }
 
             const char *name = [device.localizedName UTF8String];
