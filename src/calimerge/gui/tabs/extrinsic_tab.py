@@ -580,12 +580,15 @@ class ExtrinsicTab(QWidget):
 
     def _on_calibration_done(self, cameras: dict, error: float):
         """Handle calibration completion - auto-saves to project directory."""
+        import numpy as np
+
         self.state_manager.update_calibration(
             calibrated_cameras=cameras, extrinsic_error=error
         )
 
         # Auto-save to project directory if videos were loaded from a folder
         saved_path = None
+        output_dir = None
         if self.video_paths:
             # Use the parent of any video path as the output directory
             first_video = next(iter(self.video_paths.values()))
@@ -599,6 +602,42 @@ class ExtrinsicTab(QWidget):
                 self.results_text.append(f"\nSaved extrinsic calibration to:\n  {calibration_file}")
             except Exception as e:
                 self.results_text.append(f"\nFailed to save calibration: {e}")
+
+            # Also save camera_rig.toml with metrics
+            if output_dir is not None:
+                rig_file = output_dir / "camera_rig.toml"
+                try:
+                    import rtoml
+                    import cv2
+                    rig_data = {}
+                    # Load existing rig if present (to preserve live_view)
+                    if rig_file.exists():
+                        rig_data = rtoml.load(rig_file)
+                    rig_data["metrics"] = {"rmse_pixels": round(error, 4)}
+                    for port, cam in cameras.items():
+                        section = f"camera_{port}"
+                        rvec, _ = cv2.Rodrigues(cam.extrinsics.rotation)
+                        rig_data[section] = {
+                            "serial_number": cam.serial_number,
+                            "translation": cam.extrinsics.translation.tolist(),
+                            "rotation": cam.extrinsics.rotation.flatten().tolist(),
+                        }
+                    # Add inter-camera distances
+                    sorted_ports = sorted(cameras.keys())
+                    distances = {}
+                    for i, pa in enumerate(sorted_ports):
+                        for pb in sorted_ports[i + 1:]:
+                            ta = cameras[pa].extrinsics.translation
+                            tb = cameras[pb].extrinsics.translation
+                            dist = float(np.linalg.norm(ta - tb))
+                            distances[f"port{pa}_to_port{pb}_m"] = round(dist, 4)
+                    if distances:
+                        rig_data["metrics"]["camera_distances"] = distances
+                    with open(rig_file, "w") as f:
+                        rtoml.dump(rig_data, f)
+                    self.results_text.append(f"Saved camera rig to:\n  {rig_file}")
+                except Exception as e:
+                    self.results_text.append(f"Failed to save camera rig: {e}")
 
         # Save charuco board PDF at exact dimensions
         self._save_charuco_pdf()

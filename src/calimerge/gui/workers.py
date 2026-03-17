@@ -533,6 +533,7 @@ class PoseDetectionWorker(QThread):
 
     models_loaded = Signal()           # emitted once models are ready
     detection_ready = Signal(int, object)  # port, annotated BGR frame
+    keypoints_3d_ready = Signal(list)  # list[list[np.ndarray | None]] — one entry per person
     log_message = Signal(str)
     error = Signal(str)
 
@@ -556,20 +557,19 @@ class PoseDetectionWorker(QThread):
         (255, 140, 180),  # lavender
     ]
 
-    def __init__(self, device_name: str = "auto"):
+    def __init__(self, device_name: str = "auto", cameras: dict | None = None):
         super().__init__()
         self.device_name = device_name
+        self.cameras = cameras  # dict[port, CalibratedCamera] or None
         self.running = True
         self._models = None
         self._device = None
 
         # Tunable thresholds (set from GUI sliders)
         self.confidence_threshold = 0.3
-        self.match_threshold = 0.2
-
-        # Simple per-camera person tracker: maps port -> list of (track_id, bbox)
-        self._tracks: dict[int, list[tuple[int, "np.ndarray"]]] = {}
-        self._next_track_id = 0
+        # Raw 2D keypoints per port for live triangulation
+        # port -> list of (keypoints (17,2), scores (17,)) — one entry per detected person
+        self._last_kps_per_port: dict[int, list[tuple["np.ndarray", "np.ndarray"]]] = {}
 
         # Frame queue: stores (port, frame_bgr). Only keep latest per port.
         import threading
@@ -626,91 +626,9 @@ class PoseDetectionWorker(QThread):
                     # On detection error, just pass through original frame
                     self.detection_ready.emit(port, frame_bgr)
 
-    def _match_boxes(self, port: int, boxes: "np.ndarray") -> list[int]:
-        """Match current detections to tracked persons using bounding box IoU.
-
-        Args:
-            boxes: (N, 4) array of [x1, y1, x2, y2] bounding boxes (VOC format).
-
-        Returns list of track_ids, one per detection.
-        """
-        import numpy as np
-
-        tracks = self._tracks.get(port, [])  # list of (track_id, bbox)
-        n_det = len(boxes)
-
-        if n_det == 0:
-            self._tracks[port] = []
-            return []
-
-        if not tracks:
-            new_tracks = []
-            ids = []
-            for box in boxes:
-                tid = self._next_track_id
-                self._next_track_id += 1
-                new_tracks.append((tid, box.copy()))
-                ids.append(tid)
-            self._tracks[port] = new_tracks
-            return ids
-
-        # Compute IoU matrix
-        track_boxes = np.stack([t[1] for t in tracks])  # (T, 4)
-        iou = self._compute_iou_matrix(boxes, track_boxes)  # (D, T)
-
-        # Greedy matching by highest IoU
-        assigned = [None] * n_det
-        used_tracks = set()
-        threshold = self.match_threshold
-
-        pairs = []
-        for d in range(n_det):
-            for t in range(len(tracks)):
-                pairs.append((iou[d, t], d, t))
-        pairs.sort(reverse=True)
-
-        for score, d, t in pairs:
-            if assigned[d] is not None:
-                continue
-            if t in used_tracks:
-                continue
-            if score < threshold:
-                break
-            assigned[d] = tracks[t][0]
-            used_tracks.add(t)
-
-        # Build new track list
-        new_tracks = []
-        result_ids = []
-        for d in range(n_det):
-            if assigned[d] is not None:
-                tid = assigned[d]
-            else:
-                tid = self._next_track_id
-                self._next_track_id += 1
-            new_tracks.append((tid, boxes[d].copy()))
-            result_ids.append(tid)
-
-        self._tracks[port] = new_tracks
-        return result_ids
-
-    @staticmethod
-    def _compute_iou_matrix(boxes_a: "np.ndarray", boxes_b: "np.ndarray") -> "np.ndarray":
-        """Compute IoU between two sets of [x1,y1,x2,y2] boxes. Returns (A, B) matrix."""
-        import numpy as np
-
-        x1 = np.maximum(boxes_a[:, None, 0], boxes_b[None, :, 0])
-        y1 = np.maximum(boxes_a[:, None, 1], boxes_b[None, :, 1])
-        x2 = np.minimum(boxes_a[:, None, 2], boxes_b[None, :, 2])
-        y2 = np.minimum(boxes_a[:, None, 3], boxes_b[None, :, 3])
-
-        inter = np.maximum(0, x2 - x1) * np.maximum(0, y2 - y1)
-
-        area_a = (boxes_a[:, 2] - boxes_a[:, 0]) * (boxes_a[:, 3] - boxes_a[:, 1])
-        area_b = (boxes_b[:, 2] - boxes_b[:, 0]) * (boxes_b[:, 3] - boxes_b[:, 1])
-
-        union = area_a[:, None] + area_b[None, :] - inter
-        return inter / np.maximum(union, 1e-8)
+            # Attempt live triangulation if calibration available
+            if self.cameras is not None and len(self._last_kps_per_port) >= 2:
+                self._triangulate_live()
 
     def _detect_and_draw(self, port: int, frame_bgr: "np.ndarray") -> "np.ndarray":
         """Run detection on a single frame and draw keypoints with per-person colors."""
@@ -732,27 +650,25 @@ class PoseDetectionWorker(QThread):
         )
 
         if boxes_voc.size == 0:
-            self._tracks[port] = []
+            # No detections: remove stale keypoints for this port
+            self._last_kps_per_port.pop(port, None)
             return frame_bgr
-
-        # Match boxes to tracks for stable IDs (IoU-based)
-        track_ids = self._match_boxes(port, boxes_voc)
 
         # Estimate poses
         all_keypoints, all_scores = estimate_poses(
             pil_image, boxes_coco, pose_processor, pose_model, self._device,
         )
 
+        # Store all persons' raw keypoints for live triangulation
+        if all_keypoints:
+            self._last_kps_per_port[port] = list(zip(all_keypoints, all_scores))
+
         # Draw on frame
         vis = frame_bgr.copy()
         n_colors = len(self._PERSON_COLORS)
 
         for person_idx, (kps, kp_scores) in enumerate(zip(all_keypoints, all_scores)):
-            # Pick color by track ID
-            if person_idx < len(track_ids):
-                color = self._PERSON_COLORS[track_ids[person_idx] % n_colors]
-            else:
-                color = self._PERSON_COLORS[person_idx % n_colors]
+            color = self._PERSON_COLORS[person_idx % n_colors]
 
             # Brighter variant for keypoints
             kp_color = tuple(min(255, int(c * 1.3)) for c in color)
@@ -776,17 +692,169 @@ class PoseDetectionWorker(QThread):
                 pt = (int(kps[k, 0]), int(kps[k, 1]))
                 cv2.circle(vis, pt, 4, kp_color, -1, cv2.LINE_AA)
 
-            # Draw bounding box + track ID
+            # Draw bounding box + person index
             if person_idx < len(boxes_voc):
                 box = boxes_voc[person_idx].astype(int)
                 cv2.rectangle(vis, (box[0], box[1]), (box[2], box[3]),
                               color, 1, cv2.LINE_AA)
-                if person_idx < len(track_ids):
-                    label = f"P{track_ids[person_idx]}"
-                    cv2.putText(vis, label, (box[0], box[1] - 4),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+                cv2.putText(vis, f"P{person_idx}", (box[0], box[1] - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
 
         return vis
+
+    # ── Live triangulation helpers ────────────────────────────────────────
+
+    @staticmethod
+    def _hip_com_2d(kps: "np.ndarray", scores: "np.ndarray") -> "np.ndarray | None":
+        """Return 2D hip COM as (x, y, score) array, or None if both hips are weak."""
+        import numpy as np
+        pts, sc = [], []
+        for idx in (11, 12):   # L_hip=11, R_hip=12
+            if scores[idx] >= 0.3:
+                pts.append(kps[idx])
+                sc.append(float(scores[idx]))
+        if not pts:
+            return None
+        return np.array([*np.mean(pts, axis=0), np.mean(sc)], dtype=float)   # (3,)
+
+    @staticmethod
+    def _is_in_front(pt3d: "np.ndarray", cam_params_subset: list) -> bool:
+        """Return True when pt3d has positive depth in ALL listed cameras."""
+        import numpy as np, cv2
+        for cp in cam_params_subset:
+            R, _ = cv2.Rodrigues(np.array(cp["rotation"]))
+            depth = float((R @ pt3d + cp["translation"])[2])
+            if depth <= 0:
+                return False
+        return True
+
+    def _match_persons_hip_com(
+        self,
+        port_persons: "dict[int, list[tuple]]",
+        port_to_cam_index: "dict[int, int]",
+        camera_params: list,
+        projection_matrices: list,
+    ) -> "list[dict[int, int]]":
+        """Match persons across ports via 3D hip-COM triangulation.
+
+        For each reference person i and each other port Q, triangulates the
+        hip COM from (ref_port, Q) for all candidate j in Q.  Keeps only
+        triangulations that land in front of both cameras (eliminates ghost
+        positions), then greedily assigns the best j to each i.
+
+        Returns a list of groups: each group is {port: person_idx} covering
+        at least the reference port plus one other port.
+        """
+        import numpy as np
+        from ..tracking.triangulation import triangulate_keypoints
+
+        ref_port = max(port_persons, key=lambda p: len(port_persons[p]))
+        n_ref = len(port_persons[ref_port])
+        groups: list[dict[int, int]] = [{ref_port: i} for i in range(n_ref)]
+
+        hip_coms = {
+            port: [self._hip_com_2d(kps, sc) for kps, sc in persons]
+            for port, persons in port_persons.items()
+        }
+
+        ref_cam = camera_params[port_to_cam_index[ref_port]]
+
+        for other_port in port_persons:
+            if other_port == ref_port:
+                continue
+            other_cam = camera_params[port_to_cam_index[other_port]]
+            claimed: set[int] = set()
+            n_other = len(port_persons[other_port])
+
+            for i in range(n_ref):
+                ref_hip = hip_coms[ref_port][i]
+                if ref_hip is None:
+                    continue
+
+                # Triangulate hip COM for every unclaimed j in the other port
+                valid_j: dict[int, "np.ndarray"] = {}
+                for j in range(n_other):
+                    if j in claimed:
+                        continue
+                    other_hip = hip_coms[other_port][j]
+                    if other_hip is None:
+                        continue
+                    result = triangulate_keypoints(
+                        {ref_port: ref_hip[np.newaxis], other_port: other_hip[np.newaxis]},
+                        port_to_cam_index, camera_params, projection_matrices,
+                    )
+                    pt3d = result[0] if result else None
+                    if pt3d is None or np.isnan(pt3d).any():
+                        continue
+                    # Only keep triangulations that are physically in front of both cameras
+                    if self._is_in_front(pt3d, [ref_cam, other_cam]):
+                        valid_j[j] = pt3d
+
+                if not valid_j:
+                    continue
+
+                # Among valid candidates, prefer the one closest to the scene origin
+                # (robust heuristic: real people are closer than ghost intersections)
+                best_j = min(valid_j, key=lambda j: float(np.linalg.norm(valid_j[j])))
+                groups[i][other_port] = best_j
+                claimed.add(best_j)
+
+        return [g for g in groups if len(g) >= 2]
+
+    def _triangulate_live(self):
+        """Triangulate 3D keypoints for all matched persons and emit the results."""
+        try:
+            import cv2
+            import numpy as np
+            from ..tracking.triangulation import calculate_projection_matrices, triangulate_keypoints
+
+            # Build camera_params
+            sorted_ports = sorted(self.cameras.keys())
+            camera_params, port_to_cam_index = [], {}
+            for i, port in enumerate(sorted_ports):
+                cam = self.cameras[port]
+                rvec, _ = cv2.Rodrigues(cam.extrinsics.rotation)
+                camera_params.append({
+                    "matrix": cam.intrinsics.matrix,
+                    "distortions": cam.intrinsics.distortion,
+                    "size": np.array(cam.intrinsics.resolution),
+                    "rotation": rvec.flatten(),
+                    "translation": cam.extrinsics.translation,
+                    "port": port,
+                })
+                port_to_cam_index[port] = i
+
+            projection_matrices = calculate_projection_matrices(camera_params)
+
+            port_persons = {
+                port: persons
+                for port, persons in self._last_kps_per_port.items()
+                if port in port_to_cam_index and persons
+            }
+            if len(port_persons) < 2:
+                return
+
+            # Match persons across ports by 3D hip COM
+            groups = self._match_persons_hip_com(
+                port_persons, port_to_cam_index, camera_params, projection_matrices
+            )
+
+            # Triangulate full 17 keypoints for each matched group
+            all_persons_3d = []
+            for group in groups:
+                kp_dict = {}
+                for port, person_idx in group.items():
+                    kps, scores = port_persons[port][person_idx]
+                    kp_dict[port] = np.concatenate([kps, scores[:, None]], axis=1)
+                kps_3d = triangulate_keypoints(
+                    kp_dict, port_to_cam_index, camera_params, projection_matrices
+                )
+                all_persons_3d.append(kps_3d)
+
+            if all_persons_3d:
+                self.keypoints_3d_ready.emit(all_persons_3d)
+        except Exception:
+            pass
 
     def stop(self):
         self.running = False
@@ -812,6 +880,7 @@ class ProcessingWorker(QThread):
         max_persons: int = 2,
         batch_size: int = 8,
         skip_sync_indices: int = 1,
+        person_confidence: float = 0.30,
     ):
         super().__init__()
         self.video_paths = video_paths
@@ -823,6 +892,7 @@ class ProcessingWorker(QThread):
         self.max_persons = max_persons
         self.batch_size = batch_size
         self.skip_sync_indices = skip_sync_indices
+        self.person_confidence = person_confidence
         self.running = True
 
     def run(self):
@@ -838,6 +908,7 @@ class ProcessingWorker(QThread):
                 skip_sync_indices=self.skip_sync_indices,
                 max_persons=self.max_persons,
                 batch_size=self.batch_size,
+                person_confidence=self.person_confidence,
                 progress_callback=lambda step, frac: self.progress_update.emit(step, frac),
                 log_callback=lambda msg: self.log_message.emit(msg),
             )

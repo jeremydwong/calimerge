@@ -115,6 +115,16 @@ class ProcessTab(QWidget):
         self.skip_frames_spin.setToolTip("Process every Nth sync index (1 = all frames)")
         row2.addWidget(self.skip_frames_spin)
 
+        row2.addWidget(QLabel("Det conf:"))
+        from PySide6.QtWidgets import QDoubleSpinBox
+        self.det_conf_spin = QDoubleSpinBox()
+        self.det_conf_spin.setRange(0.05, 0.95)
+        self.det_conf_spin.setSingleStep(0.05)
+        self.det_conf_spin.setValue(0.30)
+        self.det_conf_spin.setDecimals(2)
+        self.det_conf_spin.setToolTip("YOLO person detection confidence threshold (higher = fewer false positives)")
+        row2.addWidget(self.det_conf_spin)
+
         row2.addStretch()
         settings_layout.addLayout(row2)
 
@@ -317,6 +327,7 @@ class ProcessTab(QWidget):
         self._log(f"  Device: {self.device_combo.currentText()}")
         self._log(f"  Batch size: {self.batch_size_spin.value()}")
         self._log(f"  Skip frames: {self.skip_frames_spin.value()}")
+        self._log(f"  Det conf: {self.det_conf_spin.value():.2f}")
         self._log(f"{'='*50}\n")
 
         self.processing_worker = ProcessingWorker(
@@ -329,6 +340,7 @@ class ProcessTab(QWidget):
             max_persons=self.max_persons_spin.value(),
             batch_size=self.batch_size_spin.value(),
             skip_sync_indices=self.skip_frames_spin.value(),
+            person_confidence=self.det_conf_spin.value(),
         )
         self.processing_worker.log_message.connect(self._log)
         self.processing_worker.progress_update.connect(self._on_progress)
