@@ -1,8 +1,20 @@
 """
-SkeletonViewWidget - renders a 3D skeleton projected onto the XY plane.
+SkeletonViewWidget - oblique three-quarter projection of a 3D skeleton.
 
-Receives list[np.ndarray | None] of 17 3D keypoints (COCO-17),
-applies a stored view_transform, and paints them with QPainter.
+Coordinate conventions
+----------------------
+World space  : camera-vision Y-down (Y increases downward in the scene).
+View space   : set by _view_transform (4x4 world→view).
+               After "Rotate to Human":
+                 view X = foot-to-foot (rightward)
+                 view Y = forward/depth
+                 view Z = body-up (head is at large +Z)
+Screen space : standard Qt (sy increases downward).
+
+Projection
+----------
+Oblique three-quarter projection: view X + Y-shear maps to screen X,
+view Z + Y-shear maps to screen Y (inverted for Y-up display).
 """
 
 from __future__ import annotations
@@ -22,69 +34,94 @@ _SKELETON = [
     (11, 13), (13, 15), (12, 14), (14, 16),
 ]
 
-# Per-keypoint colors (COCO-17): head, left limbs, right limbs
-_KP_COLORS = [
-    QColor(255, 255, 100),  # 0 nose
-    QColor(200, 200, 80),   # 1 left_eye
-    QColor(200, 200, 80),   # 2 right_eye
-    QColor(180, 180, 60),   # 3 left_ear
-    QColor(180, 180, 60),   # 4 right_ear
-    QColor(100, 200, 120),  # 5 left_shoulder
-    QColor(100, 160, 255),  # 6 right_shoulder
-    QColor(100, 200, 120),  # 7 left_elbow
-    QColor(100, 160, 255),  # 8 right_elbow
-    QColor(100, 200, 120),  # 9 left_wrist
-    QColor(100, 160, 255),  # 10 right_wrist
-    QColor(100, 200, 120),  # 11 left_hip
-    QColor(100, 160, 255),  # 12 right_hip
-    QColor(100, 200, 120),  # 13 left_knee
-    QColor(100, 160, 255),  # 14 right_knee
-    QColor(100, 200, 120),  # 15 left_ankle
-    QColor(100, 160, 255),  # 16 right_ankle
+# Per-person colors (limbs + keypoints use the same color per person)
+_PERSON_COLORS = [
+    QColor(220, 220, 220),  # 0  white
+    QColor(80,  220, 120),  # 1  green
+    QColor(80,  160, 255),  # 2  blue
+    QColor(255, 180,  60),  # 3  orange
+    QColor(220,  80, 220),  # 4  purple
 ]
+
+# Show ±_VIEW_HALF in the narrower widget dimension.
+_VIEW_HALF = 2.5   # metres
+
+# Oblique projection coefficients for view Y (depth) axis.
+# Positive view-Y (behind person) shifts screen LEFT and UP.
+_OBLIQUE_X = 0.45   # depth shifts screen X  (positive = left when depth is positive)
+_OBLIQUE_Z = 0.30   # depth shifts screen Z  (positive = upward when depth is positive)
+
+# When has_origin=True, centre the static view at this height above the floor (view Z).
+_FIXED_CZ = 1.0    # metres
+_FIXED_CX = 0.0    # metres
+
+# Default transform: world X → view X, world Z (depth) → view Y, world -Y (up) → view Z.
+# Gives a sensible three-quarter display before "Rotate to Human" is pressed.
+_DEFAULT_TRANSFORM = np.array([
+    [1,  0,  0,  0],
+    [0,  0,  1,  0],
+    [0, -1,  0,  0],
+    [0,  0,  0,  1],
+], dtype=float)
 
 
 class SkeletonViewWidget(QWidget):
-    """Displays a 3D skeleton projected onto the XY plane using QPainter."""
+    """Displays a 3D skeleton with an oblique three-quarter projection."""
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setMinimumSize(200, 300)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self._keypoints: list = []
+        # list of persons; each person is list[np.ndarray(3,) | None] length 17
+        self._persons: list[list] = []
         self._message: str = "No detection"
-        self._view_transform: np.ndarray = np.eye(4)
+        self._view_transform: np.ndarray = _DEFAULT_TRANSFORM.copy()
+        # True once "Set Origin at L_Ankle" has been applied → static view + floor grid.
+        self._has_origin: bool = False
 
-    def update_keypoints(self, kps_3d: list) -> None:
-        """Set new 3D keypoints and trigger a repaint.
+    # ── Public API ──
+
+    def update_keypoints(self, persons: list) -> None:
+        """Set raw world-space keypoints for one or more persons and repaint.
 
         Args:
-            kps_3d: list of np.ndarray (3,) or None, length 17 (COCO-17).
+            persons: list[list[np.ndarray(3,) | None]]
+                     Outer list = persons; inner list = 17 COCO-17 keypoints.
         """
-        self._keypoints = list(kps_3d)
+        self._persons = [list(p) for p in persons]
         self._message = ""
         self.update()
 
-    def set_view_transform(self, mat: np.ndarray) -> None:
-        """Set 4x4 view transform matrix and repaint."""
+    def set_view_transform(self, mat: np.ndarray, has_origin: bool = False) -> None:
+        """Set 4x4 world→view transform and repaint.
+
+        Args:
+            mat: 4x4 matrix; after "Rotate to Human" columns are
+                 [X_foot-to-foot, Y_forward, Z_body-up].
+            has_origin: True when a floor origin has been zeroed.
+                        Switches to static centre + enables floor grid.
+        """
         self._view_transform = np.array(mat, dtype=float)
+        self._has_origin = has_origin
         self.update()
 
     def set_message(self, msg: str) -> None:
-        """Show a status message (clears keypoints)."""
-        self._keypoints = []
+        self._persons = []
         self._message = msg
         self.update()
 
     def clear(self) -> None:
-        """Clear keypoints and show default 'No detection' message."""
-        self._keypoints = []
+        self._persons = []
         self._message = "No detection"
+        self._has_origin = False
+        self._view_transform = _DEFAULT_TRANSFORM.copy()
         self.update()
 
     def get_keypoints(self) -> list:
-        """Return the current list of keypoints (already transformed)."""
-        return list(self._keypoints)
+        """Return person 0's RAW world-space keypoints (for rotate/zero buttons)."""
+        if self._persons:
+            return list(self._persons[0])
+        return []
 
     # ── Painting ──
 
@@ -94,98 +131,150 @@ class SkeletonViewWidget(QWidget):
 
         w = self.width()
         h = self.height()
+        margin = 20
+        title_h = 18   # pixels reserved for title at top
 
-        # Background
         painter.fillRect(0, 0, w, h, QColor(30, 30, 30))
 
-        has_kps = bool(self._keypoints) and any(k is not None for k in self._keypoints)
+        has_kps = bool(self._persons) and any(
+            any(k is not None for k in p) for p in self._persons
+        )
 
         if not has_kps:
             msg = self._message if self._message else "No detection"
             painter.setPen(QColor(100, 100, 100))
             painter.setFont(QFont("monospace", 10))
-            painter.drawText(
-                self.rect(), Qt.AlignmentFlag.AlignCenter, msg
-            )
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, msg)
             painter.end()
             return
 
-        # Project keypoints: apply view transform then use XY plane
-        screen_pts: list[tuple[float, float] | None] = []
-        raw_xy: list[tuple[float, float]] = []
+        # ── Project all persons: world → view space ──
+        def project_kps(kps: list) -> list:
+            result = []
+            for kp in kps:
+                if kp is None:
+                    result.append(None)
+                    continue
+                pt = np.array(kp, dtype=float)
+                if pt.shape != (3,):
+                    result.append(None)
+                    continue
+                v = (self._view_transform @ np.append(pt, 1.0))[:3]
+                result.append((float(v[0]), float(v[1]), float(v[2])))
+            return result
 
-        for kp in self._keypoints:
-            if kp is None:
-                screen_pts.append(None)
-                continue
-            pt = np.array(kp, dtype=float)
-            if pt.shape != (3,):
-                screen_pts.append(None)
-                continue
-            # Apply stored view transform
-            pt4 = np.append(pt, 1.0)
-            transformed = (self._view_transform @ pt4)[:3]
-            raw_xy.append((transformed[0], transformed[1]))
-            screen_pts.append((transformed[0], transformed[1]))
+        all_view_pts = [project_kps(p) for p in self._persons]
 
-        if not raw_xy:
+        # Collect all valid 3D view points for centering
+        all_valid = [vp for pvp in all_view_pts for vp in pvp if vp is not None]
+        if not all_valid:
             painter.setPen(QColor(100, 100, 100))
             painter.setFont(QFont("monospace", 10))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "No detection")
             painter.end()
             return
 
-        # Compute bounding box for auto-scaling
-        xs = [p[0] for p in raw_xy]
-        ys = [p[1] for p in raw_xy]
-        x_min, x_max = min(xs), max(xs)
-        y_min, y_max = min(ys), max(ys)
+        # ── Scale ──
+        avail = min(w - 2 * margin, h - 2 * margin - title_h)
+        scale = avail / (2 * _VIEW_HALF)
 
-        margin = 20
-        data_w = x_max - x_min or 1.0
-        data_h = y_max - y_min or 1.0
+        # ── Centre of view ──
+        # Static (has_origin): 1 m above zeroed floor, centred on X=0.
+        # Tracking (no origin): centroid over all persons in XZ.
+        if self._has_origin:
+            cx, cz = _FIXED_CX, _FIXED_CZ
+        else:
+            cx = sum(p[0] for p in all_valid) / len(all_valid)
+            cz = sum(p[2] for p in all_valid) / len(all_valid)
 
-        avail_w = w - 2 * margin
-        avail_h = h - 2 * margin
-        scale = min(avail_w / data_w, avail_h / data_h)
+        # Screen centre (slightly below mid to leave title room)
+        scx = w / 2
+        scy = h / 2 + title_h // 2
 
-        x_center = (x_min + x_max) / 2
-        y_center = (y_min + y_max) / 2
-
-        def to_screen(xy: tuple[float, float]) -> tuple[int, int]:
-            sx = int(w / 2 + (xy[0] - x_center) * scale)
-            # Y-up: flip Y for screen coords
-            sy = int(h / 2 - (xy[1] - y_center) * scale)
+        def to_screen(vx: float, vy: float, vz: float) -> tuple[int, int]:
+            # Oblique: view X + depth-shear → screen X
+            #          view Z + depth-shear → screen Y (inverted: Z-up)
+            sx = int(scx + ((vx - vy * _OBLIQUE_X) - cx) * scale)
+            sy = int(scy - ((vz + vy * _OBLIQUE_Z) - cz) * scale)
             return sx, sy
 
-        # Build final screen coords
-        final_pts: list[tuple[int, int] | None] = []
-        for sp in screen_pts:
-            if sp is None:
-                final_pts.append(None)
-            else:
-                final_pts.append(to_screen(sp))
+        # ── Floor grid (only when origin is zeroed) ──
+        if self._has_origin:
+            # Height markers: Z = 0, 0.5, 1.0, 1.5, 2.0 m (at vy=0)
+            for gh in (0.0, 0.5, 1.0, 1.5, 2.0):
+                # Front edge of grid line (vy = 0)
+                sx0, sy0 = to_screen(-_VIEW_HALF, 0.0, gh)
+                sx1, sy1 = to_screen(+_VIEW_HALF, 0.0, gh)
+                if gh == 0.0:
+                    painter.setPen(QPen(QColor(110, 110, 110), 1))
+                else:
+                    pen = QPen(QColor(60, 60, 60), 1)
+                    pen.setStyle(Qt.PenStyle.DashLine)
+                    painter.setPen(pen)
+                painter.drawLine(sx0, sy0, sx1, sy1)
+                if gh > 0:
+                    painter.setPen(QColor(65, 65, 65))
+                    painter.setFont(QFont("monospace", 7))
+                    painter.drawText(sx1 + 3, sy1 + 4, f"{gh:.1f}m")
 
-        # Draw skeleton limbs
-        painter.setPen(QPen(QColor(220, 220, 220), 2))
-        n = len(final_pts)
-        for i, j in _SKELETON:
-            if i >= n or j >= n:
-                continue
-            if final_pts[i] is None or final_pts[j] is None:
-                continue
-            painter.drawLine(
-                final_pts[i][0], final_pts[i][1],
-                final_pts[j][0], final_pts[j][1],
-            )
+            # Depth lines on floor (Z=0): draw X-axis and Y-axis at floor
+            # X axis (foot-to-foot at floor level)
+            ax0, ay0 = to_screen(0.0, 0.0, 0.0)
+            ax1, ay1 = to_screen(1.0, 0.0, 0.0)
+            painter.setPen(QPen(QColor(180, 60, 60), 2))   # red = X
+            painter.drawLine(ax0, ay0, ax1, ay1)
 
-        # Draw keypoints
-        for idx, pt in enumerate(final_pts):
-            if pt is None:
-                continue
-            color = _KP_COLORS[idx] if idx < len(_KP_COLORS) else QColor(200, 200, 200)
+            # Z axis (body up)
+            az1, az2 = to_screen(0.0, 0.0, 1.0)
+            painter.setPen(QPen(QColor(60, 60, 180), 2))   # blue = Z (up)
+            painter.drawLine(ax0, ay0, az1, az2)
+
+            # Y axis (depth / forward)
+            ay_1, ay_2 = to_screen(0.0, 1.0, 0.0)
+            painter.setPen(QPen(QColor(60, 160, 60), 2))   # green = Y (forward)
+            painter.drawLine(ax0, ay0, ay_1, ay_2)
+
+        # ── Skeletons — one per person, each in a distinct colour ──
+        for person_idx, view_pts in enumerate(all_view_pts):
+            color = _PERSON_COLORS[person_idx % len(_PERSON_COLORS)]
+            n = len(view_pts)
+
+            # Limbs
+            painter.setPen(QPen(color, 2))
+            for i, j in _SKELETON:
+                if i >= n or j >= n:
+                    continue
+                if view_pts[i] is None or view_pts[j] is None:
+                    continue
+                painter.drawLine(*to_screen(*view_pts[i]), *to_screen(*view_pts[j]))
+
+            # Keypoints
             painter.setBrush(color)
             painter.setPen(QPen(QColor(30, 30, 30), 1))
-            painter.drawEllipse(pt[0] - 4, pt[1] - 4, 8, 8)
+            for vp in view_pts:
+                if vp is None:
+                    continue
+                sp = to_screen(*vp)
+                painter.drawEllipse(sp[0] - 4, sp[1] - 4, 8, 8)
+
+        # ── Title: person 0's L_Ankle ──
+        p0_view = all_view_pts[0] if all_view_pts else []
+        p0_raw  = self._persons[0] if self._persons else []
+        l_ankle_vp  = p0_view[15] if len(p0_view) > 15 else None
+        l_ankle_raw = p0_raw[15]  if len(p0_raw) > 15 else None
+
+        n_str = f"  [{len(self._persons)} person{'s' if len(self._persons) != 1 else ''}]"
+        if self._has_origin and l_ankle_vp is not None:
+            vx, vy, vz = l_ankle_vp
+            title = f"L_Ankle  x={vx:.2f}  y={vy:.2f}  z={vz:.2f} m{n_str}"
+        elif l_ankle_raw is not None:
+            rx, ry, rz = l_ankle_raw
+            title = f"L_Ankle (world)  x={rx:.2f}  y={ry:.2f}  z={rz:.2f} m{n_str}"
+        else:
+            title = f"L_Ankle: not detected{n_str}"
+
+        painter.setPen(QColor(160, 160, 160))
+        painter.setFont(QFont("monospace", 8))
+        painter.drawText(margin, margin + 12, title)
 
         painter.end()

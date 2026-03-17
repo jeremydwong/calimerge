@@ -230,10 +230,21 @@ class CamerasTab(QWidget):
         # Per-camera last-frame timestamp for FPS computation
         self._last_frame_time: dict[int, float] = {}
 
-        # Live 3D projection view transform (4x4, loaded from camera_rig.toml if present)
-        self._view_transform = np.eye(4)
+        # Live 3D projection state
+        # _view_rotation: rotation-only 4x4 (set by "Rotate to Human")
+        # _view_has_origin: True once "Set Origin at L_Ankle" has been applied
+        # Default matches _DEFAULT_TRANSFORM in skeleton_view.py
+        self._view_rotation: np.ndarray = np.array([
+            [1,  0,  0,  0],
+            [0,  0,  1,  0],
+            [0, -1,  0,  0],
+            [0,  0,  0,  1],
+        ], dtype=float)
+        self._view_has_origin: bool = False
         self._rotate_timer: QTimer | None = None
         self._rotate_countdown = 0
+        self._zero_timer: QTimer | None = None
+        self._zero_countdown = 0
 
         self._init_ui()
         self._connect_signals()
@@ -422,9 +433,20 @@ class CamerasTab(QWidget):
         skel_header.addStretch()
         self.rotate_to_human_button = QPushButton("Rotate to Human")
         self.rotate_to_human_button.setEnabled(False)
-        self.rotate_to_human_button.setToolTip("Auto-orient view: stand still, triggers in 3s")
+        self.rotate_to_human_button.setToolTip(
+            "Orient view: Y=up (head), X=foot-to-foot, Z=forward. Stand still, triggers in 3s."
+        )
         self.rotate_to_human_button.clicked.connect(self._on_rotate_to_human)
         skel_header.addWidget(self.rotate_to_human_button)
+
+        self.zero_origin_button = QPushButton("Zero at L_Ankle")
+        self.zero_origin_button.setEnabled(False)
+        self.zero_origin_button.setToolTip(
+            "Set left ankle as floor origin (0,0,0). Stand still, triggers in 3s."
+        )
+        self.zero_origin_button.clicked.connect(self._on_zero_at_left_foot)
+        skel_header.addWidget(self.zero_origin_button)
+
         skel_layout.addLayout(skel_header)
         self.skeleton_view = SkeletonViewWidget()
         skel_layout.addWidget(self.skeleton_view)
@@ -949,6 +971,13 @@ class CamerasTab(QWidget):
     # ── Recording ──
 
     def _start_recording(self):
+        # Stop live detection first (frees GPU for recording)
+        if self.detection_worker is not None:
+            self._stop_detection()
+            self.detect_checkbox.blockSignals(True)
+            self.detect_checkbox.setChecked(False)
+            self.detect_checkbox.blockSignals(False)
+
         # Stop preview if running
         if self.preview_worker:
             self.preview_worker.stop()
@@ -1114,15 +1143,37 @@ class CamerasTab(QWidget):
         if self.detection_worker is not None:
             self.detection_worker.match_threshold = thresh
 
+    def _load_calibration_from_disk(self) -> dict | None:
+        """Scan recordings subdirectories for the most recent calibration.toml."""
+        try:
+            from ...config import load_calibration_from_toml
+            candidates = sorted(self.base_output_path.glob("*/calibration.toml"))
+            if not candidates:
+                return None
+            # Last alphabetically = most recent (timestamp-named folders)
+            cal_file = candidates[-1]
+            cameras = load_calibration_from_toml(cal_file)
+            if cameras:
+                print(f"[detect] loaded calibration from {cal_file} ({len(cameras)} cameras)")
+                # Persist into state so other tabs (Process) also see it
+                self.state_manager.update_calibration(calibrated_cameras=cameras)
+            return cameras or None
+        except Exception as e:
+            print(f"[detect] calibration load failed: {e}")
+            return None
+
     def _start_detection(self):
         """Start the pose detection worker."""
         if self.detection_worker is not None:
             print("[detect] worker already exists, skipping")
             return
 
-        # Get calibrated cameras if available
+        # Get calibrated cameras: prefer in-memory state, fall back to disk
         cal_state = self.state_manager.state.calibration
         cameras = cal_state.calibrated_cameras if cal_state.calibrated_cameras else None
+
+        if cameras is None:
+            cameras = self._load_calibration_from_disk()
 
         if cameras is None:
             self.skeleton_view.set_message("No extrinsic calibration")
@@ -1154,6 +1205,7 @@ class CamerasTab(QWidget):
             print("[detect] stopped")
         self.skeleton_view.clear()
         self.rotate_to_human_button.setEnabled(False)
+        self.zero_origin_button.setEnabled(False)
 
     def _on_detection_finished(self):
         """Handle detection worker thread finishing (could be normal or crash)."""
@@ -1173,24 +1225,30 @@ class CamerasTab(QWidget):
         self.detect_checkbox.blockSignals(False)
         self._stop_detection()
 
-    def _on_keypoints_3d(self, kps_3d: list):
-        """Handle 3D keypoints from live triangulation."""
-        transformed = []
-        for kp in kps_3d:
-            if kp is not None and not np.isnan(kp).any():
-                pt4 = np.append(kp, 1.0)
-                t = (self._view_transform @ pt4)[:3]
-                transformed.append(t)
-            else:
-                transformed.append(None)
-        self.skeleton_view.update_keypoints(transformed)
-        # Enable rotate button when we have valid keypoints
-        has_kps = any(k is not None for k in kps_3d)
+    def _on_keypoints_3d(self, persons: list):
+        """Handle multi-person 3D keypoints from live triangulation.
+
+        persons: list[list[np.ndarray(3,) | None]]
+        """
+        # Clean NaNs per person
+        clean_persons = []
+        for kps_3d in persons:
+            clean = [
+                kp if (kp is not None and not np.isnan(kp).any()) else None
+                for kp in kps_3d
+            ]
+            clean_persons.append(clean)
+
+        self.skeleton_view.update_keypoints(clean_persons)
+        has_kps = any(any(k is not None for k in p) for p in clean_persons)
         self.rotate_to_human_button.setEnabled(has_kps)
+        self.zero_origin_button.setEnabled(has_kps)
+
+    # ── Rotate to Human ──────────────────────────────────────────────────
 
     def _on_rotate_to_human(self):
-        """Start countdown then compute view transform from current skeleton."""
-        self._rotate_countdown = 3
+        """Start 5s countdown then capture rotation from current skeleton."""
+        self._rotate_countdown = 5
         self.rotate_to_human_button.setEnabled(False)
         self.rotate_to_human_button.setText(f"Rotating in {self._rotate_countdown}s...")
         self._rotate_timer = QTimer()
@@ -1208,7 +1266,18 @@ class CamerasTab(QWidget):
             self._compute_rotate_to_human()
 
     def _compute_rotate_to_human(self):
-        """Compute egocentric view transform from current live 3D skeleton."""
+        """Compute a rotation-only view transform from the current skeleton.
+
+        Axis definitions (user-specified):
+          X  = normalize(R_Ankle − L_Ankle)       foot-to-foot / rightward
+          Z  = normalize(head − avg_feet)          body-up
+          Y  = normalize(cross(Z, X))              forward / depth
+
+        X and Z are orthogonalised via Gram-Schmidt so the frame is
+        guaranteed orthonormal.  Stores rotation-only (no translation);
+        the widget auto-centres on the body until "Set Origin at L_Ankle"
+        is pressed.
+        """
         kps = self.skeleton_view.get_keypoints()
         if not kps or not any(k is not None for k in kps):
             self.rotate_to_human_button.setEnabled(True)
@@ -1216,72 +1285,123 @@ class CamerasTab(QWidget):
 
         def get_pt(idx):
             if idx < len(kps) and kps[idx] is not None:
-                return np.array(kps[idx])
+                return np.array(kps[idx], dtype=float)
             return None
 
-        # COCO-17: 15=L_Ankle, 16=R_Ankle, 0=Nose, 11=L_Hip, 12=R_Hip
+        # COCO-17 indices
         l_ankle = get_pt(15)
         r_ankle = get_pt(16)
-        nose = get_pt(0)
-        l_hip = get_pt(11)
-        r_hip = get_pt(12)
+        nose    = get_pt(0)
+        l_hip   = get_pt(11)
+        r_hip   = get_pt(12)
+        l_sho   = get_pt(5)
+        r_sho   = get_pt(6)
 
-        # Foot center (floor origin)
+        # ── Z axis: avg_feet → head (body-up) ──
+        foot_ref = (
+            (l_ankle + r_ankle) / 2 if l_ankle is not None and r_ankle is not None
+            else l_ankle if l_ankle is not None
+            else r_ankle if r_ankle is not None
+            else (l_hip + r_hip) / 2 if l_hip is not None and r_hip is not None
+            else None
+        )
+        head_ref = (
+            nose if nose is not None
+            else (l_sho + r_sho) / 2 if l_sho is not None and r_sho is not None
+            else (l_hip + r_hip) / 2 if l_hip is not None and r_hip is not None
+            else None
+        )
+        if foot_ref is None or head_ref is None:
+            self.rotate_to_human_button.setEnabled(True)
+            return
+
+        Z = head_ref - foot_ref
+        z_norm = np.linalg.norm(Z)
+        if z_norm < 0.01:
+            self.rotate_to_human_button.setEnabled(True)
+            return
+        Z = Z / z_norm
+
+        # ── X axis: L_Ankle → R_Ankle, orthogonalised against Z ──
         if l_ankle is not None and r_ankle is not None:
-            foot_center = (l_ankle + r_ankle) / 2
-        elif l_ankle is not None:
-            foot_center = l_ankle
-        elif r_ankle is not None:
-            foot_center = r_ankle
+            X_raw = r_ankle - l_ankle
         elif l_hip is not None and r_hip is not None:
-            foot_center = (l_hip + r_hip) / 2
+            X_raw = r_hip - l_hip
         else:
+            X_raw = np.array([1.0, 0.0, 0.0])
+            if abs(np.dot(X_raw, Z)) > 0.9:
+                X_raw = np.array([0.0, 0.0, 1.0])
+
+        X = X_raw - np.dot(X_raw, Z) * Z   # Gram-Schmidt
+        x_norm = np.linalg.norm(X)
+        if x_norm < 1e-4:
             self.rotate_to_human_button.setEnabled(True)
             return
+        X = X / x_norm
 
-        # Up direction: foot center to nose
-        if nose is not None:
-            up = nose - foot_center
-        elif l_hip is not None and r_hip is not None:
-            hip_center = (l_hip + r_hip) / 2
-            up = hip_center - foot_center
-        else:
-            self.rotate_to_human_button.setEnabled(True)
-            return
+        # ── Y axis: forward = cross(Z, X) ──
+        Y = np.cross(Z, X)
+        Y = Y / np.linalg.norm(Y)
 
-        up_norm = np.linalg.norm(up)
-        if up_norm < 0.01:
-            self.rotate_to_human_button.setEnabled(True)
-            return
-        up = up / up_norm
-
-        # Build rotation: Y=up, X=right (cross with world Z or world X)
-        world_fwd = np.array([0.0, 0.0, 1.0])
-        right = np.cross(world_fwd, up)
-        r_norm = np.linalg.norm(right)
-        if r_norm < 0.01:
-            world_fwd = np.array([1.0, 0.0, 0.0])
-            right = np.cross(world_fwd, up)
-            r_norm = np.linalg.norm(right)
-        right = right / r_norm
-        fwd = np.cross(up, right)
-
-        # Rotation matrix: columns are right, up, fwd
-        R = np.column_stack([right, up, fwd])
-
-        # Build 4x4 transform: rotate then translate so foot_center goes to origin
+        # R columns are the world vectors that map to view X, Y, Z.
+        # R.T (the inverse rotation) maps world → view space.
+        R = np.column_stack([X, Y, Z])
         T = np.eye(4)
-        T[:3, :3] = R.T  # inverse rotation
-        T[:3, 3] = -R.T @ foot_center
+        T[:3, :3] = R.T   # rotation only, no translation
 
-        self._view_transform = T
-        self.skeleton_view.set_view_transform(T)
-
-        # Save to camera_rig.toml
-        self._save_view_transform(T)
+        self._view_rotation = T
+        self._view_has_origin = False
+        self.skeleton_view.set_view_transform(T, has_origin=False)
+        self._save_view_transform(T, has_origin=False)
         self.rotate_to_human_button.setEnabled(True)
 
-    def _save_view_transform(self, T: np.ndarray):
+    # ── Zero at Left Foot ─────────────────────────────────────────────────
+
+    def _on_zero_at_left_foot(self):
+        """Start 5s countdown then anchor view origin to current L_Ankle."""
+        self._zero_countdown = 5
+        self.zero_origin_button.setEnabled(False)
+        self.zero_origin_button.setText(f"Zeroing in {self._zero_countdown}s...")
+        self._zero_timer = QTimer()
+        self._zero_timer.timeout.connect(self._zero_countdown_tick)
+        self._zero_timer.start(1000)
+
+    def _zero_countdown_tick(self):
+        self._zero_countdown -= 1
+        if self._zero_countdown > 0:
+            self.zero_origin_button.setText(f"Zeroing in {self._zero_countdown}s...")
+        else:
+            self._zero_timer.stop()
+            self._zero_timer = None
+            self.zero_origin_button.setText("Zero at L_Ankle")
+            self._compute_zero_origin()
+
+    def _compute_zero_origin(self):
+        """Translate the view so the current L_Ankle maps to view origin (0,0,0).
+
+        Composites the stored rotation (_view_rotation) with a translation
+        that places L_Ankle at the origin.  Enables the floor grid.
+        """
+        kps = self.skeleton_view.get_keypoints()
+        l_ankle = None
+        if kps and len(kps) > 15 and kps[15] is not None:
+            l_ankle = np.array(kps[15], dtype=float)
+
+        if l_ankle is None:
+            self.zero_origin_button.setEnabled(True)
+            return
+
+        R = self._view_rotation[:3, :3]   # rotation part only
+        T = np.eye(4)
+        T[:3, :3] = R
+        T[:3, 3] = -R @ l_ankle   # translate so L_Ankle → view origin
+
+        self._view_has_origin = True
+        self.skeleton_view.set_view_transform(T, has_origin=True)
+        self._save_view_transform(T, has_origin=True)
+        self.zero_origin_button.setEnabled(True)
+
+    def _save_view_transform(self, T: np.ndarray, has_origin: bool = False):
         """Save view transform to camera_rig.toml in the project folder."""
         try:
             import rtoml
@@ -1291,7 +1411,10 @@ class CamerasTab(QWidget):
             data = {}
             if rig_path.exists():
                 data = rtoml.load(rig_path)
-            data["live_view"] = {"transform": T.flatten().tolist()}
+            data["live_view"] = {
+                "transform": T.flatten().tolist(),
+                "has_origin": has_origin,
+            }
             with open(rig_path, "w") as f:
                 rtoml.dump(data, f)
         except Exception:
@@ -1310,10 +1433,14 @@ class CamerasTab(QWidget):
             if rig_path is None or not rig_path.exists():
                 return
             data = rtoml.load(rig_path)
-            if "live_view" in data and "transform" in data["live_view"]:
-                flat = data["live_view"]["transform"]
-                self._view_transform = np.array(flat).reshape(4, 4)
-                self.skeleton_view.set_view_transform(self._view_transform)
+            lv = data.get("live_view", {})
+            if "transform" in lv:
+                T = np.array(lv["transform"]).reshape(4, 4)
+                has_origin = bool(lv.get("has_origin", False))
+                if not has_origin:
+                    self._view_rotation = T
+                self._view_has_origin = has_origin
+                self.skeleton_view.set_view_transform(T, has_origin=has_origin)
         except Exception:
             pass
 
