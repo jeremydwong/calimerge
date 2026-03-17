@@ -581,6 +581,101 @@ void cm_shutdown(void) {
  * Camera Enumeration
  * ============================================================================ */
 
+/*
+ * Try to read the real USB iSerialNumber descriptor for the camera identified
+ * by an AVFoundation uniqueID string.
+ *
+ * AVFoundation uniqueID format for external USB cameras:
+ *   "0xLLLLLLLLVVVVPPPP"  (64-bit hex)
+ *   bits 63-32 : USB locationID  (bus + port topology)
+ *   bits 31-16 : USB vendorID
+ *   bits 15-0  : USB productID
+ *
+ * Strategy:
+ *   1. Parse the hex value and extract locationID, vendorID, productID.
+ *   2. Walk IOKit USB device tree; match on locationID + VID + PID
+ *      (locationID uniquely identifies port, so two identical cameras on
+ *      different ports are distinguished correctly).
+ *   3. Read the "USB Serial Number" IOKit property — this is the raw
+ *      iSerialNumber string from the USB descriptor, identical to what
+ *      Windows reads from its symbolic link.
+ *   4. Return the serial string, or nil if the camera has no serial /
+ *      is not a USB device.
+ */
+static NSString *get_usb_serial_for_avf_camera(NSString *avfUniqueID) {
+    if (!avfUniqueID || ![avfUniqueID hasPrefix:@"0x"]) {
+        return nil; /* built-in FaceTime camera — no USB serial */
+    }
+
+    /* Parse the 64-bit AVF uniqueID */
+    unsigned long long avfID = 0;
+    NSScanner *scanner = [NSScanner scannerWithString:avfUniqueID];
+    [scanner scanHexLongLong:&avfID];
+
+    uint32_t locationID = (uint32_t)((avfID >> 32) & 0xFFFFFFFF);
+    uint16_t vendorID   = (uint16_t)((avfID >> 16) & 0xFFFF);
+    uint16_t productID  = (uint16_t)( avfID        & 0xFFFF);
+
+    NSLog(@"[serial] AVF uniqueID %@ → loc=0x%08x vid=0x%04x pid=0x%04x",
+          avfUniqueID, locationID, vendorID, productID);
+
+    CFMutableDictionaryRef matching = IOServiceMatching(kIOUSBDeviceClassName);
+    if (!matching) return nil;
+
+    io_iterator_t iterator;
+    kern_return_t kr = IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iterator);
+    if (kr != KERN_SUCCESS) return nil;
+
+    NSString *result = nil;
+    io_service_t service;
+
+    while ((service = IOIteratorNext(iterator))) {
+        /* Read locationID, vendorID, productID from IOKit */
+        CFNumberRef locRef = (CFNumberRef)IORegistryEntryCreateCFProperty(
+            service, CFSTR("locationID"), kCFAllocatorDefault, 0);
+        CFNumberRef vidRef = (CFNumberRef)IORegistryEntryCreateCFProperty(
+            service, CFSTR("idVendor"), kCFAllocatorDefault, 0);
+        CFNumberRef pidRef = (CFNumberRef)IORegistryEntryCreateCFProperty(
+            service, CFSTR("idProduct"), kCFAllocatorDefault, 0);
+
+        uint32_t loc = 0;
+        int vid = 0, pid = 0;
+        if (locRef) { CFNumberGetValue(locRef, kCFNumberSInt32Type, &loc); CFRelease(locRef); }
+        if (vidRef) { CFNumberGetValue(vidRef, kCFNumberIntType, &vid);    CFRelease(vidRef); }
+        if (pidRef) { CFNumberGetValue(pidRef, kCFNumberIntType, &pid);    CFRelease(pidRef); }
+
+        bool vidpid_match = ((int)vendorID == vid && (int)productID == pid);
+
+        /* Prefer locationID match; fall back to VID+PID only when locationID
+         * is zero (shouldn't happen for real USB devices, but be defensive). */
+        bool matched = vidpid_match &&
+                       (locationID == 0 || loc == locationID);
+
+        if (matched) {
+            CFStringRef serialRef = (CFStringRef)IORegistryEntryCreateCFProperty(
+                service, CFSTR("USB Serial Number"), kCFAllocatorDefault, 0);
+            if (serialRef) {
+                NSString *s = (__bridge_transfer NSString *)serialRef;
+                if (s.length > 0) {
+                    NSLog(@"[serial] USB iSerialNumber: %@", s);
+                    result = s;
+                } else {
+                    NSLog(@"[serial] USB Serial Number property is empty");
+                }
+            } else {
+                NSLog(@"[serial] no USB Serial Number property on device");
+            }
+            IOObjectRelease(service);
+            break;
+        }
+
+        IOObjectRelease(service);
+    }
+
+    IOObjectRelease(iterator);
+    return result;
+}
+
 int cm_enumerate_cameras(CM_Camera *out_cameras, int max_cameras) {
     if (!g_initialized) {
         if (cm_init() != CM_OK) return CM_ERROR_INIT_FAILED;
@@ -605,8 +700,16 @@ int cm_enumerate_cameras(CM_Camera *out_cameras, int max_cameras) {
             CM_Camera *cam = &out_cameras[count];
             memset(cam, 0, sizeof(CM_Camera));
 
-            const char *uid = [device.uniqueID UTF8String];
-            strncpy(cam->serial_number, uid ? uid : "unknown", CM_SERIAL_LEN - 1);
+            /* Prefer the real USB iSerialNumber so serial numbers match
+             * the Windows implementation.  Fall back to AVF uniqueID for
+             * cameras that have no hardware serial (e.g. built-in webcam). */
+            NSString *usbSerial = get_usb_serial_for_avf_camera(device.uniqueID);
+            if (usbSerial) {
+                strncpy(cam->serial_number, [usbSerial UTF8String], CM_SERIAL_LEN - 1);
+            } else {
+                const char *uid = [device.uniqueID UTF8String];
+                strncpy(cam->serial_number, uid ? uid : "unknown", CM_SERIAL_LEN - 1);
+            }
 
             const char *name = [device.localizedName UTF8String];
             strncpy(cam->display_name, name ? name : "Unknown Camera", CM_NAME_LEN - 1);
