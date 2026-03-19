@@ -71,6 +71,7 @@ def stereo_calibrate_pair(
     port_a: int,
     port_b: int,
     min_corners: int = 6,
+    max_boards: int = 50,
 ) -> tuple[np.ndarray, np.ndarray, float] | None:
     """
     Stereo calibrate a camera pair using shared ChArUco observations.
@@ -82,6 +83,8 @@ def stereo_calibrate_pair(
         port_a: Port number for camera A
         port_b: Port number for camera B
         min_corners: Minimum shared corners required per frame
+        max_boards: Maximum boards to use; if exceeded, sample weighted by
+            point_count**2 (boards with more shared points are preferred)
 
     Returns:
         (rotation_3x3, translation_3, rmse) of camera B relative to camera A,
@@ -134,6 +137,17 @@ def stereo_calibrate_pair(
     if len(obj_points_list) < 3:
         return None
 
+    # Weighted board sampling: prefer boards with more shared corners
+    if len(obj_points_list) > max_boards:
+        rng = np.random.default_rng(42)
+        weights = np.array([len(obj) for obj in obj_points_list], dtype=np.float64)
+        weights = weights**2
+        weights /= weights.sum()
+        chosen = rng.choice(len(obj_points_list), size=max_boards, replace=False, p=weights)
+        obj_points_list = [obj_points_list[i] for i in chosen]
+        img_points_a_list = [img_points_a_list[i] for i in chosen]
+        img_points_b_list = [img_points_b_list[i] for i in chosen]
+
     # Run OpenCV stereo calibration
     flags = cv2.CALIB_FIX_INTRINSIC
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 1e-6)
@@ -154,6 +168,156 @@ def stereo_calibrate_pair(
     return R, T[:, 0], ret
 
 
+# --- Stereo pair helpers (inversion, bridging, gap-filling) ---
+
+
+# Type alias: (R_3x3, t_3, rmse)
+_StereoPairResult = tuple[np.ndarray, np.ndarray, float]
+
+
+def _invert_stereo_result(result: _StereoPairResult) -> _StereoPairResult:
+    """Invert a stereo result A→B to get B→A (same error)."""
+    R, t, error = result
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = R
+    T[:3, 3] = t
+    T_inv = np.linalg.inv(T)
+    return T_inv[:3, :3], T_inv[:3, 3].copy(), error
+
+
+def _chain_stereo_results(
+    ab: _StereoPairResult, bc: _StereoPairResult,
+) -> _StereoPairResult:
+    """Chain A→B and B→C to get A→C. Errors are summed."""
+    R_ab, t_ab, e_ab = ab
+    R_bc, t_bc, e_bc = bc
+    R_ac = R_bc @ R_ab
+    t_ac = R_bc @ t_ab + t_bc
+    return R_ac, t_ac, e_ab + e_bc
+
+
+def _compute_all_stereo_pairs(
+    synced_points_list: list[SyncedPoints],
+    cameras: dict[int, CalibratedCamera],
+    max_boards: int = 50,
+) -> dict[tuple[int, int], _StereoPairResult]:
+    """
+    Compute stereo calibration for all camera pairs, including inversions.
+
+    Returns dict keyed by directed pair (anchor, target) → (R, t, error).
+    Both (A,B) and (B,A) are stored so any direction is available.
+    """
+    ports = sorted(cameras.keys())
+    pairs: dict[tuple[int, int], _StereoPairResult] = {}
+
+    for port_a, port_b in combinations(ports, 2):
+        result = stereo_calibrate_pair(
+            synced_points_list,
+            cameras[port_a].intrinsics,
+            cameras[port_b].intrinsics,
+            port_a,
+            port_b,
+            max_boards=max_boards,
+        )
+        if result is not None:
+            pairs[(port_a, port_b)] = result
+            pairs[(port_b, port_a)] = _invert_stereo_result(result)
+
+    return pairs
+
+
+def _fill_stereo_gaps(
+    pairs: dict[tuple[int, int], _StereoPairResult],
+    ports: list[int],
+) -> dict[tuple[int, int], _StereoPairResult]:
+    """
+    Fill missing directed pairs by bridging through intermediate cameras.
+
+    For each missing (A, C), try all intermediate cameras X where (A, X) and
+    (X, C) both exist. Keep the bridge with lowest accumulated error.
+    Iterates until no new pairs are added.
+    """
+    from itertools import permutations
+
+    pairs = dict(pairs)  # don't mutate caller's dict
+    all_directed = list(permutations(ports, 2))
+
+    while True:
+        added = 0
+        for a, c in all_directed:
+            if (a, c) in pairs:
+                continue
+            # Try bridging through every intermediate camera
+            best: _StereoPairResult | None = None
+            for x in ports:
+                if x == a or x == c:
+                    continue
+                if (a, x) in pairs and (x, c) in pairs:
+                    candidate = _chain_stereo_results(pairs[(a, x)], pairs[(x, c)])
+                    if best is None or candidate[2] < best[2]:
+                        best = candidate
+            if best is not None:
+                pairs[(a, c)] = best
+                added += 1
+        if added == 0:
+            break
+
+    return pairs
+
+
+def _chain_from_anchor(
+    anchor_port: int,
+    ports: list[int],
+    stereo_pairs: dict[tuple[int, int], _StereoPairResult],
+) -> tuple[dict[int, CameraExtrinsics], float]:
+    """
+    Build extrinsics for all cameras by chaining from anchor.
+
+    Returns (extrinsics_dict, total_accumulated_error).
+    """
+    extrinsics = {
+        anchor_port: CameraExtrinsics(
+            rotation=np.eye(3, dtype=np.float64),
+            translation=np.zeros(3, dtype=np.float64),
+        )
+    }
+    total_error = 0.0
+    calibrated = {anchor_port}
+
+    changed = True
+    while changed:
+        changed = False
+        for target in ports:
+            if target in calibrated:
+                continue
+            # Find best anchor→target path via any calibrated camera
+            best_result: _StereoPairResult | None = None
+            best_anchor: int | None = None
+            for anchor in list(calibrated):
+                key = (anchor, target)
+                if key in stereo_pairs:
+                    r = stereo_pairs[key]
+                    if best_result is None or r[2] < best_result[2]:
+                        best_result = r
+                        best_anchor = anchor
+            if best_result is None:
+                continue
+
+            R_rel, t_rel, err = best_result
+            R_anchor = extrinsics[best_anchor].rotation
+            t_anchor = extrinsics[best_anchor].translation
+
+            extrinsics[target] = CameraExtrinsics(
+                rotation=R_rel @ R_anchor,
+                translation=R_rel @ t_anchor + t_rel,
+            )
+            calibrated.add(target)
+            total_error += err
+            changed = True
+
+    return extrinsics, total_error
+
+
 def compute_initial_extrinsics(
     synced_points_list: list[SyncedPoints],
     cameras: dict[int, CalibratedCamera],
@@ -162,85 +326,104 @@ def compute_initial_extrinsics(
     """
     Compute initial extrinsics for all cameras via pairwise stereo calibration.
 
-    Uses the reference camera (or first camera) as the origin, then chains
-    stereo calibrations to estimate other camera poses.
+    Improvements over naive chaining:
+    - Pre-computes all stereo pairs (both directions)
+    - Fills gaps via error-aware bridging through intermediate cameras
+    - When reference_port is None, tries every camera as anchor and picks
+      the one with lowest total accumulated stereo error
 
     Args:
         synced_points_list: List of SyncedPoints with ChArUco detections
         cameras: Dict of port -> CalibratedCamera (intrinsics only needed)
-        reference_port: Port to use as origin (default: lowest port number)
+        reference_port: Port to use as origin (default: auto-select best anchor)
 
     Returns:
         Dict of port -> CameraExtrinsics
     """
     ports = sorted(cameras.keys())
 
-    if reference_port is None:
-        reference_port = ports[0]
+    # Step 1: Pre-compute all stereo pairs (+ inversions)
+    stereo_pairs = _compute_all_stereo_pairs(synced_points_list, cameras)
 
-    # Initialize reference camera at origin
-    extrinsics = {
-        reference_port: CameraExtrinsics(
-            rotation=np.eye(3, dtype=np.float64),
-            translation=np.zeros(3, dtype=np.float64),
-        )
-    }
+    # Step 2: Fill gaps via bridging
+    stereo_pairs = _fill_stereo_gaps(stereo_pairs, ports)
 
-    # Chain stereo calibrations from reference
-    calibrated = {reference_port}
-    pairs = list(combinations(ports, 2))
+    # Step 3: Chain from anchor
+    if reference_port is not None:
+        extrinsics, _ = _chain_from_anchor(reference_port, ports, stereo_pairs)
+        return extrinsics
 
-    # Keep trying until we can't calibrate any more cameras
-    changed = True
-    while changed:
-        changed = False
-        for port_a, port_b in pairs:
-            # Skip if both calibrated or neither calibrated
-            if port_a in calibrated and port_b in calibrated:
-                continue
-            if port_a not in calibrated and port_b not in calibrated:
-                continue
+    # Multi-anchor: try each camera as origin, pick lowest error
+    best_extrinsics: dict[int, CameraExtrinsics] | None = None
+    best_error = float("inf")
+    best_count = 0
 
-            # Determine which camera is the anchor
-            if port_a in calibrated:
-                anchor, target = port_a, port_b
-            else:
-                anchor, target = port_b, port_a
+    for anchor in ports:
+        extrinsics, error = _chain_from_anchor(anchor, ports, stereo_pairs)
+        count = len(extrinsics)
+        # Prefer: most cameras calibrated, then lowest error
+        if count > best_count or (count == best_count and error < best_error):
+            best_extrinsics = extrinsics
+            best_error = error
+            best_count = count
 
-            # Stereo calibrate
-            result = stereo_calibrate_pair(
-                synced_points_list,
-                cameras[anchor].intrinsics,
-                cameras[target].intrinsics,
-                anchor,
-                target,
-            )
-
-            if result is None:
-                continue
-
-            R_rel, t_rel, _ = result
-
-            # Compute absolute pose of target camera
-            R_anchor = extrinsics[anchor].rotation
-            t_anchor = extrinsics[anchor].translation
-
-            R_target = R_rel @ R_anchor
-            t_target = R_rel @ t_anchor + t_rel
-
-            extrinsics[target] = CameraExtrinsics(
-                rotation=R_target,
-                translation=t_target,
-            )
-            calibrated.add(target)
-            changed = True
-
-    return extrinsics
+    return best_extrinsics
 
 
 # ============================================================================
 # Bundle Adjustment
 # ============================================================================
+
+
+def _triangulate_point_multi_pair(
+    cameras: dict[int, "CalibratedCamera"],
+    obs_cameras: np.ndarray,
+    obs_img: np.ndarray,
+) -> np.ndarray | None:
+    """
+    Triangulate a 3D point by averaging pairwise triangulations.
+
+    For each pair of observing cameras, triangulate independently using
+    cv2.triangulatePoints. Return the mean of all pairwise estimates.
+    This is more robust than a single multi-camera DLT when some cameras
+    have poor initial extrinsics.
+    """
+    from ..types import compute_projection_matrix
+
+    if len(obs_cameras) < 2:
+        return None
+
+    # Build projection matrices once
+    proj = {}
+    for port in np.unique(obs_cameras):
+        port = int(port)
+        if port in cameras:
+            proj[port] = compute_projection_matrix(cameras[port])
+
+    # Build mapping: port → image point for this observation
+    port_to_img = {}
+    for port, pt in zip(obs_cameras, obs_img):
+        port_to_img[int(port)] = pt
+
+    estimates = []
+    ports_list = list(port_to_img.keys())
+    for i in range(len(ports_list)):
+        for j in range(i + 1, len(ports_list)):
+            pa, pb = ports_list[i], ports_list[j]
+            if pa not in proj or pb not in proj:
+                continue
+            pts_a = port_to_img[pa].reshape(1, 1, 2).astype(np.float64)
+            pts_b = port_to_img[pb].reshape(1, 1, 2).astype(np.float64)
+            xyzw = cv2.triangulatePoints(proj[pa], proj[pb], pts_a, pts_b)
+            if abs(xyzw[3, 0]) < 1e-10:
+                continue
+            xyz = (xyzw[:3, 0] / xyzw[3, 0])
+            estimates.append(xyz)
+
+    if not estimates:
+        return None
+
+    return np.mean(estimates, axis=0)
 
 
 def build_point_estimates(
@@ -250,7 +433,8 @@ def build_point_estimates(
     """
     Build PointEstimates from synchronized point observations.
 
-    Triangulates initial 3D point positions from the camera poses.
+    Triangulates initial 3D point positions by averaging pairwise
+    triangulations from all stereo pairs that observe each point.
 
     Args:
         synced_points_list: List of SyncedPoints
@@ -259,7 +443,6 @@ def build_point_estimates(
     Returns:
         PointEstimates for bundle adjustment
     """
-    from ..triangulation import triangulate_points
 
     # Collect all observations
     sync_indices = []
@@ -295,7 +478,7 @@ def build_point_estimates(
             unique_combos[key] = len(unique_combos)
         obj_indices[i] = unique_combos[key]
 
-    # Triangulate 3D points
+    # Triangulate 3D points via multi-pair averaging
     obj_points = np.zeros((len(unique_combos), 3), dtype=np.float64)
 
     for (sync_idx, pt_id), obj_idx in unique_combos.items():
@@ -305,12 +488,7 @@ def build_point_estimates(
         obs_img = img_points[mask]
 
         if len(obs_cameras) >= 2:
-            # Simple triangulation using first two cameras
-            xyz = triangulate_points(
-                {port: cameras[port] for port in obs_cameras},
-                obs_cameras,
-                obs_img,
-            )
+            xyz = _triangulate_point_multi_pair(cameras, obs_cameras, obs_img)
             if xyz is not None:
                 obj_points[obj_idx] = xyz
 
@@ -487,6 +665,89 @@ def run_bundle_adjustment(
     rmse = float(np.sqrt(np.mean(np.sum(final_error**2, axis=1))))
 
     return refined_cameras, refined_point_estimates, rmse
+
+
+def filter_point_estimates(
+    cameras: dict[int, CalibratedCamera],
+    point_estimates: PointEstimates,
+    fraction_to_remove: float = 0.025,
+) -> PointEstimates:
+    """
+    Remove the worst-fitting observations by reprojection error percentile.
+
+    After removing high-error observations, also removes any 3D points that
+    have fewer than 2 remaining observations (can't triangulate from 1 camera).
+
+    Args:
+        cameras: Dict of port -> CalibratedCamera
+        point_estimates: Current point estimates
+        fraction_to_remove: Fraction of worst observations to remove (default 2.5%)
+
+    Returns:
+        Filtered PointEstimates with remapped obj_indices
+    """
+    ports = sorted(cameras.keys())
+    port_to_idx = {port: idx for idx, port in enumerate(ports)}
+    CAMERA_PARAM_COUNT = 6
+    n_cameras = len(ports)
+
+    # Build parameter vector from current camera state
+    camera_params = np.zeros((n_cameras, CAMERA_PARAM_COUNT), dtype=np.float64)
+    for port, cam in cameras.items():
+        camera_params[port_to_idx[port]] = extrinsics_to_vector(cam.extrinsics)
+
+    params = np.hstack([
+        camera_params.ravel(),
+        point_estimates.obj_points.ravel(),
+    ])
+
+    # Compute per-observation reprojection error
+    error = _xy_reprojection_error(params, point_estimates, cameras, port_to_idx)
+    error_2d = error.reshape(-1, 2)
+    euclidean = np.sqrt(np.sum(error_2d**2, axis=1))
+
+    # Percentile cutoff
+    cutoff = np.percentile(euclidean, (1.0 - fraction_to_remove) * 100)
+    keep_mask = euclidean < cutoff
+
+    if not np.any(keep_mask):
+        return point_estimates  # nothing to filter
+
+    # Apply mask to observation arrays
+    sync_indices = point_estimates.sync_indices[keep_mask]
+    camera_indices = point_estimates.camera_indices[keep_mask]
+    point_ids_arr = point_estimates.point_ids[keep_mask]
+    img_points = point_estimates.img_points[keep_mask]
+    old_obj_indices = point_estimates.obj_indices[keep_mask]
+
+    # Ensure every 3D point still has >= 2 observations
+    unique_obj, counts = np.unique(old_obj_indices, return_counts=True)
+    valid_obj = set(unique_obj[counts >= 2].tolist())
+
+    obs_valid = np.array([idx in valid_obj for idx in old_obj_indices])
+    sync_indices = sync_indices[obs_valid]
+    camera_indices = camera_indices[obs_valid]
+    point_ids_arr = point_ids_arr[obs_valid]
+    img_points = img_points[obs_valid]
+    old_obj_indices = old_obj_indices[obs_valid]
+
+    if len(sync_indices) == 0:
+        return point_estimates  # filtering removed everything, bail out
+
+    # Remap obj_indices to be contiguous
+    kept_obj_ids = np.unique(old_obj_indices)
+    old_to_new = {old: new for new, old in enumerate(kept_obj_ids)}
+    new_obj_indices = np.array([old_to_new[idx] for idx in old_obj_indices], dtype=np.int32)
+    new_obj_points = point_estimates.obj_points[kept_obj_ids]
+
+    return PointEstimates(
+        sync_indices=sync_indices,
+        camera_indices=camera_indices,
+        point_ids=point_ids_arr,
+        img_points=img_points,
+        obj_indices=new_obj_indices,
+        obj_points=new_obj_points,
+    )
 
 
 def compute_reprojection_rmse(
@@ -728,14 +989,53 @@ def run_extrinsic_from_videos(
 
     report(0.6, f"  {point_estimates.n_obj_points} 3D points, {point_estimates.n_img_points} observations")
 
-    # Step 5: Bundle adjustment
-    report(0.6, "Step 5: Running bundle adjustment...")
+    # Step 5: Bundle adjustment with outlier rejection
+    report(0.6, "Step 5: Running bundle adjustment (initial)...")
 
     refined_cameras, refined_points, rmse = run_bundle_adjustment(
         cameras, point_estimates
     )
 
-    report(1.0, f"  Bundle adjustment complete. RMSE: {rmse:.4f}")
+    report(0.7, f"  Initial bundle adjustment RMSE: {rmse:.4f} px")
+    report(0.7, f"    {refined_points.n_obj_points} 3D points, {refined_points.n_img_points} observations")
+
+    # Step 6: Outlier rejection + re-optimization
+    report(0.7, "Step 6: Filtering outliers and re-optimizing...")
+
+    OUTLIER_FRACTION = 0.025  # remove worst 2.5% per round
+    OUTLIER_ROUNDS = 2        # initial + filtered (matching caliscope)
+
+    for round_i in range(OUTLIER_ROUNDS):
+        prev_n_obs = refined_points.n_img_points
+        prev_n_pts = refined_points.n_obj_points
+
+        filtered_points = filter_point_estimates(
+            refined_cameras, refined_points, OUTLIER_FRACTION
+        )
+
+        removed_obs = prev_n_obs - filtered_points.n_img_points
+        removed_pts = prev_n_pts - filtered_points.n_obj_points
+        report(
+            0.75 + 0.1 * round_i,
+            f"  Round {round_i + 1}: removed {removed_obs} observations, "
+            f"{removed_pts} 3D points ({OUTLIER_FRACTION * 100:.1f}% cutoff)",
+        )
+
+        if filtered_points.n_img_points == prev_n_obs:
+            report(0.75 + 0.1 * round_i, "  No outliers removed, skipping re-optimization")
+            break
+
+        refined_cameras, refined_points, rmse = run_bundle_adjustment(
+            refined_cameras, filtered_points
+        )
+
+        report(
+            0.8 + 0.1 * round_i,
+            f"  Round {round_i + 1} RMSE: {rmse:.4f} px "
+            f"({refined_points.n_obj_points} pts, {refined_points.n_img_points} obs)",
+        )
+
+    report(1.0, f"  Final RMSE: {rmse:.4f} px")
 
     return refined_cameras, rmse
 
