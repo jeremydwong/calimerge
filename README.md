@@ -4,12 +4,13 @@ Unified multi-camera motion capture: synchronized recording, calibration, and 3D
 
 > **Status:** Active development. Camera capture, calibration pipeline, and GPU pose tracking working on Windows and macOS.
 
-Note: this work is heavily-inspired by both Jon Matthis' Freemocap project, and Mac Prible's caliscope -= in fact so inspired by the latter that this name is an attempt to respect his efforts. 
+Note: this work is heavily-inspired by both Jon Matthis' Freemocap project, and Mac Prible's caliscope --'calimerge' is an attempt to respect his efforts. 
 
 the main goals of this work are:
 - a single app for simple use (and minimal collisions with file ownership)
 - multi person recording
 - support for cuda/mps rapid keypoint detection.
+- management of serial devices to avoid port-order sensitivity. One camera, one intrinsic, stored in a database. 
 ---
 
 ## Implementation Languages
@@ -648,7 +649,15 @@ See [CLAUDE.md](CLAUDE.md) for detailed design documentation including:
 BSD-2-Clause
 
 ## Todo
+
 <li>
+2026-03-19
+
+1- move this main interface into a 'configure' dialog from the menu. so, we might as well build a file menu now as well, and 'file' only options should be the 'new project'; 'open project folder'; and 'recent projects'. if there are files within, point that out to the user that we're opening an existing project.
+
+2- bake in 
+
+- 2 i not 
 2026-03-11
 - nickname ghost text should be empty, not 'A'
 - default exposure for non-exposure controlled cams should be -4

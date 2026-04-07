@@ -28,10 +28,14 @@ if errorlevel 1 (
 echo.
 dumpbin /exports calimerge.dll 2>nul | findstr "cm_"
 
-:: Test programs
+:: Test programs (linked against calimerge.dll)
 cl %CFLAGS% /Fe:test_enumerate.exe test_enumerate.c /link calimerge.lib
 cl %CFLAGS% /Fe:test_capture.exe test_capture.c /link calimerge.lib
 cl %CFLAGS% /Fe:test_multi.exe test_multi.c /link calimerge.lib
 cl %CFLAGS% /Fe:test_sync_log.exe test_sync_log.c /link calimerge.lib
+
+:: Standalone diagnostic tools (no dependency on calimerge.dll)
+cl %CFLAGS% /EHsc /Fe:test_usb_serials.exe test_usb_serials.cpp ^
+    /link mf.lib mfplat.lib mfuuid.lib ole32.lib setupapi.lib
 
 popd

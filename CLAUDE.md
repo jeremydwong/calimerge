@@ -115,6 +115,20 @@ cd src/native
 ./test_enumerate    # List cameras with serial numbers
 ./test_capture 0    # Single camera capture test (camera index)
 ./test_multi        # Multi-camera synchronized capture
+./test_usb_serials  # Check whether cameras have real USB iSerialNumbers
+```
+
+### Building a single .cpp file on Windows
+
+```bash
+cd src/native
+cmd //c "cl test_usb_serials.cpp /EHsc /link mf.lib mfplat.lib mfuuid.lib ole32.lib setupapi.lib"
+```
+
+Note: `cmd //c build_win32.bat` sets up the MSVC environment automatically.
+For one-off files, either run from a VS Developer Command Prompt, or use the bat:
+```bash
+cmd //c "build_win32.bat release && cl test_usb_serials.cpp /EHsc /link mf.lib mfplat.lib mfuuid.lib ole32.lib setupapi.lib"
 ```
 
 ---
