@@ -524,6 +524,162 @@ class ExtrinsicCalibrationWorker(QThread):
         self.running = False
 
 
+class _PersonTrack:
+    """Frame-to-frame 3D person track with COM-based identity persistence.
+
+    Each track has a stable ``track_id`` that survives brief detection
+    dropouts (up to ``grace_frames``).  Matching is done via 3D hip-COM
+    proximity between consecutive frames.
+    """
+
+    __slots__ = (
+        "track_id",
+        "last_com_3d",
+        "last_keypoints_3d",
+        "frames_since_seen",
+        "is_active",
+    )
+
+    def __init__(self, track_id: int, com_3d: "np.ndarray", keypoints_3d: list):
+        self.track_id = track_id
+        self.last_com_3d = com_3d            # (3,) hip midpoint
+        self.last_keypoints_3d = keypoints_3d  # list[np.ndarray | None], len 17
+        self.frames_since_seen: int = 0
+        self.is_active: bool = True
+
+    def update(self, com_3d: "np.ndarray", keypoints_3d: list):
+        self.last_com_3d = com_3d
+        self.last_keypoints_3d = keypoints_3d
+        self.frames_since_seen = 0
+
+    def increment_lost(self, grace_frames: int = 5):
+        self.frames_since_seen += 1
+        if self.frames_since_seen > grace_frames:
+            self.is_active = False
+
+
+class _PersonTracker:
+    """Manages a set of ``_PersonTrack`` instances across frames.
+
+    Responsibilities:
+    * Match new 3D detections to existing tracks via COM proximity.
+    * Hold last-known keypoints for tracks that temporarily lose detection.
+    * Cap the number of tracked persons at ``max_persons``.
+    * Determine which person is the "primary" subject (closest to the
+      calibrated origin, i.e. the person doing the exercise).
+    """
+
+    def __init__(self, max_persons: int = 2, grace_frames: int = 5,
+                 max_com_jump_m: float = 0.3):
+        self.max_persons = max_persons
+        self.grace_frames = grace_frames
+        self.max_com_jump_m = max_com_jump_m
+        self._tracks: list[_PersonTrack] = []
+        self._next_id: int = 0
+        # Index into _tracks of the person closest to origin
+        self.primary_track_id: int | None = None
+
+    # ── public API ────────────────────────────────────────────────────
+
+    def update(self, detections: list[tuple["np.ndarray", list]]):
+        """Accept this frame's detections and update tracks.
+
+        Parameters
+        ----------
+        detections : list of (com_3d, keypoints_3d)
+            Each entry is a detected person in the current frame.
+            ``com_3d`` is a (3,) hip midpoint, ``keypoints_3d`` is the
+            list of 17 keypoints (np.ndarray | None).
+        """
+        import numpy as np
+
+        active = [t for t in self._tracks if t.is_active]
+
+        if not active and not detections:
+            return
+
+        # ── Greedy assignment by COM distance ──
+        used_det: set[int] = set()
+        used_track: set[int] = set()
+
+        if active and detections:
+            # Build cost matrix
+            n_tracks = len(active)
+            n_dets = len(detections)
+            costs = np.full((n_tracks, n_dets), 1e9)
+            for ti, track in enumerate(active):
+                for di, (com, _kps) in enumerate(detections):
+                    costs[ti, di] = float(np.linalg.norm(track.last_com_3d - com))
+
+            # Greedy assign smallest cost first (fast enough for <=4 persons)
+            for _ in range(min(n_tracks, n_dets)):
+                idx = np.argmin(costs)
+                ti, di = divmod(int(idx), n_dets)
+                dist = costs[ti, di]
+                if dist > self.max_com_jump_m:
+                    break
+                active[ti].update(detections[di][0], detections[di][1])
+                used_track.add(ti)
+                used_det.add(di)
+                costs[ti, :] = 1e9
+                costs[:, di] = 1e9
+
+        # Increment lost counter for unmatched tracks
+        for ti, track in enumerate(active):
+            if ti not in used_track:
+                track.increment_lost(self.grace_frames)
+
+        # Create new tracks for unmatched detections (up to max_persons)
+        n_active = sum(1 for t in self._tracks if t.is_active)
+        for di, (com, kps) in enumerate(detections):
+            if di in used_det:
+                continue
+            if n_active >= self.max_persons:
+                break
+            new_track = _PersonTrack(self._next_id, com, kps)
+            self._next_id += 1
+            self._tracks.append(new_track)
+            n_active += 1
+
+        # Prune dead tracks
+        self._tracks = [t for t in self._tracks if t.is_active]
+
+        # Update primary person (closest to world origin)
+        self._update_primary()
+
+    def get_ordered_persons(self) -> tuple[list[list], int]:
+        """Return (persons_3d, primary_index).
+
+        ``persons_3d`` is a list of keypoint lists, ordered by stable
+        track ID.  ``primary_index`` is the index into that list of the
+        person closest to the calibrated origin.
+        """
+        ordered = sorted(self._tracks, key=lambda t: t.track_id)
+        persons = [t.last_keypoints_3d for t in ordered]
+        primary_idx = 0
+        for i, t in enumerate(ordered):
+            if t.track_id == self.primary_track_id:
+                primary_idx = i
+                break
+        return persons, primary_idx
+
+    def reset(self):
+        self._tracks.clear()
+        self._next_id = 0
+        self.primary_track_id = None
+
+    # ── internals ─────────────────────────────────────────────────────
+
+    def _update_primary(self):
+        import numpy as np
+        if not self._tracks:
+            self.primary_track_id = None
+            return
+        best_track = min(self._tracks,
+                         key=lambda t: float(np.linalg.norm(t.last_com_3d)))
+        self.primary_track_id = best_track.track_id
+
+
 class PoseDetectionWorker(QThread):
     """Live 2D pose detection on preview frames.
 
@@ -533,7 +689,7 @@ class PoseDetectionWorker(QThread):
 
     models_loaded = Signal()           # emitted once models are ready
     detection_ready = Signal(int, object)  # port, annotated BGR frame
-    keypoints_3d_ready = Signal(list)  # list[list[np.ndarray | None]] — one entry per person
+    keypoints_3d_ready = Signal(list, int)  # list[list[np.ndarray | None]], primary_person_index
     log_message = Signal(str)
     error = Signal(str)
 
@@ -557,7 +713,8 @@ class PoseDetectionWorker(QThread):
         (255, 140, 180),  # lavender
     ]
 
-    def __init__(self, device_name: str = "auto", cameras: dict | None = None):
+    def __init__(self, device_name: str = "auto", cameras: dict | None = None,
+                 max_persons: int = 2):
         super().__init__()
         self.device_name = device_name
         self.cameras = cameras  # dict[port, CalibratedCamera] or None
@@ -570,6 +727,13 @@ class PoseDetectionWorker(QThread):
         # Raw 2D keypoints per port for live triangulation
         # port -> list of (keypoints (17,2), scores (17,)) — one entry per detected person
         self._last_kps_per_port: dict[int, list[tuple["np.ndarray", "np.ndarray"]]] = {}
+
+        # Frame-to-frame person tracker (COM-based identity persistence)
+        self._person_tracker = _PersonTracker(
+            max_persons=max_persons,
+            grace_frames=5,
+            max_com_jump_m=0.3,
+        )
 
         # Frame queue: stores (port, frame_bgr). Only keep latest per port.
         import threading
@@ -801,8 +965,22 @@ class PoseDetectionWorker(QThread):
 
         return [g for g in groups if len(g) >= 2]
 
+    @staticmethod
+    def _com_3d_from_keypoints(kps_3d: list) -> "np.ndarray | None":
+        """Compute 3D hip midpoint from a triangulated keypoint list."""
+        import numpy as np
+        L_HIP, R_HIP = 11, 12
+        pts = []
+        for idx in (L_HIP, R_HIP):
+            if idx < len(kps_3d) and kps_3d[idx] is not None and not np.isnan(kps_3d[idx]).any():
+                pts.append(np.asarray(kps_3d[idx], dtype=float))
+        if not pts:
+            return None
+        return np.mean(pts, axis=0)
+
     def _triangulate_live(self):
-        """Triangulate 3D keypoints for all matched persons and emit the results."""
+        """Triangulate 3D keypoints for all matched persons, feed the
+        person tracker, and emit stable-ordered results."""
         try:
             import cv2
             import numpy as np
@@ -840,7 +1018,7 @@ class PoseDetectionWorker(QThread):
             )
 
             # Triangulate full 17 keypoints for each matched group
-            all_persons_3d = []
+            frame_detections: list[tuple[np.ndarray, list]] = []
             for group in groups:
                 kp_dict = {}
                 for port, person_idx in group.items():
@@ -849,10 +1027,16 @@ class PoseDetectionWorker(QThread):
                 kps_3d = triangulate_keypoints(
                     kp_dict, port_to_cam_index, camera_params, projection_matrices
                 )
-                all_persons_3d.append(kps_3d)
+                com = self._com_3d_from_keypoints(kps_3d)
+                if com is not None:
+                    frame_detections.append((com, kps_3d))
 
-            if all_persons_3d:
-                self.keypoints_3d_ready.emit(all_persons_3d)
+            # Feed into the person tracker for stable IDs + grace period
+            self._person_tracker.update(frame_detections)
+
+            persons_3d, primary_idx = self._person_tracker.get_ordered_persons()
+            if persons_3d:
+                self.keypoints_3d_ready.emit(persons_3d, primary_idx)
         except Exception:
             pass
 
