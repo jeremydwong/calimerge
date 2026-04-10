@@ -314,15 +314,9 @@ class WorkoutPage(QWidget):
         middle_layout.addWidget(self.results_group, stretch=1)
         bottom_splitter.addWidget(middle_pane)
 
-        # Right pane: deadspace (reserved)
-        right_pane = QWidget()
-        right_layout = QVBoxLayout(right_pane)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        right_placeholder = QLabel("(reserved)")
-        right_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        right_placeholder.setStyleSheet("color: #555; font-style: italic;")
-        right_layout.addWidget(right_placeholder)
-        bottom_splitter.addWidget(right_pane)
+        # Right pane: long-term workout progress graph
+        longterm_pane = self._build_longterm_graph_pane()
+        bottom_splitter.addWidget(longterm_pane)
 
         bottom_splitter.setStretchFactor(0, 1)
         bottom_splitter.setStretchFactor(1, 2)
@@ -595,6 +589,191 @@ class WorkoutPage(QWidget):
 
         self.threshold_spin.blockSignals(False)
         self.threshold_line.blockSignals(False)
+
+    def _build_longterm_graph_pane(self) -> QWidget:
+        """Build the right-pane long-term workout progress graph."""
+        import pyqtgraph as pg
+
+        pane = QGroupBox("Long-term Progress")
+        layout = QVBoxLayout(pane)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(2)
+
+        self.longterm_summary = QLabel("Select an exercise to view progress")
+        self.longterm_summary.setStyleSheet("color: #888; font-size: 11px;")
+        self.longterm_summary.setWordWrap(True)
+        layout.addWidget(self.longterm_summary)
+
+        self.longterm_plot = pg.PlotWidget()
+        self.longterm_plot.setLabel("left", "Work (J)")
+        self.longterm_plot.setLabel("bottom", "Day")
+        self.longterm_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.longterm_plot.setMinimumHeight(100)
+
+        self._longterm_week_regions: list = []
+
+        self.longterm_scatter = pg.ScatterPlotItem(
+            size=8, brush=pg.mkBrush("#42A5F5"),
+            pen=pg.mkPen(color="#000", width=1),
+        )
+        self.longterm_plot.addItem(self.longterm_scatter)
+
+        self.longterm_daily_trace = self.longterm_plot.plot(
+            pen=pg.mkPen(color="#4CAF50", width=2),
+        )
+
+        self.longterm_target_trace = self.longterm_plot.plot(
+            pen=pg.mkPen(color="#FFC107", width=1, style=Qt.PenStyle.DashLine),
+        )
+
+        layout.addWidget(self.longterm_plot, stretch=1)
+        return pane
+
+    def _refresh_longterm_graph(self):
+        """Reload and redraw the long-term progress graph for the current exercise."""
+        import pyqtgraph as pg
+
+        for region in self._longterm_week_regions:
+            self.longterm_plot.removeItem(region)
+        self._longterm_week_regions.clear()
+        self.longterm_scatter.clear()
+        self.longterm_daily_trace.clear()
+        self.longterm_target_trace.clear()
+
+        if self._current_user_id is None or self._current_program_exercise is None:
+            self.longterm_summary.setText("Select an exercise to view progress")
+            return
+
+        exercise = self._current_program_exercise
+        workout_type = exercise["workout_type"]
+        program_exercise_id = exercise["id"]
+        sets_per_week_target = exercise.get("sets_per_day", 3) * exercise.get("days_per_week", 3)
+
+        try:
+            from ..workout_types import WORKOUT_TYPES
+            wt_def = WORKOUT_TYPES.get(workout_type)
+        except Exception:
+            wt_def = None
+
+        # Try work_per_rep_joules first, fall back to rep_count
+        metric_name = "work_per_rep_joules"
+        y_label = "Work (J)"
+        points = self._load_longterm_points(program_exercise_id, metric_name)
+        if not points:
+            metric_name = "rep_count"
+            y_label = "Repetitions"
+            if wt_def and hasattr(wt_def, "primary_metric"):
+                metric_name = wt_def.primary_metric
+                y_label = getattr(wt_def, "primary_metric_label", "Value")
+            points = self._load_longterm_points(program_exercise_id, metric_name)
+
+        self.longterm_plot.setLabel("left", y_label)
+
+        if not points:
+            self.longterm_summary.setText(
+                f"No sessions recorded for {exercise['display_name']} yet."
+            )
+            return
+
+        from datetime import datetime, timedelta
+        program_start = self._get_program_start_dt()
+        day_origin = program_start if program_start else points[0][0]
+
+        xs = [(dt - day_origin).total_seconds() / 86400.0 for dt, val in points]
+        ys = [val for _, val in points]
+
+        self.longterm_scatter.setData(x=xs, y=ys)
+
+        by_day: dict[int, float] = {}
+        for x, y in zip(xs, ys):
+            day = int(x)
+            if day not in by_day or y > by_day[day]:
+                by_day[day] = y
+        if by_day:
+            days_sorted = sorted(by_day.keys())
+            bests = [by_day[d] for d in days_sorted]
+            self.longterm_daily_trace.setData(days_sorted, bests)
+
+        # Week shading
+        session_dates = [dt for dt, _ in points]
+        total_days = max(1, int(max(xs)) + 7)
+
+        for week_idx in range(total_days // 7 + 1):
+            week_start_day = week_idx * 7
+            week_end_day = week_start_day + 7
+            sessions_in_week = sum(
+                1 for x in xs if week_start_day <= x < week_end_day
+            )
+            met_target = sessions_in_week >= sets_per_week_target
+            color = pg.mkBrush(80, 200, 120, 30) if met_target else pg.mkBrush(100, 100, 100, 15)
+            region = pg.LinearRegionItem(
+                values=(week_start_day, week_end_day),
+                orientation="vertical",
+                movable=False,
+                brush=color,
+                pen=pg.mkPen(None),
+            )
+            region.setZValue(-10)
+            self.longterm_plot.addItem(region)
+            self._longterm_week_regions.append(region)
+
+        # Target improvement line
+        improvement = getattr(wt_def, "weekly_improvement_factor", 1.02) if wt_def else 1.02
+        if ys and improvement != 1.0:
+            first_week_vals = [y for x, y in zip(xs, ys) if x < 7]
+            baseline = float(np.mean(first_week_vals)) if first_week_vals else ys[0]
+            max_day = int(max(xs)) + 7
+            target_days = list(range(0, max_day + 1, 7))
+            target_vals = [baseline * (improvement ** (d / 7.0)) for d in target_days]
+            self.longterm_target_trace.setData(target_days, target_vals)
+
+        peak = max(ys)
+        self.longterm_summary.setText(
+            f"{exercise['display_name']}: {len(points)} sessions, peak {peak:.1f}"
+        )
+
+    def _load_longterm_points(self, program_exercise_id: int,
+                               metric_name: str) -> list[tuple]:
+        """Load (datetime, metric_value) pairs for the given exercise + metric."""
+        from datetime import datetime
+        from ..config import DEFAULT_WORKOUTS_DB
+        import sqlite3
+        try:
+            conn = sqlite3.connect(str(DEFAULT_WORKOUTS_DB))
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT s.created_at, r.metric_value "
+                "FROM sessions s "
+                "JOIN session_results r ON r.session_id = s.id "
+                "WHERE s.user_id = ? AND s.program_exercise_id = ? "
+                "  AND r.metric_name = ? "
+                "ORDER BY s.created_at",
+                (self._current_user_id, program_exercise_id, metric_name),
+            ).fetchall()
+            conn.close()
+        except Exception:
+            return []
+
+        out = []
+        for r in rows:
+            try:
+                ts = datetime.fromisoformat(str(r["created_at"]).replace(" ", "T"))
+                out.append((ts, float(r["metric_value"])))
+            except Exception:
+                continue
+        return out
+
+    def _get_program_start_dt(self):
+        from datetime import datetime
+        from ..config import get_user_by_id
+        try:
+            user = get_user_by_id(self._current_user_id)
+            started = user.get("program_started_at") if user else None
+            if started:
+                return datetime.fromisoformat(str(started).replace(" ", "T"))
+        except Exception:
+            pass
+        return None
 
     def _on_threshold_changed(self, value: float):
         """Seated threshold spin box changed — update the line and reanalyse."""
@@ -1083,6 +1262,7 @@ class WorkoutPage(QWidget):
     def _on_plan_exercise_selected(self, exercise: dict):
         """User clicked an exercise in the Today's Plan widget."""
         self._apply_program_exercise(exercise)
+        self._refresh_longterm_graph()
 
     def _apply_program_exercise(self, exercise: dict):
         """Switch the workout page over to the given program exercise."""
@@ -1920,6 +2100,7 @@ class WorkoutPage(QWidget):
         # Refresh the Today's Plan counts and button label
         self._refresh_todays_plan()
         self._update_record_button_label()
+        self._refresh_longterm_graph()
 
         # Run analysis on collected keypoints
         self._run_workout_analysis(session_id)
