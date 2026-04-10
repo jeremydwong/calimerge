@@ -768,6 +768,8 @@ def init_workouts_db(db_path: Path = DEFAULT_WORKOUTS_DB) -> None:
         conn.execute("ALTER TABLE sessions ADD COLUMN program_exercise_id INTEGER")
     if "set_number" not in session_cols:
         conn.execute("ALTER TABLE sessions ADD COLUMN set_number INTEGER")
+    if "model_version" not in session_cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN model_version TEXT")
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS session_results (
