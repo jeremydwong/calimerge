@@ -850,7 +850,7 @@ extern "C" int pt_pipeline_run(PT_Pipeline *p) {
     pipeline_log(p, "Building VitPose engine (max_batch=%d)...", vitpose_max_batch);
     memset(&p->vitpose_engine, 0, sizeof(PT_TrtEngine));
     rc = pt_trt_build_engine(&p->vitpose_engine, p->config.vitpose_onnx_path,
-                              p->config.engine_cache_dir, vitpose_max_batch, 0);
+                              p->config.engine_cache_dir, vitpose_max_batch, 1);
     if (rc != PT_OK) {
         fprintf(stderr, "[pt_pipeline] VitPose engine build failed (error %d)\n", rc);
         return rc;

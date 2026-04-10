@@ -4,13 +4,61 @@ Unified multi-camera motion capture: synchronized recording, calibration, and 3D
 
 > **Status:** Active development. Camera capture, calibration pipeline, and GPU pose tracking working on Windows and macOS.
 
-Note: this work is heavily-inspired by both Jon Matthis' Freemocap project, and Mac Prible's caliscope --'calimerge' is an attempt to respect his efforts. 
+### Acknowledgements
 
-the main goals of this work are:
-- a single app for simple use (and minimal collisions with file ownership)
-- multi person recording
-- support for cuda/mps rapid keypoint detection.
-- management of serial devices to avoid port-order sensitivity. One camera, one intrinsic, stored in a database. 
+This project is inspired by and builds on the work of:
+- **Jon Matthis** and the [FreeMoCap](https://github.com/freemocap/freemocap) project
+- **Mac Prible** and [Caliscope](https://github.com/mprib/caliscope) — the name "calimerge" is an attempt to respect his efforts
+
+### Goals
+
+- A single app for simple use (minimal collisions with file ownership)
+- Multi-person recording and tracking
+- CUDA/MPS-accelerated keypoint detection
+- Serial-number-based camera management (one camera = one intrinsic, stored in a database, independent of USB port order)
+
+---
+
+## Dependencies
+
+### Required (all platforms)
+
+| Dependency | Version | Purpose |
+|------------|---------|---------|
+| [Python](https://www.python.org/) | 3.10 - 3.12 | Runtime |
+| [uv](https://astral.sh/uv) | latest | Python package manager (replaces pip/Poetry) |
+| [NumPy](https://numpy.org/) | >= 1.24 | Array math |
+| [OpenCV](https://opencv.org/) (Python) | >= 4.8 | Calibration, video I/O, image processing |
+| [PySide6](https://doc.qt.io/qtforpython/) | >= 6.6 | GUI framework |
+| [SciPy](https://scipy.org/) | >= 1.11 | Bundle adjustment optimization |
+| [Numba](https://numba.pydata.org/) | >= 0.59 | JIT-compiled triangulation |
+| [rtoml](https://github.com/samuelcolvin/rtoml) | >= 0.10 | TOML config files |
+| [PyTorch](https://pytorch.org/) | >= 2.0 | Neural network inference (CPU or CUDA) |
+| [Transformers](https://huggingface.co/docs/transformers) | >= 4.36 | VitPose model loading |
+| [Ultralytics](https://docs.ultralytics.com/) | >= 8.0 | YOLO person detection |
+
+### Required for native camera capture
+
+| Dependency | Platform | Purpose |
+|------------|----------|---------|
+| [MSVC Build Tools 2022](https://visualstudio.microsoft.com/visual-cpp-build-tools/) | Windows | Compile `calimerge.dll` (Media Foundation backend) |
+| Xcode Command Line Tools | macOS | Compile `libcalimerge.dylib` (AVFoundation backend) |
+
+### Optional (GPU-accelerated pose tracking)
+
+The CUDA pipeline (`src/cuda_pipeline/`) provides ~15x faster 3D pose tracking. Without it, the Python pipeline (PyTorch + Transformers) is used instead.
+
+| Dependency | Version | Purpose |
+|------------|---------|---------|
+| NVIDIA GPU | Compute >= 7.0 | Hardware requirement |
+| [CUDA Toolkit](https://developer.nvidia.com/cuda-toolkit) | 12.x | GPU compute runtime |
+| [TensorRT](https://developer.nvidia.com/tensorrt) | 10.x | Optimized neural network inference |
+| [OpenCV](https://opencv.org/) (C++) | 4.x | CPU video decode fallback for batch pipeline |
+
+### What works without a GPU?
+
+The GUI, camera capture, recording, and calibration all work on CPU — no GPU required. The Python pose tracking pipeline (PyTorch on CPU) works but is significantly slower (~10x). The CUDA pipeline is optional and only needed for real-time or high-throughput pose estimation.
+
 ---
 
 ## Implementation Languages
@@ -161,14 +209,18 @@ Prerequisites: [uv](https://astral.sh/uv), [Visual Studio Build Tools 2022](http
 
 ---
 
-## GUI Tabs
+## GUI Layout
 
-| Tab | Name | Purpose |
-|-----|------|---------|
-| 1 | Record | Camera detection, live preview, settings (resolution/FPS/exposure), FPS graph, synchronized recording |
-| 2 | Intrinsic | Per-camera lens calibration from ChArUco board videos |
-| 3 | Extrinsic | Multi-camera spatial calibration via bundle adjustment |
-| 4 | Process | 2D tracking + triangulation → 3D export |
+The default landing page is the **Workout Page** — user login, camera initialization, workout recording, and analysis results. Calibration tools are under `Tools → Calibration`.
+
+| Location | Name | Purpose |
+|----------|------|---------|
+| Main page | Workout | User login, camera preview, workout recording + analysis |
+| File menu | Workout Directory | Set the working directory for recordings and calibrations |
+| Tools → Calibration | 1. Record | Camera detection, live preview, settings, synchronized recording |
+| Tools → Calibration | 2. Intrinsic | Per-camera lens calibration from ChArUco board videos |
+| Tools → Calibration | 3. Extrinsic | Multi-camera spatial calibration via bundle adjustment |
+| Tools → Calibration | 4. Process | 2D tracking + triangulation → 3D export |
 
 ## ChArUco Board Configuration
 
@@ -655,7 +707,7 @@ BSD-2-Clause
 
 1- move this main interface into a 'configure' dialog from the menu. so, we might as well build a file menu now as well, and 'file' only options should be the 'new project'; 'open project folder'; and 'recent projects'. if there are files within, point that out to the user that we're opening an existing project.
 
-2- bake in 
+2- the main interface should be converted into an interface reflecting the task that you wish to analyze. the idea is that you can record 
 
 - 2 i not 
 2026-03-11

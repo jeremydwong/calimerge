@@ -22,6 +22,7 @@ dependencies = [
     "pandas>=2.0.0",
     "onnxscript>=0.6.2",
     "matplotlib>=3.7.0",
+    "pyqtgraph>=0.13.0",
 ]
 
 [project.optional-dependencies]

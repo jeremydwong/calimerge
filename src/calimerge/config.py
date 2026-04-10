@@ -721,3 +721,437 @@ def _deep_merge(base: dict, override: dict) -> None:
             _deep_merge(base[k], v)
         else:
             base[k] = v
+
+
+# ============================================================================
+# Workouts Database  (~/.calimerge/workouts.db)
+# ============================================================================
+
+DEFAULT_WORKOUTS_DB = Path.home() / ".calimerge" / "workouts.db"
+
+
+def init_workouts_db(db_path: Path = DEFAULT_WORKOUTS_DB) -> None:
+    """Create workouts database and tables if they don't exist."""
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            mass_kg REAL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    # Migration: add program tracking columns to users
+    user_cols = [row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()]
+    if "active_program_id" not in user_cols:
+        conn.execute("ALTER TABLE users ADD COLUMN active_program_id INTEGER")
+    if "program_started_at" not in user_cols:
+        conn.execute("ALTER TABLE users ADD COLUMN program_started_at TIMESTAMP")
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL REFERENCES users(id),
+            workout_type TEXT NOT NULL,
+            duration_seconds REAL,
+            recording_path TEXT,
+            calibration_path TEXT,
+            config_blob BLOB,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    session_cols = [row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()]
+    if "config_blob" not in session_cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN config_blob BLOB")
+    if "program_exercise_id" not in session_cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN program_exercise_id INTEGER")
+    if "set_number" not in session_cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN set_number INTEGER")
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS session_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id INTEGER NOT NULL REFERENCES sessions(id),
+            metric_name TEXT NOT NULL,
+            metric_value REAL,
+            metadata TEXT
+        )
+    """)
+
+    # Program templates + their exercises
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS programs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL,
+            display_name TEXT NOT NULL,
+            description TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS program_exercises (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            program_id INTEGER NOT NULL REFERENCES programs(id),
+            workout_type TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            sets_per_day INTEGER NOT NULL,
+            target_reps INTEGER,
+            target_duration_seconds REAL,
+            days_per_week INTEGER NOT NULL,
+            suggested_days TEXT,
+            break_seconds INTEGER DEFAULT 60,
+            order_index INTEGER DEFAULT 0
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+    # Seed default program templates (idempotent)
+    _seed_default_programs(db_path)
+
+
+def _seed_default_programs(db_path: Path = DEFAULT_WORKOUTS_DB) -> None:
+    """Insert the default Vivifrail and Calisthenics programs if they don't exist."""
+    from .programs import DEFAULT_PROGRAMS
+
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+
+    for prog in DEFAULT_PROGRAMS:
+        existing = conn.execute(
+            "SELECT id FROM programs WHERE name = ?", (prog["name"],)
+        ).fetchone()
+        if existing:
+            continue  # already seeded
+
+        cur = conn.execute(
+            "INSERT INTO programs (name, display_name, description) VALUES (?, ?, ?)",
+            (prog["name"], prog["display_name"], prog.get("description", "")),
+        )
+        program_id = cur.lastrowid
+
+        for ex in prog.get("exercises", []):
+            conn.execute(
+                "INSERT INTO program_exercises "
+                "(program_id, workout_type, display_name, sets_per_day, "
+                " target_reps, target_duration_seconds, days_per_week, "
+                " suggested_days, break_seconds, order_index) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    program_id,
+                    ex["workout_type"],
+                    ex["display_name"],
+                    int(ex["sets_per_day"]),
+                    ex.get("target_reps"),
+                    ex.get("target_duration_seconds"),
+                    int(ex["days_per_week"]),
+                    ex.get("suggested_days"),
+                    int(ex.get("break_seconds", 60)),
+                    int(ex.get("order_index", 0)),
+                ),
+            )
+
+    conn.commit()
+    conn.close()
+
+
+# ─── Config blob serialization ───
+# Format (little-endian):
+#   header: int32 magic (0x43414C49 'CALI'), int32 version (1), int32 num_cameras
+#   per camera:
+#     int32 port
+#     uint8 serial_len, serial bytes
+#     uint8 workout_type_len — (unused, reserved for future)
+#     int32 width, int32 height
+#     9 × float64 camera matrix (3x3 row-major)
+#     5 × float64 distortion coefficients
+#     9 × float64 rotation matrix (3x3 row-major)
+#     3 × float64 translation vector
+
+_CONFIG_BLOB_MAGIC = 0x43414C49  # 'CALI'
+_CONFIG_BLOB_VERSION = 1
+
+
+def pack_session_config(calibrated_cameras: dict) -> bytes:
+    """
+    Pack a dict[port, CalibratedCamera] into a compact binary blob.
+
+    Parameters
+    ----------
+    calibrated_cameras : dict[int, CalibratedCamera]
+        Keyed by port, each with intrinsics + extrinsics.
+
+    Returns
+    -------
+    bytes suitable for storing in a BLOB column.
+    """
+    import struct
+
+    parts = []
+    parts.append(struct.pack("<iii", _CONFIG_BLOB_MAGIC, _CONFIG_BLOB_VERSION,
+                             len(calibrated_cameras)))
+
+    for port in sorted(calibrated_cameras.keys()):
+        cam = calibrated_cameras[port]
+        serial = cam.serial_number.encode("utf-8")
+        parts.append(struct.pack("<i", port))
+        parts.append(struct.pack("<B", len(serial)))
+        parts.append(serial)
+        parts.append(struct.pack("<B", 0))  # reserved (workout_type_len)
+
+        w, h = cam.intrinsics.resolution
+        parts.append(struct.pack("<ii", int(w), int(h)))
+
+        matrix = np.asarray(cam.intrinsics.matrix, dtype=np.float64).flatten()
+        parts.append(matrix.tobytes())
+
+        dist = np.asarray(cam.intrinsics.distortion, dtype=np.float64).flatten()
+        if dist.size < 5:
+            dist = np.concatenate([dist, np.zeros(5 - dist.size)])
+        parts.append(dist[:5].tobytes())
+
+        rotation = np.asarray(cam.extrinsics.rotation, dtype=np.float64).flatten()
+        parts.append(rotation.tobytes())
+
+        translation = np.asarray(cam.extrinsics.translation, dtype=np.float64).flatten()
+        parts.append(translation.tobytes())
+
+    return b"".join(parts)
+
+
+def unpack_session_config(blob: bytes) -> dict[int, dict]:
+    """
+    Unpack a config blob into a dict keyed by port.
+
+    Returns
+    -------
+    dict[int, dict] where each value has:
+        "serial_number": str
+        "resolution": (int, int)
+        "matrix": (3, 3) np.ndarray
+        "distortion": (5,) np.ndarray
+        "rotation": (3, 3) np.ndarray
+        "translation": (3,) np.ndarray
+    """
+    import struct
+
+    if not blob or len(blob) < 12:
+        return {}
+
+    offset = 0
+    magic, version, num_cameras = struct.unpack_from("<iii", blob, offset)
+    offset += 12
+
+    if magic != _CONFIG_BLOB_MAGIC or version != _CONFIG_BLOB_VERSION:
+        raise ValueError(f"Invalid config blob header: magic={magic:#x} version={version}")
+
+    result: dict[int, dict] = {}
+    for _ in range(num_cameras):
+        (port,) = struct.unpack_from("<i", blob, offset); offset += 4
+        (serial_len,) = struct.unpack_from("<B", blob, offset); offset += 1
+        serial = blob[offset:offset + serial_len].decode("utf-8"); offset += serial_len
+        (_reserved,) = struct.unpack_from("<B", blob, offset); offset += 1
+
+        width, height = struct.unpack_from("<ii", blob, offset); offset += 8
+
+        matrix = np.frombuffer(blob, dtype=np.float64, count=9, offset=offset).reshape(3, 3).copy()
+        offset += 9 * 8
+
+        distortion = np.frombuffer(blob, dtype=np.float64, count=5, offset=offset).copy()
+        offset += 5 * 8
+
+        rotation = np.frombuffer(blob, dtype=np.float64, count=9, offset=offset).reshape(3, 3).copy()
+        offset += 9 * 8
+
+        translation = np.frombuffer(blob, dtype=np.float64, count=3, offset=offset).copy()
+        offset += 3 * 8
+
+        result[port] = {
+            "serial_number": serial,
+            "resolution": (width, height),
+            "matrix": matrix,
+            "distortion": distortion,
+            "rotation": rotation,
+            "translation": translation,
+        }
+
+    return result
+
+
+def _workouts_conn(db_path: Path = DEFAULT_WORKOUTS_DB) -> sqlite3.Connection:
+    init_workouts_db(db_path)
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def create_user(username: str, mass_kg: float | None = None,
+                db_path: Path = DEFAULT_WORKOUTS_DB) -> dict:
+    conn = _workouts_conn(db_path)
+    conn.execute("INSERT INTO users (username, mass_kg) VALUES (?, ?)",
+                 (username, mass_kg))
+    conn.commit()
+    row = conn.execute("SELECT * FROM users WHERE username = ?",
+                       (username,)).fetchone()
+    conn.close()
+    return dict(row)
+
+
+def get_user(username: str, db_path: Path = DEFAULT_WORKOUTS_DB) -> dict | None:
+    conn = _workouts_conn(db_path)
+    row = conn.execute("SELECT * FROM users WHERE username = ?",
+                       (username,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def list_users(db_path: Path = DEFAULT_WORKOUTS_DB) -> list[dict]:
+    conn = _workouts_conn(db_path)
+    rows = conn.execute("SELECT * FROM users ORDER BY username").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def update_user_mass(user_id: int, mass_kg: float,
+                     db_path: Path = DEFAULT_WORKOUTS_DB) -> None:
+    conn = _workouts_conn(db_path)
+    conn.execute("UPDATE users SET mass_kg = ? WHERE id = ?", (mass_kg, user_id))
+    conn.commit()
+    conn.close()
+
+
+def create_session(user_id: int, workout_type: str,
+                   duration_seconds: float | None = None,
+                   recording_path: str | None = None,
+                   calibration_path: str | None = None,
+                   config_blob: bytes | None = None,
+                   program_exercise_id: int | None = None,
+                   set_number: int | None = None,
+                   db_path: Path = DEFAULT_WORKOUTS_DB) -> int:
+    conn = _workouts_conn(db_path)
+    cur = conn.execute(
+        "INSERT INTO sessions (user_id, workout_type, duration_seconds, "
+        "recording_path, calibration_path, config_blob, "
+        "program_exercise_id, set_number) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (user_id, workout_type, duration_seconds, recording_path, calibration_path,
+         config_blob, program_exercise_id, set_number))
+    conn.commit()
+    session_id = cur.lastrowid
+    conn.close()
+    return session_id
+
+
+def get_session_config(session_id: int,
+                       db_path: Path = DEFAULT_WORKOUTS_DB) -> dict[int, dict] | None:
+    """Load and unpack the config blob for a session."""
+    conn = _workouts_conn(db_path)
+    row = conn.execute(
+        "SELECT config_blob FROM sessions WHERE id = ?", (session_id,)
+    ).fetchone()
+    conn.close()
+    if row is None or row["config_blob"] is None:
+        return None
+    try:
+        return unpack_session_config(row["config_blob"])
+    except Exception:
+        return None
+
+
+def get_sessions_for_user(user_id: int,
+                          db_path: Path = DEFAULT_WORKOUTS_DB) -> list[dict]:
+    conn = _workouts_conn(db_path)
+    rows = conn.execute(
+        "SELECT * FROM sessions WHERE user_id = ? ORDER BY created_at DESC",
+        (user_id,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def save_session_result(session_id: int, metric_name: str, metric_value: float,
+                        metadata: str | None = None,
+                        db_path: Path = DEFAULT_WORKOUTS_DB) -> None:
+    conn = _workouts_conn(db_path)
+    conn.execute(
+        "INSERT INTO session_results (session_id, metric_name, metric_value, metadata) "
+        "VALUES (?, ?, ?, ?)",
+        (session_id, metric_name, metric_value, metadata))
+    conn.commit()
+    conn.close()
+
+
+def delete_session_results(session_id: int,
+                           db_path: Path = DEFAULT_WORKOUTS_DB) -> None:
+    """Remove all stored metrics for a session. Used before re-analysis."""
+    conn = _workouts_conn(db_path)
+    conn.execute("DELETE FROM session_results WHERE session_id = ?", (session_id,))
+    conn.commit()
+    conn.close()
+
+
+# ─── Program CRUD ───
+
+def list_programs(db_path: Path = DEFAULT_WORKOUTS_DB) -> list[dict]:
+    """Return all known program templates."""
+    conn = _workouts_conn(db_path)
+    rows = conn.execute("SELECT * FROM programs ORDER BY id").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_program(program_id: int, db_path: Path = DEFAULT_WORKOUTS_DB) -> dict | None:
+    conn = _workouts_conn(db_path)
+    row = conn.execute("SELECT * FROM programs WHERE id = ?", (program_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_program_exercises(program_id: int,
+                          db_path: Path = DEFAULT_WORKOUTS_DB) -> list[dict]:
+    """Return all exercises in a program, ordered by order_index."""
+    conn = _workouts_conn(db_path)
+    rows = conn.execute(
+        "SELECT * FROM program_exercises WHERE program_id = ? "
+        "ORDER BY order_index, id",
+        (program_id,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def set_user_program(user_id: int, program_id: int | None,
+                     db_path: Path = DEFAULT_WORKOUTS_DB) -> None:
+    """Assign a program to a user. Updates program_started_at on change."""
+    from datetime import datetime
+    conn = _workouts_conn(db_path)
+    now = datetime.now().isoformat(sep=" ", timespec="seconds")
+    conn.execute(
+        "UPDATE users SET active_program_id = ?, program_started_at = ? WHERE id = ?",
+        (program_id, now, user_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_user_by_id(user_id: int, db_path: Path = DEFAULT_WORKOUTS_DB) -> dict | None:
+    conn = _workouts_conn(db_path)
+    row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def count_sets_since(user_id: int, program_exercise_id: int, since: str,
+                     db_path: Path = DEFAULT_WORKOUTS_DB) -> int:
+    """Count sessions for a given (user, program_exercise) since an ISO timestamp.
+
+    `since` is a string accepted by SQLite's comparison (ISO-formatted datetime).
+    """
+    conn = _workouts_conn(db_path)
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM sessions "
+        "WHERE user_id = ? AND program_exercise_id = ? AND created_at >= ?",
+        (user_id, program_exercise_id, since),
+    ).fetchone()
+    conn.close()
+    return int(row["n"]) if row else 0

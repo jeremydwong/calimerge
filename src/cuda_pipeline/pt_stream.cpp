@@ -228,7 +228,7 @@ extern "C" int pt_stream_create(PT_Stream **out, const PT_StreamConfig *config) 
     stream_log(s, "Building VitPose engine (max_batch=%d)...", vitpose_max_batch);
     memset(&s->vitpose_engine, 0, sizeof(PT_TrtEngine));
     rc = pt_trt_build_engine(&s->vitpose_engine, s->config.vitpose_onnx_path,
-                              s->config.engine_cache_dir, vitpose_max_batch, 0);
+                              s->config.engine_cache_dir, vitpose_max_batch, 1);
     if (rc != PT_OK) {
         fprintf(stderr, "[pt_stream] VitPose engine build failed (error %d)\n", rc);
         pt_trt_destroy_engine(&s->yolo_engine);

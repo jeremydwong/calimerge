@@ -378,9 +378,9 @@ class CamerasTab(QWidget):
         camera_layout = QVBoxLayout(camera_group)
 
         self.camera_table = QTableWidget()
-        self.camera_table.setColumnCount(7)
+        self.camera_table.setColumnCount(8)
         self.camera_table.setHorizontalHeaderLabels(
-            ["", "Port", "Nickname", "Name", "Resolution", "Exposure", "Enabled"]
+            ["", "Port", "Nickname", "Name", "Resolution", "Exposure", "Brightness", "Enabled"]
         )
         header = self.camera_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
@@ -395,7 +395,9 @@ class CamerasTab(QWidget):
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
         header.resizeSection(5, 80)  # Exposure
         header.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
-        header.resizeSection(6, 60)  # Enabled
+        header.resizeSection(6, 80)  # Brightness
+        header.setSectionResizeMode(7, QHeaderView.ResizeMode.Fixed)
+        header.resizeSection(7, 60)  # Enabled
         self.camera_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         camera_layout.addWidget(self.camera_table)
 
@@ -539,7 +541,10 @@ class CamerasTab(QWidget):
             exp_widget = self.camera_table.cellWidget(row, 5)
             if exp_widget and isinstance(exp_widget, QSpinBox):
                 entry["exposure"] = exp_widget.value()
-            en_widget = self.camera_table.cellWidget(row, 6)
+            bright_widget = self.camera_table.cellWidget(row, 6)
+            if bright_widget and isinstance(bright_widget, QSpinBox):
+                entry["brightness"] = bright_widget.value()
+            en_widget = self.camera_table.cellWidget(row, 7)
             if en_widget:
                 cb = en_widget.findChild(QCheckBox)
                 if cb:
@@ -632,17 +637,29 @@ class CamerasTab(QWidget):
             )
             self.camera_table.setCellWidget(row, 4, res_combo)
 
-            # Exposure spinbox
+            # Exposure spinbox (read-only — use Brightness instead)
             exposure_spin = QSpinBox()
             exposure_spin.setRange(-13, 0)
             serial_pref_exp = self._serial_prefs.get(info.serial_number, {}).get("exposure")
             prev_exp = prev.get("exposure", serial_pref_exp if serial_pref_exp is not None else info.exposure)
             exposure_spin.setValue(prev_exp)
-            exposure_spin.setToolTip("Exposure (log2 seconds, e.g. -4 = 1/16s)")
-            exposure_spin.valueChanged.connect(
-                lambda val, p=port: self._on_exposure_changed(p, val)
-            )
+            exposure_spin.setToolTip("Exposure (log2 seconds) — read-only, use Brightness to adjust")
+            exposure_spin.setReadOnly(True)
+            exposure_spin.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+            exposure_spin.setStyleSheet("QSpinBox { color: #888; background: #2a2a2a; }")
             self.camera_table.setCellWidget(row, 5, exposure_spin)
+
+            # Brightness spinbox
+            brightness_spin = QSpinBox()
+            brightness_spin.setRange(-13, 0)
+            serial_pref_bright = self._serial_prefs.get(info.serial_number, {}).get("brightness")
+            prev_bright = prev.get("brightness", serial_pref_bright if serial_pref_bright is not None else prev_exp)
+            brightness_spin.setValue(prev_bright)
+            brightness_spin.setToolTip("Brightness (-13 to 0, maps to camera brightness control)")
+            brightness_spin.valueChanged.connect(
+                lambda val, p=port: self._on_brightness_changed(p, val)
+            )
+            self.camera_table.setCellWidget(row, 6, brightness_spin)
 
             # Enabled checkbox
             checkbox = QCheckBox()
@@ -657,7 +674,7 @@ class CamerasTab(QWidget):
             checkbox_layout.addWidget(checkbox)
             checkbox_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
             checkbox_layout.setContentsMargins(0, 0, 0, 0)
-            self.camera_table.setCellWidget(row, 6, checkbox_widget)
+            self.camera_table.setCellWidget(row, 7, checkbox_widget)
 
         self._updating_table = False
 
@@ -740,6 +757,22 @@ class CamerasTab(QWidget):
         else:
             self.status_message.emit(f"Port {port}: exposure set to {value} (will apply on preview)")
 
+    def _on_brightness_changed(self, port: int, value: int):
+        if self._updating_table:
+            return
+
+        cameras = self.state_manager.state.cameras
+        cam_state = cameras.get(port)
+        if cam_state and cam_state.is_open:
+            try:
+                from ...camera_binding import set_exposure
+                set_exposure(cam_state.info, value)
+                self.status_message.emit(f"Port {port}: brightness set to {value}")
+            except Exception as e:
+                self.status_message.emit(f"Port {port}: brightness change failed: {e}")
+        else:
+            self.status_message.emit(f"Port {port}: brightness set to {value} (will apply on preview)")
+
     # ── Project settings ──
 
     def apply_project_settings(self, settings: dict) -> None:
@@ -777,7 +810,7 @@ class CamerasTab(QWidget):
                 res = res_widget.currentData()
                 if res:
                     entry["resolution"] = list(res)
-            en_widget = self.camera_table.cellWidget(row, 6)
+            en_widget = self.camera_table.cellWidget(row, 7)
             if en_widget:
                 cb = en_widget.findChild(QCheckBox)
                 if cb:
@@ -785,6 +818,9 @@ class CamerasTab(QWidget):
             exp_widget = self.camera_table.cellWidget(row, 5)
             if exp_widget and isinstance(exp_widget, QSpinBox):
                 entry["exposure"] = exp_widget.value()
+            bright_widget = self.camera_table.cellWidget(row, 6)
+            if bright_widget and isinstance(bright_widget, QSpinBox):
+                entry["brightness"] = bright_widget.value()
             cameras_section[serial] = entry  # overwrite with live table values
 
         return {
@@ -840,12 +876,22 @@ class CamerasTab(QWidget):
                     return exp_widget.value()
         return -4
 
+    def _get_brightness_for_port(self, port: int) -> int:
+        """Get selected brightness from table for a port."""
+        cameras = self.state_manager.state.cameras
+        for row, (p, _) in enumerate(sorted(cameras.items())):
+            if p == port:
+                bright_widget = self.camera_table.cellWidget(row, 6)
+                if bright_widget and isinstance(bright_widget, QSpinBox):
+                    return bright_widget.value()
+        return -4
+
     def _is_camera_enabled_in_table(self, port: int) -> bool:
         """Read enabled state directly from the table checkbox widget."""
         cameras = self.state_manager.state.cameras
         for row, (p, _) in enumerate(sorted(cameras.items())):
             if p == port:
-                en_widget = self.camera_table.cellWidget(row, 6)
+                en_widget = self.camera_table.cellWidget(row, 7)
                 if en_widget:
                     cb = en_widget.findChild(QCheckBox)
                     if cb:
@@ -886,10 +932,10 @@ class CamerasTab(QWidget):
             except Exception as e:
                 self.status_message.emit(f"Port {port}: resolution failed: {e}")
             try:
-                exposure = self._get_exposure_for_port(port)
-                set_exposure(cam, exposure)
+                brightness = self._get_brightness_for_port(port)
+                set_exposure(cam, brightness)
             except Exception as e:
-                self.status_message.emit(f"Port {port}: exposure failed: {e}")
+                self.status_message.emit(f"Port {port}: brightness failed: {e}")
 
         # Batch-update state (triggers one table rebuild, which preserves settings)
         if opened_ports:
@@ -1399,6 +1445,7 @@ class CamerasTab(QWidget):
         self._view_has_origin = True
         self.skeleton_view.set_view_transform(T, has_origin=True)
         self._save_view_transform(T, has_origin=True)
+        self._save_body_transform(R, l_ankle)
         self.zero_origin_button.setEnabled(True)
 
     def _save_view_transform(self, T: np.ndarray, has_origin: bool = False):
@@ -1414,6 +1461,31 @@ class CamerasTab(QWidget):
             data["live_view"] = {
                 "transform": T.flatten().tolist(),
                 "has_origin": has_origin,
+            }
+            with open(rig_path, "w") as f:
+                rtoml.dump(data, f)
+        except Exception:
+            pass
+
+    def _save_body_transform(self, R: np.ndarray, origin: np.ndarray):
+        """Save the world-to-body transform (rotation + origin) to camera_rig.toml.
+
+        This records the coordinate frame where L_Ankle is at origin with
+        anatomically meaningful axes, so recorded poses can be expressed
+        in body-centred coordinates.
+        """
+        try:
+            import rtoml
+            rig_path = self._get_camera_rig_path()
+            if rig_path is None:
+                return
+            data = {}
+            if rig_path.exists():
+                data = rtoml.load(rig_path)
+            data["body_transform"] = {
+                "rotation": R.flatten().tolist(),
+                "origin_world": origin.tolist(),
+                "description": "World-to-body transform: R rotates world axes to body axes, origin is L_Ankle in world coords",
             }
             with open(rig_path, "w") as f:
                 rtoml.dump(data, f)

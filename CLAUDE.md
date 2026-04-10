@@ -131,6 +131,38 @@ For one-off files, either run from a VS Developer Command Prompt, or use the bat
 cmd //c "build_win32.bat release && cl test_usb_serials.cpp /EHsc /link mf.lib mfplat.lib mfuuid.lib ole32.lib setupapi.lib"
 ```
 
+### CUDA Pipeline Profiling (Windows)
+
+Requires a **cmd.exe** window (not Git Bash, not PowerShell — Anaconda's conda hooks break DLL paths in bash).
+
+```cmd
+:: 1. Set up environment (from repo root)
+"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat" -arch=amd64
+set OPENCV_PATH=C:\OpenCV\opencv\build
+set PATH=C:\TensorRT\lib;C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9\bin;C:\OpenCV\opencv\build\x64\vc16\bin;%PATH%
+
+:: 2. Build CUDA pipeline with OpenCV support
+cd src\cuda_pipeline
+build_cuda_win32.bat release
+cd ..\..
+
+:: 3. Test run (verify it works before profiling)
+src\cuda_pipeline\pt_main.exe posetrack\tests\caliscope\coord_3x1_3 posetrack\tests\caliscope\coord_3x1_3\config.toml --yolo models\onnx\yolo_v10s.onnx --vitpose models\onnx\vitpose_base_coco.onnx 2>&1
+
+:: 4. Profile with Nsight Systems
+"C:\Program Files\NVIDIA Corporation\Nsight Systems 2025.5.2\target-windows-x64\nsys.exe" profile --trace=cuda,nvtx --output=profile_batch --force-overwrite=true src\cuda_pipeline\pt_main.exe posetrack\tests\caliscope\coord_3x1_3 posetrack\tests\caliscope\coord_3x1_3\config.toml --yolo models\onnx\yolo_v10s.onnx --vitpose models\onnx\vitpose_base_coco.onnx 2>&1
+
+:: 5. Open profile in GUI
+"C:\Program Files\NVIDIA Corporation\Nsight Systems 2025.5.2\host-windows-x64\nsys-ui.exe" profile_batch.nsys-rep
+```
+
+Notes:
+- First run after changing TensorRT precision flags will be slow (engine rebuild + cache)
+- `pt_main.exe` uses the batch pipeline (NVDEC or OpenCV CPU decode)
+- `pt_stream_main.exe` uses the streaming pipeline (requires OpenCV for test harness)
+- Nsys timeline view: width = duration, look for gaps between kernel bars (GPU idle time)
+- For per-kernel occupancy analysis, use Nsight Compute (`ncu`) instead of `nsys`
+
 ---
 
 ## Current Architecture
