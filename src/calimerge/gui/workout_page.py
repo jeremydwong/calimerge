@@ -58,6 +58,7 @@ class WorkoutPage(QWidget):
         self.recording_worker: RecordingWorker | None = None
         self._is_recording = False
         self._recording_keypoints: list[dict] = []  # collected during recording
+        self._primary_person_index: int = 0  # person closest to calibrated origin
         self.opened_cameras: list = []
         self.opened_ports: list[int] = []
         self._last_frame_time: dict[int, float] = {}
@@ -1400,10 +1401,15 @@ class WorkoutPage(QWidget):
         self.opened_ports = []
 
     def _on_frame_received(self, port: int, pixels):
-        self.camera_grid.update_frame(port, pixels)
-        # Feed to detection worker if running
+        # When detection is running and we already have an annotated frame,
+        # don't overwrite it with the raw frame — prevents flicker.
         if self.detection_worker is not None:
+            if port not in self._last_annotated:
+                # No annotated frame yet — show raw so the grid isn't blank
+                self.camera_grid.update_frame(port, pixels)
             self.detection_worker.submit_frame(port, pixels)
+        else:
+            self.camera_grid.update_frame(port, pixels)
 
     def _on_preview_error(self, error: str):
         self.status_message.emit(f"Preview error: {error}")
@@ -1460,7 +1466,7 @@ class WorkoutPage(QWidget):
         self.detect_checkbox.blockSignals(False)
         self._stop_detection()
 
-    def _on_keypoints_3d(self, persons: list):
+    def _on_keypoints_3d(self, persons: list, primary_index: int = 0):
         clean_persons = []
         for kps_3d in persons:
             clean = [
@@ -1474,12 +1480,16 @@ class WorkoutPage(QWidget):
         self.rotate_to_human_button.setEnabled(has_kps)
         self.zero_origin_button.setEnabled(has_kps)
 
+        # Track which person is primary (closest to calibrated origin)
+        self._primary_person_index = primary_index
+
         # Buffer keypoints during recording
         if self._is_recording and clean_persons:
             t = time.perf_counter() - self._recording_start_time
             self._recording_keypoints.append({
                 "time": t,
                 "persons": clean_persons,
+                "primary_index": primary_index,
             })
 
     # ── Rotate to Human ──
@@ -1860,7 +1870,10 @@ class WorkoutPage(QWidget):
             try:
                 from ..analysis.keypoints_io import save_keypoints_3d
                 kps_file = self._current_session_dir / "keypoints_3d.npz"
-                save_keypoints_3d(kps_file, self._recording_keypoints)
+                save_keypoints_3d(
+                    kps_file, self._recording_keypoints,
+                    primary_person_index=self._primary_person_index,
+                )
             except Exception as e:
                 self.status_message.emit(f"Failed to save keypoints: {e}")
                 kps_file = None
@@ -2144,12 +2157,17 @@ class WorkoutPage(QWidget):
         elbow_angles = []
         shoulder_z = []
         knee_z_max = []
+        # Determine which person is the primary subject (closest to origin).
+        # Use per-frame primary_index stored by the tracker; fall back to 0.
         for frame in self._recording_keypoints:
             t = frame["time"]
             persons = frame["persons"]
             if not persons:
                 continue
-            kps = persons[0]
+            p_idx = frame.get("primary_index", 0)
+            if p_idx >= len(persons):
+                p_idx = 0
+            kps = persons[p_idx]
             l_hip = kps[11] if len(kps) > 11 else None
             r_hip = kps[12] if len(kps) > 12 else None
             l_sho = kps[5]  if len(kps) > 5  else None
@@ -2210,8 +2228,8 @@ class WorkoutPage(QWidget):
                 head = np.array([np.nan, np.nan, np.nan])
                 head_z_val = float("nan")
 
-            # Elbow angle (biceps)
-            angle = average_elbow_angle(persons)
+            # Elbow angle (biceps) — pass primary person at index 0
+            angle = average_elbow_angle([kps])
 
             if (np.isnan(hip_val) and np.isnan(head).all()
                     and np.isnan(angle) and np.isnan(shoulder_val)):

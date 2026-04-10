@@ -30,6 +30,7 @@ def save_keypoints_3d(
     frames: list[dict],
     num_keypoints: int = DEFAULT_NUM_KEYPOINTS,
     max_persons: int = 4,
+    primary_person_index: int = 0,
 ) -> None:
     """
     Save a list of per-frame keypoint records to a .npz file.
@@ -43,10 +44,14 @@ def save_keypoints_3d(
             "time": float     — seconds since recording start
             "persons": list   — list of persons; each person is a list of
                                  (x, y, z) tuples or np.ndarray(3,) or None
+            "primary_index": int (optional) — per-frame primary person index
     num_keypoints : int
         Number of keypoints per person (default 17 for COCO).
     max_persons : int
         Maximum persons to store per frame. Extras are dropped.
+    primary_person_index : int
+        Index of the person closest to the calibrated origin (the exercise
+        subject).  Stored as a scalar in the npz for downstream analysis.
     """
     n_frames = len(frames)
     if n_frames == 0:
@@ -58,12 +63,14 @@ def save_keypoints_3d(
         np.nan, dtype=np.float32,
     )
     person_counts = np.zeros(n_frames, dtype=np.int32)
+    primary_indices = np.zeros(n_frames, dtype=np.int32)
 
     for i, frame in enumerate(frames):
         timestamps[i] = frame.get("time", 0.0)
         persons = frame.get("persons", [])
         n_persons = min(len(persons), max_persons)
         person_counts[i] = n_persons
+        primary_indices[i] = frame.get("primary_index", primary_person_index)
 
         for p_idx in range(n_persons):
             person = persons[p_idx]
@@ -86,6 +93,7 @@ def save_keypoints_3d(
         timestamps=timestamps,
         keypoints_3d=keypoints,
         person_count=person_counts,
+        primary_person_index=np.array(primary_indices, dtype=np.int32),
     )
 
 
@@ -95,14 +103,18 @@ def load_keypoints_3d(path: Path) -> dict:
 
     Returns
     -------
-    dict with keys: "timestamps", "keypoints_3d", "person_count"
+    dict with keys: "timestamps", "keypoints_3d", "person_count",
+    and optionally "primary_person_index".
     """
     data = np.load(path)
-    return {
+    result = {
         "timestamps": data["timestamps"],
         "keypoints_3d": data["keypoints_3d"],
         "person_count": data["person_count"],
     }
+    if "primary_person_index" in data:
+        result["primary_person_index"] = data["primary_person_index"]
+    return result
 
 
 def extract_hip_z_series(

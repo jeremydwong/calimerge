@@ -51,7 +51,7 @@ def analyze_pushup(
     shoulder_z: np.ndarray,
     timestamps: np.ndarray,
     top_threshold_m: float = 0.30,
-    smooth_window: int = 5,
+    smooth_window: int = 3,
     min_gap_frames: int = 10,
 ) -> PushupResult:
     """
