@@ -137,6 +137,7 @@ class WorkoutPage(QWidget):
         self.detect_model_combo.addItem("MediaPipe Hands", "mediapipe_hands")
         self.detect_model_combo.setToolTip("Detection model")
         self.detect_model_combo.setFixedWidth(130)
+        self.detect_model_combo.currentIndexChanged.connect(self._on_model_changed)
         user_layout.addWidget(self.detect_model_combo)
 
         self.detect_backend_combo = QComboBox()
@@ -149,6 +150,7 @@ class WorkoutPage(QWidget):
             pass
         self.detect_backend_combo.setToolTip("Backend: PyTorch or CUDA TensorRT")
         self.detect_backend_combo.setFixedWidth(130)
+        self.detect_backend_combo.currentIndexChanged.connect(self._on_model_changed)
         user_layout.addWidget(self.detect_backend_combo)
 
         user_layout.addStretch()
@@ -1642,6 +1644,12 @@ class WorkoutPage(QWidget):
             self._start_detection()
         else:
             self._stop_detection()
+
+    def _on_model_changed(self, _index: int = 0):
+        """Restart detection when the model or backend dropdown changes."""
+        if self.detection_worker is not None:
+            self._stop_detection()
+            self._start_detection()
 
     def _start_detection(self):
         if self.detection_worker is not None:
