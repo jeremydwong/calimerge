@@ -22,7 +22,7 @@ import torch
 
 
 def export():
-    from transformers import AutoModelForPoseEstimation
+    from transformers import VitPoseForPoseEstimation
 
     model_id = "stanfordmimi/synthpose-vitpose-base-hf"
     output_dir = Path(__file__).parent.parent / "models" / "onnx"
@@ -30,7 +30,7 @@ def export():
     output_path = output_dir / "vitpose_synthpose.onnx"
 
     print(f"Loading model: {model_id}")
-    model = AutoModelForPoseEstimation.from_pretrained(model_id)
+    model = VitPoseForPoseEstimation.from_pretrained(model_id)
     model.eval()
 
     # Input: (batch, 3, 256, 192) matching PT_VITPOSE_INPUT_H/W

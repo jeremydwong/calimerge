@@ -35,7 +35,7 @@ from .state import StateManager, CameraState
 from .workers import (
     CameraEnumerateWorker, CameraPreviewWorker,
     PoseDetectionWorker, CudaStreamDetectionWorker,
-    RecordingWorker,
+    MediaPipeHandsDetectionWorker, RecordingWorker,
 )
 from .widgets.camera_grid import CameraGrid
 from .widgets.skeleton_view import SkeletonViewWidget
@@ -152,7 +152,15 @@ class WorkoutPage(QWidget):
         self.detect_checkbox.toggled.connect(self._on_detect_toggled)
         cam_layout.addWidget(self.detect_checkbox)
 
-        # Backend toggle: PyTorch (CPU/GPU via Python) vs Hardware (TensorRT CUDA)
+        # Model toggle: VitPose (body) vs MediaPipe Hands
+        self.detect_model_combo = QComboBox()
+        self.detect_model_combo.addItem("VitPose (Body)", "vitpose")
+        self.detect_model_combo.addItem("MediaPipe Hands", "mediapipe_hands")
+        self.detect_model_combo.setToolTip("Detection model to use")
+        self.detect_model_combo.setFixedWidth(130)
+        cam_layout.addWidget(self.detect_model_combo)
+
+        # Backend toggle: PyTorch vs Hardware (CUDA) — only for VitPose
         self.detect_backend_combo = QComboBox()
         self.detect_backend_combo.addItem("PyTorch", "pytorch")
         try:
@@ -163,9 +171,9 @@ class WorkoutPage(QWidget):
             pass
         self.detect_backend_combo.setToolTip(
             "PyTorch: 2D overlay + 3D skeleton (slower)\n"
-            "Hardware: 3D skeleton only via TensorRT (~10ms/frame)"
+            "Hardware: 3D skeleton via TensorRT (~10ms/frame)"
         )
-        self.detect_backend_combo.setFixedWidth(140)
+        self.detect_backend_combo.setFixedWidth(130)
         cam_layout.addWidget(self.detect_backend_combo)
 
         self.camera_count_label = QLabel("No cameras")
@@ -1291,6 +1299,17 @@ class WorkoutPage(QWidget):
         """Switch the workout page over to the given program exercise."""
         self._current_program_exercise = exercise
         wt = exercise["workout_type"]
+
+        # Auto-switch model based on workout type
+        if wt == "hand_squeeze":
+            idx = self.detect_model_combo.findData("mediapipe_hands")
+            if idx >= 0:
+                self.detect_model_combo.setCurrentIndex(idx)
+        else:
+            idx = self.detect_model_combo.findData("vitpose")
+            if idx >= 0:
+                self.detect_model_combo.setCurrentIndex(idx)
+
         # Mirror the choice into the hidden radio group so legacy
         # _selected_workout_type() keeps working.
         if wt == "sit_to_stand":
@@ -1629,6 +1648,12 @@ class WorkoutPage(QWidget):
         if self.detection_worker is not None:
             return
 
+        model = self.detect_model_combo.currentData() or "vitpose"
+
+        if model == "mediapipe_hands":
+            self._start_mediapipe_hands_detection()
+            return
+
         cameras = self._calibrated_cameras
         if cameras is None:
             self.skeleton_view.set_message("No extrinsic calibration")
@@ -1682,6 +1707,21 @@ class WorkoutPage(QWidget):
         self.detection_worker.keypoints_3d_ready.connect(self._on_keypoints_3d)
         self.detection_worker.start()
         self.status_message.emit("Detection started (CUDA TensorRT)")
+
+    def _start_mediapipe_hands_detection(self):
+        """Start the MediaPipe Hands detection worker."""
+        from .workers import MediaPipeHandsDetectionWorker
+
+        self.detection_worker = MediaPipeHandsDetectionWorker(max_hands=2)
+        self.detection_worker.detection_ready.connect(self._on_detection_ready)
+        self.detection_worker.log_message.connect(
+            lambda msg: self.status_message.emit(msg)
+        )
+        self.detection_worker.error.connect(self._on_detection_error)
+        self.detection_worker.finished.connect(self._on_detection_finished)
+        self.detection_worker.start()
+        self.skeleton_view.set_message("Hand detection (2D only)")
+        self.status_message.emit("Detection started (MediaPipe Hands)")
 
     def _stop_detection(self):
         if self.detection_worker is not None:

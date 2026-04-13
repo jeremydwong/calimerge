@@ -1045,6 +1045,109 @@ class PoseDetectionWorker(QThread):
         self._has_work.set()  # unblock the wait
 
 
+class MediaPipeHandsDetectionWorker(QThread):
+    """Live hand detection using MediaPipe Hands.
+
+    Same signal interface as PoseDetectionWorker. Runs MediaPipe on each
+    camera frame independently (2D only — no triangulation). Draws hand
+    landmarks + connections on the annotated frame. Emits hand landmark
+    positions via keypoints_3d_ready (using 2D pixel coords as x,y and 0 as z
+    so the signal type matches, but the skeleton view won't be meaningful).
+    """
+
+    models_loaded = Signal()
+    detection_ready = Signal(int, object)
+    keypoints_3d_ready = Signal(list, int)
+    log_message = Signal(str)
+    error = Signal(str)
+
+    def __init__(self, max_hands: int = 2):
+        super().__init__()
+        self.max_hands = max_hands
+        self.running = True
+
+        import threading
+        self._lock = threading.Lock()
+        self._pending_frames: dict[int, "np.ndarray"] = {}
+
+    def submit_frame(self, port: int, frame: "np.ndarray"):
+        with self._lock:
+            self._pending_frames[port] = frame.copy()
+
+    def run(self):
+        try:
+            from ..tracking.hand_detector import detect_hands, get_thumb_index_distance
+            import cv2
+            import numpy as np
+        except Exception as e:
+            self.error.emit(f"MediaPipe Hands init failed: {e}")
+            return
+
+        self.models_loaded.emit()
+        self.log_message.emit("[mediapipe_hands] Ready")
+
+        # MediaPipe hand connections for drawing
+        HAND_CONNECTIONS = [
+            (0, 1), (1, 2), (2, 3), (3, 4),      # thumb
+            (0, 5), (5, 6), (6, 7), (7, 8),      # index
+            (0, 9), (9, 10), (10, 11), (11, 12),  # middle
+            (0, 13), (13, 14), (14, 15), (15, 16), # ring
+            (0, 17), (17, 18), (18, 19), (19, 20), # pinky
+            (5, 9), (9, 13), (13, 17),             # palm
+        ]
+
+        while self.running:
+            with self._lock:
+                if self._pending_frames:
+                    frames_snapshot = dict(self._pending_frames)
+                    self._pending_frames.clear()
+                else:
+                    frames_snapshot = {}
+
+            if not frames_snapshot:
+                time.sleep(0.01)
+                continue
+
+            for port, bgr in frames_snapshot.items():
+                try:
+                    hands = detect_hands(bgr, max_hands=self.max_hands)
+                    annotated = bgr.copy()
+                    h, w = bgr.shape[:2]
+
+                    for hand in hands:
+                        # hand is a list of 21 (x, y, z) normalized landmarks
+                        pts = [(int(lm[0] * w), int(lm[1] * h)) for lm in hand]
+
+                        # Draw connections
+                        for i, j in HAND_CONNECTIONS:
+                            if i < len(pts) and j < len(pts):
+                                cv2.line(annotated, pts[i], pts[j],
+                                         (0, 255, 128), 2, cv2.LINE_AA)
+
+                        # Draw landmarks
+                        for pt in pts:
+                            cv2.circle(annotated, pt, 3, (0, 200, 255),
+                                       -1, cv2.LINE_AA)
+
+                        # Show thumb-index distance
+                        if len(hand) >= 9:
+                            dist = get_thumb_index_distance(hand)
+                            thumb_pt = pts[4]
+                            cv2.putText(annotated,
+                                        f"{dist:.0f}px",
+                                        (thumb_pt[0] + 10, thumb_pt[1]),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                                        (255, 255, 255), 1, cv2.LINE_AA)
+
+                    self.detection_ready.emit(port, annotated)
+
+                except Exception as e:
+                    self.log_message.emit(f"[mediapipe_hands] Error on port {port}: {e}")
+
+    def stop(self):
+        self.running = False
+
+
 class CudaStreamDetectionWorker(QThread):
     """Live 3D pose detection using the CUDA TensorRT streaming pipeline.
 
