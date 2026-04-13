@@ -500,9 +500,8 @@ calimerge/
 │
 ├── tests/                      # Test suite
 ├── recordings/                 # Output directory
-├── caliscope/                  # Legacy: GUI calibration package
-├── multiwebcam/                # Legacy: webcam recording package
-└── posetrack/                  # Legacy: pose estimation package
+├── tests/data/                 # Test recordings (coord_3x1_3, recording_3by1, etc.)
+└── tests/                      # Test suite
 ```
 
 ## Recording Output Format
@@ -625,17 +624,7 @@ uv run pytest tests/test_triangulation.py -v
 
 ## Legacy Packages
 
-The original packages are preserved for reference during migration:
-
-- **caliscope/** - Full calibration + pose estimation GUI (Poetry)
-- **multiwebcam/** - Synchronized webcam recording (Poetry)
-- **posetrack/** - VitPose-based pose estimation
-
-To run legacy packages:
-```bash
-cd caliscope && poetry install && poetry run caliscope
-cd multiwebcam && poetry install && poetry run mwc clock
-```
+The original packages (caliscope, multiwebcam, posetrack) have been removed from the repository. Their functionality has been merged into `src/calimerge/`. Key test recordings are preserved in `tests/data/`.
 
 ## Memory Management
 

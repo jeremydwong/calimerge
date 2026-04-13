@@ -31,7 +31,6 @@ dev = [
     "pytest>=7.0.0",
     "pytest-qt>=4.2.0",
     "ruff>=0.1.0",
-    "posetrack",
 ]
 
 [project.scripts]
@@ -54,7 +53,6 @@ url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [tool.uv.sources]
-posetrack = { path = "posetrack", editable = true }
 # Use CUDA wheels on Windows/Linux, standard PyPI wheels on macOS
 torch = [
     { index = "pytorch-cu128", marker = "sys_platform != 'darwin'" },

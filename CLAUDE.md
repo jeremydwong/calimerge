@@ -51,9 +51,9 @@ VIRTUAL_ENV= ~/.local/bin/uv run pytest ...
 
 **calimerge** is a unified multi-camera motion capture application. It merges three legacy packages:
 
-- **caliscope** (legacy, in `caliscope/`): GUI calibration and 3D pose estimation
-- **multiwebcam** (legacy, in `multiwebcam/`): Synchronized webcam recording
-- **posetrack** (legacy, in `posetrack/`): VitPose-based pose estimation
+- **caliscope** (removed, was GUI calibration and 3D pose estimation)
+- **multiwebcam** (removed, was synchronized webcam recording)
+- **posetrack** (removed, was VitPose-based pose estimation)
 
 The active unified package is in `src/calimerge/` and uses **uv** (not Poetry).
 
@@ -147,10 +147,10 @@ build_cuda_win32.bat release
 cd ..\..
 
 :: 3. Test run (verify it works before profiling)
-src\cuda_pipeline\pt_main.exe posetrack\tests\caliscope\coord_3x1_3 posetrack\tests\caliscope\coord_3x1_3\config.toml --yolo models\onnx\yolo_v10s.onnx --vitpose models\onnx\vitpose_base_coco.onnx 2>&1
+src\cuda_pipeline\pt_main.exe tests\data\coord_3x1_3 tests\data\coord_3x1_3\config.toml --yolo models\onnx\yolo_v10s.onnx --vitpose models\onnx\vitpose_base_coco.onnx 2>&1
 
 :: 4. Profile with Nsight Systems
-"C:\Program Files\NVIDIA Corporation\Nsight Systems 2025.5.2\target-windows-x64\nsys.exe" profile --trace=cuda,nvtx --output=profile_batch --force-overwrite=true src\cuda_pipeline\pt_main.exe posetrack\tests\caliscope\coord_3x1_3 posetrack\tests\caliscope\coord_3x1_3\config.toml --yolo models\onnx\yolo_v10s.onnx --vitpose models\onnx\vitpose_base_coco.onnx 2>&1
+"C:\Program Files\NVIDIA Corporation\Nsight Systems 2025.5.2\target-windows-x64\nsys.exe" profile --trace=cuda,nvtx --output=profile_batch --force-overwrite=true src\cuda_pipeline\pt_main.exe tests\data\coord_3x1_3 tests\data\coord_3x1_3\config.toml --yolo models\onnx\yolo_v10s.onnx --vitpose models\onnx\vitpose_base_coco.onnx 2>&1
 
 :: 5. Open profile in GUI
 "C:\Program Files\NVIDIA Corporation\Nsight Systems 2025.5.2\host-windows-x64\nsys-ui.exe" profile_batch.nsys-rep

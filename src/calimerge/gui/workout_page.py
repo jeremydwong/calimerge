@@ -157,6 +157,9 @@ class WorkoutPage(QWidget):
         cam_layout.addWidget(self.cal_status)
         cam_layout.addStretch()
 
+        # Hidden — cameras auto-init on login. Widgets kept alive for
+        # internal state management (auto-chain, status labels).
+        cam_group.setVisible(False)
         layout.addWidget(cam_group)
 
         # ── Main vertical splitter: preview (top) | controls (mid) | analysis (bottom) ──
