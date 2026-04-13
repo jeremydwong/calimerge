@@ -21,8 +21,8 @@ from pathlib import Path
 import numpy as np
 
 
-# COCO-17 has 17 keypoints; SynthPose uses 52. Default to 17 for live tracking.
-DEFAULT_NUM_KEYPOINTS = 17
+# SynthPose uses 52 keypoints (superset of COCO-17).
+DEFAULT_NUM_KEYPOINTS = 52
 
 
 def save_keypoints_3d(

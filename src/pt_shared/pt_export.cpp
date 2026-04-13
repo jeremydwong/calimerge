@@ -10,7 +10,7 @@
  *
  * The model outputs 17 COCO keypoints (PT_NUM_KEYPOINTS).
  * Columns 17-51 are padded with empty fields (NaN) to match the
- * Python SynthPoseMarkers format (PT_EXPORT_KEYPOINTS = 52).
+ * Python SynthPoseMarkers format (PT_NUM_KEYPOINTS = 52).
  *
  * Invalid (non-triangulated) keypoints are written as empty fields (,,)
  * which Python/pandas reads as NaN.
@@ -45,7 +45,7 @@
 static int write_csv_header(FILE *f) {
     if (fprintf(f, "sync_index,person_id") < 0) return -1;
 
-    for (int k = 0; k < PT_EXPORT_KEYPOINTS; k++) {
+    for (int k = 0; k < PT_NUM_KEYPOINTS; k++) {
         if (fprintf(f, ",%s_X,%s_Y,%s_Z",
                     PT_EXPORT_MARKER_NAMES[k],
                     PT_EXPORT_MARKER_NAMES[k],
@@ -87,8 +87,8 @@ static int write_csv_row(FILE *f, int sync_index, int person_id,
         }
     }
 
-    /* Pad remaining columns (PT_NUM_KEYPOINTS to PT_EXPORT_KEYPOINTS-1 = 17..51) with NaN */
-    for (int k = PT_NUM_KEYPOINTS; k < PT_EXPORT_KEYPOINTS; k++) {
+    /* Pad remaining columns (PT_NUM_KEYPOINTS to PT_NUM_KEYPOINTS-1 = 17..51) with NaN */
+    for (int k = PT_NUM_KEYPOINTS; k < PT_NUM_KEYPOINTS; k++) {
         if (fprintf(f, ",,,") < 0) return -1;
     }
 

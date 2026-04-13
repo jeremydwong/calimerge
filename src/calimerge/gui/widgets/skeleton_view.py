@@ -26,12 +26,29 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QPainter, QColor, QPen, QFont
 
 
-# COCO-17 skeleton connections
+# SynthPose 52-keypoint skeleton connections (draws whatever keypoints are available)
 _SKELETON = [
+    # Head
     (0, 1), (0, 2), (1, 3), (2, 4),
-    (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
+    # Neck / shoulders
+    (0, 17), (17, 5), (17, 6), (17, 48),
+    # Arms
+    (5, 7), (7, 9), (6, 8), (8, 10),
+    (7, 20), (7, 22), (8, 21), (8, 23),
+    (9, 24), (9, 26), (10, 25), (10, 27),
+    # Torso
     (5, 11), (6, 12), (11, 12),
+    (48, 51), (51, 50), (50, 49),
+    (49, 28), (49, 29), (28, 30), (29, 31),
+    # Legs
     (11, 13), (13, 15), (12, 14), (14, 16),
+    (13, 32), (13, 34), (14, 33), (14, 35),
+    (15, 36), (15, 38), (16, 37), (16, 39),
+    # Feet
+    (15, 46), (16, 47), (15, 40), (16, 41),
+    (40, 42), (41, 43), (42, 44), (43, 45),
+    # Fallback COCO-only connections (used when SynthPose kps 17+ are absent)
+    (5, 6),
 ]
 
 # Per-person colors (limbs + keypoints use the same color per person)

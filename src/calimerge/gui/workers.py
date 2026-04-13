@@ -1061,12 +1061,30 @@ class CudaStreamDetectionWorker(QThread):
     log_message = Signal(str)
     error = Signal(str)
 
-    # COCO-17 skeleton for drawing
+    # SynthPose 52-keypoint skeleton connections (superset of COCO-17)
     _SKELETON = [
-        (0, 1), (0, 2), (1, 3), (2, 4),        # head
-        (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),  # arms
-        (5, 11), (6, 12), (11, 12),             # torso
-        (11, 13), (13, 15), (12, 14), (14, 16), # legs
+        # Head (COCO)
+        (0, 1), (0, 2), (1, 3), (2, 4),
+        # Neck / shoulders
+        (0, 17), (17, 5), (17, 6), (17, 48),    # nose→sternum→shoulders→C7
+        # Arms (COCO + elbow/wrist landmarks)
+        (5, 7), (7, 9), (6, 8), (8, 10),
+        (7, 20), (7, 22), (8, 21), (8, 23),     # elbow landmarks
+        (9, 24), (9, 26), (10, 25), (10, 27),   # wrist landmarks
+        # Torso
+        (5, 11), (6, 12), (11, 12),
+        (17, 48), (48, 51), (51, 50), (50, 49),  # spine: C7→T6→T11→L2
+        (49, 28), (49, 29),                       # L2→ASIS
+        (28, 30), (29, 31),                       # ASIS→PSIS
+        # Legs (COCO + knee/ankle landmarks)
+        (11, 13), (13, 15), (12, 14), (14, 16),
+        (13, 32), (13, 34), (14, 33), (14, 35),  # knee landmarks
+        (15, 36), (15, 38), (16, 37), (16, 39),  # ankle landmarks
+        # Feet
+        (15, 46), (16, 47),                       # ankle→calcaneus
+        (15, 40), (16, 41),                       # ankle→5th meta
+        (40, 42), (41, 43),                       # 5th meta→toe
+        (42, 44), (43, 45),                       # toe→big toe
     ]
     _PERSON_COLORS = [
         (120, 200, 80), (255, 160, 100), (220, 100, 220),
