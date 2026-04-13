@@ -1045,6 +1045,141 @@ class PoseDetectionWorker(QThread):
         self._has_work.set()  # unblock the wait
 
 
+class CudaStreamDetectionWorker(QThread):
+    """Live 3D pose detection using the CUDA TensorRT streaming pipeline.
+
+    Same signal interface as PoseDetectionWorker so the GUI can swap between
+    them transparently. Unlike the Python worker, this one:
+    - Runs all stages on GPU (YOLO + VitPose + matching + triangulation + tracking)
+    - Returns 3D keypoints directly (no separate 2D detection step)
+    - Does NOT produce 2D-annotated camera frames (detection_ready is not emitted)
+    - Has its own built-in multiperson tracker with stable person IDs
+    """
+
+    models_loaded = Signal()
+    detection_ready = Signal(int, object)      # port, annotated_frame (NOT used — raw frames only)
+    keypoints_3d_ready = Signal(list, int)     # persons, primary_index
+    log_message = Signal(str)
+    error = Signal(str)
+
+    def __init__(self, cameras: dict, calibration_path: str,
+                 yolo_onnx: str = "", vitpose_onnx: str = "",
+                 engine_cache: str = "", max_persons: int = 2):
+        super().__init__()
+        self.cameras = cameras
+        self.calibration_path = calibration_path
+        self.yolo_onnx = yolo_onnx
+        self.vitpose_onnx = vitpose_onnx
+        self.engine_cache = engine_cache
+        self.max_persons = max_persons
+        self.running = True
+        self._pipeline = None
+
+        import threading
+        self._lock = threading.Lock()
+        self._pending_frames: dict[int, "np.ndarray"] = {}
+        self._sync_index = 0
+
+    def submit_frame(self, port: int, frame: "np.ndarray"):
+        """Submit a frame for detection (non-blocking, keeps only latest per port)."""
+        with self._lock:
+            self._pending_frames[port] = frame.copy()
+
+    def run(self):
+        try:
+            from ..tracking.cuda_stream_binding import CudaStreamPipeline
+
+            # Determine frame dimensions from the camera calibration
+            sorted_ports = sorted(self.cameras.keys())
+            first_cam = self.cameras[sorted_ports[0]]
+            w, h = first_cam.intrinsics.resolution
+
+            self.log_message.emit(f"[cuda_stream] Initializing pipeline ({len(sorted_ports)} cameras, {w}x{h})...")
+
+            def _log(msg):
+                self.log_message.emit(f"[cuda_stream] {msg}")
+
+            self._pipeline = CudaStreamPipeline(
+                num_cameras=len(sorted_ports),
+                frame_width=w,
+                frame_height=h,
+                calibration_toml_path=self.calibration_path,
+                yolo_onnx_path=self.yolo_onnx,
+                vitpose_onnx_path=self.vitpose_onnx,
+                engine_cache_dir=self.engine_cache,
+                max_persons=self.max_persons,
+                log_callback=_log,
+            )
+            self.models_loaded.emit()
+            self.log_message.emit("[cuda_stream] Pipeline ready")
+
+        except Exception as e:
+            self.error.emit(f"CUDA pipeline init failed: {e}")
+            return
+
+        # Detection loop
+        while self.running:
+            with self._lock:
+                if not self._pending_frames:
+                    pass  # will sleep below
+                else:
+                    frames_snapshot = dict(self._pending_frames)
+                    self._pending_frames.clear()
+
+            if not frames_snapshot:
+                time.sleep(0.005)
+                continue
+
+            try:
+                # Build frame list for the C API
+                frame_list = []
+                for port in sorted(frames_snapshot.keys()):
+                    frame_list.append((frames_snapshot[port], port))
+
+                result = self._pipeline.process_frame(frame_list, self._sync_index)
+                self._sync_index += 1
+
+                if result.num_persons > 0:
+                    # Convert to the same format PoseDetectionWorker emits:
+                    # list[list[np.ndarray(3,) | None]]
+                    all_persons_3d = []
+                    primary_index = 0
+                    min_origin_dist = float("inf")
+
+                    for i, person in enumerate(result.persons):
+                        all_persons_3d.append(person.keypoints_3d)
+
+                        # Primary = closest COM to world origin
+                        if person.com_3d is not None:
+                            import numpy as np
+                            dist = float(np.linalg.norm(person.com_3d))
+                            if dist < min_origin_dist:
+                                min_origin_dist = dist
+                                primary_index = i
+
+                    self.keypoints_3d_ready.emit(all_persons_3d, primary_index)
+
+            except Exception as e:
+                self.log_message.emit(f"[cuda_stream] Frame error: {e}")
+
+            frames_snapshot = {}
+
+        # Cleanup
+        if self._pipeline is not None:
+            stats = self._pipeline.get_stats()
+            if stats.frames_processed > 0:
+                avg = stats.total_ms / stats.frames_processed
+                self.log_message.emit(
+                    f"[cuda_stream] Processed {stats.frames_processed} frames, "
+                    f"avg {avg:.1f}ms/frame"
+                )
+            self._pipeline.close()
+            self._pipeline = None
+
+    def stop(self):
+        self.running = False
+
+
 class ProcessingWorker(QThread):
     """Run tracking and triangulation pipeline."""
 

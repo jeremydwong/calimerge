@@ -32,7 +32,11 @@ from PySide6.QtCore import Signal, Qt, QTimer
 from PySide6.QtGui import QFont
 
 from .state import StateManager, CameraState
-from .workers import CameraEnumerateWorker, CameraPreviewWorker, PoseDetectionWorker, RecordingWorker
+from .workers import (
+    CameraEnumerateWorker, CameraPreviewWorker,
+    PoseDetectionWorker, CudaStreamDetectionWorker,
+    RecordingWorker,
+)
 from .widgets.camera_grid import CameraGrid
 from .widgets.skeleton_view import SkeletonViewWidget
 
@@ -147,6 +151,22 @@ class WorkoutPage(QWidget):
         self.detect_checkbox.setToolTip("Overlay 2D pose detection + 3D skeleton")
         self.detect_checkbox.toggled.connect(self._on_detect_toggled)
         cam_layout.addWidget(self.detect_checkbox)
+
+        # Backend toggle: PyTorch (CPU/GPU via Python) vs Hardware (TensorRT CUDA)
+        self.detect_backend_combo = QComboBox()
+        self.detect_backend_combo.addItem("PyTorch", "pytorch")
+        try:
+            from ..tracking.cuda_stream_binding import is_available
+            if is_available():
+                self.detect_backend_combo.addItem("Hardware (CUDA)", "cuda")
+        except Exception:
+            pass
+        self.detect_backend_combo.setToolTip(
+            "PyTorch: 2D overlay + 3D skeleton (slower)\n"
+            "Hardware: 3D skeleton only via TensorRT (~10ms/frame)"
+        )
+        self.detect_backend_combo.setFixedWidth(140)
+        cam_layout.addWidget(self.detect_backend_combo)
 
         self.camera_count_label = QLabel("No cameras")
         self.camera_count_label.setStyleSheet("color: #888;")
@@ -1613,6 +1633,15 @@ class WorkoutPage(QWidget):
         if cameras is None:
             self.skeleton_view.set_message("No extrinsic calibration")
 
+        backend = self.detect_backend_combo.currentData() or "pytorch"
+
+        if backend == "cuda" and cameras is not None and self._calibration_path is not None:
+            self._start_cuda_detection(cameras)
+        else:
+            self._start_pytorch_detection(cameras)
+
+    def _start_pytorch_detection(self, cameras):
+        """Start the Python-based detection worker (YOLO + VitPose via PyTorch)."""
         self.detection_worker = PoseDetectionWorker(device_name="auto", cameras=cameras)
         self.detection_worker.detection_ready.connect(self._on_detection_ready)
         self.detection_worker.error.connect(self._on_detection_error)
@@ -1620,6 +1649,38 @@ class WorkoutPage(QWidget):
         if cameras is not None:
             self.detection_worker.keypoints_3d_ready.connect(self._on_keypoints_3d)
         self.detection_worker.start()
+        self.status_message.emit("Detection started (PyTorch)")
+
+    def _start_cuda_detection(self, cameras):
+        """Start the CUDA TensorRT streaming detection worker."""
+        from .workers import CudaStreamDetectionWorker
+        from ..config import load_app_settings
+
+        # Find ONNX model paths
+        app = load_app_settings()
+        project_folder = app.get("last_project_folder", "")
+        repo_root = str(Path(__file__).parent.parent.parent)
+
+        yolo_onnx = str(Path(repo_root) / "models" / "onnx" / "yolo_v10s.onnx")
+        vitpose_onnx = str(Path(repo_root) / "models" / "onnx" / "vitpose_base_coco.onnx")
+        engine_cache = str(Path(project_folder) / "engine_cache") if project_folder else ""
+
+        self.detection_worker = CudaStreamDetectionWorker(
+            cameras=cameras,
+            calibration_path=str(self._calibration_path),
+            yolo_onnx=yolo_onnx,
+            vitpose_onnx=vitpose_onnx,
+            engine_cache=engine_cache,
+            max_persons=2,
+        )
+        self.detection_worker.log_message.connect(
+            lambda msg: self.status_message.emit(msg)
+        )
+        self.detection_worker.error.connect(self._on_detection_error)
+        self.detection_worker.finished.connect(self._on_detection_finished)
+        self.detection_worker.keypoints_3d_ready.connect(self._on_keypoints_3d)
+        self.detection_worker.start()
+        self.status_message.emit("Detection started (CUDA TensorRT)")
 
     def _stop_detection(self):
         if self.detection_worker is not None:
