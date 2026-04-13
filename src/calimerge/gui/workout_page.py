@@ -1676,6 +1676,7 @@ class WorkoutPage(QWidget):
         self.detection_worker.log_message.connect(
             lambda msg: self.status_message.emit(msg)
         )
+        self.detection_worker.detection_ready.connect(self._on_detection_ready)
         self.detection_worker.error.connect(self._on_detection_error)
         self.detection_worker.finished.connect(self._on_detection_finished)
         self.detection_worker.keypoints_3d_ready.connect(self._on_keypoints_3d)

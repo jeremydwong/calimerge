@@ -1049,18 +1049,29 @@ class CudaStreamDetectionWorker(QThread):
     """Live 3D pose detection using the CUDA TensorRT streaming pipeline.
 
     Same signal interface as PoseDetectionWorker so the GUI can swap between
-    them transparently. Unlike the Python worker, this one:
-    - Runs all stages on GPU (YOLO + VitPose + matching + triangulation + tracking)
-    - Returns 3D keypoints directly (no separate 2D detection step)
-    - Does NOT produce 2D-annotated camera frames (detection_ready is not emitted)
+    them transparently. This worker:
+    - Runs detection + matching + triangulation + tracking on GPU (~10ms/frame)
+    - Reprojects 3D keypoints to 2D per camera for overlays (zero GPU cost)
     - Has its own built-in multiperson tracker with stable person IDs
     """
 
     models_loaded = Signal()
-    detection_ready = Signal(int, object)      # port, annotated_frame (NOT used — raw frames only)
+    detection_ready = Signal(int, object)      # port, annotated_frame
     keypoints_3d_ready = Signal(list, int)     # persons, primary_index
     log_message = Signal(str)
     error = Signal(str)
+
+    # COCO-17 skeleton for drawing
+    _SKELETON = [
+        (0, 1), (0, 2), (1, 3), (2, 4),        # head
+        (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),  # arms
+        (5, 11), (6, 12), (11, 12),             # torso
+        (11, 13), (13, 15), (12, 14), (14, 16), # legs
+    ]
+    _PERSON_COLORS = [
+        (120, 200, 80), (255, 160, 100), (220, 100, 220),
+        (100, 100, 255), (100, 220, 220), (255, 220, 80),
+    ]
 
     def __init__(self, cameras: dict, calibration_path: str,
                  yolo_onnx: str = "", vitpose_onnx: str = "",
@@ -1074,6 +1085,7 @@ class CudaStreamDetectionWorker(QThread):
         self.max_persons = max_persons
         self.running = True
         self._pipeline = None
+        self._proj_matrices: dict[int, "np.ndarray"] = {}  # port → 3x4
 
         import threading
         self._lock = threading.Lock()
@@ -1085,16 +1097,75 @@ class CudaStreamDetectionWorker(QThread):
         with self._lock:
             self._pending_frames[port] = frame.copy()
 
+    def _build_projection_matrices(self):
+        """Precompute 3x4 projection matrices for each camera (for 3D→2D reprojection)."""
+        import numpy as np
+        for port, cam in self.cameras.items():
+            K = np.asarray(cam.intrinsics.matrix, dtype=np.float64)
+            R = np.asarray(cam.extrinsics.rotation, dtype=np.float64)
+            t = np.asarray(cam.extrinsics.translation, dtype=np.float64).reshape(3, 1)
+            Rt = np.hstack([R, t])
+            self._proj_matrices[port] = K @ Rt
+
+    def _project_3d_to_2d(self, point_3d, proj_matrix):
+        """Project a 3D point to 2D pixel coordinates. Returns (x, y) or None."""
+        import numpy as np
+        if point_3d is None:
+            return None
+        pt = np.asarray(point_3d, dtype=np.float64)
+        if pt.shape != (3,) or np.isnan(pt).any():
+            return None
+        h = proj_matrix @ np.append(pt, 1.0)
+        if abs(h[2]) < 1e-6:
+            return None
+        return (int(h[0] / h[2]), int(h[1] / h[2]))
+
+    def _draw_overlay(self, frame, persons_3d, port):
+        """Draw reprojected 3D skeletons onto a BGR frame for one camera.
+
+        Cost: ~0.2ms on CPU per frame (just cv2.circle + cv2.line).
+        """
+        import cv2
+        import numpy as np
+
+        proj = self._proj_matrices.get(port)
+        if proj is None:
+            return frame
+
+        annotated = frame.copy()
+
+        for p_idx, person_kps in enumerate(persons_3d):
+            color = self._PERSON_COLORS[p_idx % len(self._PERSON_COLORS)]
+            pts_2d = [self._project_3d_to_2d(kp, proj) for kp in person_kps]
+
+            # Draw limbs
+            for i, j in self._SKELETON:
+                if i < len(pts_2d) and j < len(pts_2d):
+                    pi, pj = pts_2d[i], pts_2d[j]
+                    if pi is not None and pj is not None:
+                        cv2.line(annotated, pi, pj, color, 2, cv2.LINE_AA)
+
+            # Draw keypoints
+            for pt in pts_2d:
+                if pt is not None:
+                    cv2.circle(annotated, pt, 4, color, -1, cv2.LINE_AA)
+
+        return annotated
+
     def run(self):
+        import numpy as np
+
         try:
             from ..tracking.cuda_stream_binding import CudaStreamPipeline
 
-            # Determine frame dimensions from the camera calibration
             sorted_ports = sorted(self.cameras.keys())
             first_cam = self.cameras[sorted_ports[0]]
             w, h = first_cam.intrinsics.resolution
 
-            self.log_message.emit(f"[cuda_stream] Initializing pipeline ({len(sorted_ports)} cameras, {w}x{h})...")
+            self.log_message.emit(
+                f"[cuda_stream] Initializing pipeline "
+                f"({len(sorted_ports)} cameras, {w}x{h})..."
+            )
 
             def _log(msg):
                 self.log_message.emit(f"[cuda_stream] {msg}")
@@ -1110,6 +1181,9 @@ class CudaStreamDetectionWorker(QThread):
                 max_persons=self.max_persons,
                 log_callback=_log,
             )
+
+            self._build_projection_matrices()
+
             self.models_loaded.emit()
             self.log_message.emit("[cuda_stream] Pipeline ready")
 
@@ -1117,12 +1191,11 @@ class CudaStreamDetectionWorker(QThread):
             self.error.emit(f"CUDA pipeline init failed: {e}")
             return
 
-        # Detection loop
+        frames_snapshot = {}
+
         while self.running:
             with self._lock:
-                if not self._pending_frames:
-                    pass  # will sleep below
-                else:
+                if self._pending_frames:
                     frames_snapshot = dict(self._pending_frames)
                     self._pending_frames.clear()
 
@@ -1131,7 +1204,6 @@ class CudaStreamDetectionWorker(QThread):
                 continue
 
             try:
-                # Build frame list for the C API
                 frame_list = []
                 for port in sorted(frames_snapshot.keys()):
                     frame_list.append((frames_snapshot[port], port))
@@ -1139,25 +1211,30 @@ class CudaStreamDetectionWorker(QThread):
                 result = self._pipeline.process_frame(frame_list, self._sync_index)
                 self._sync_index += 1
 
-                if result.num_persons > 0:
-                    # Convert to the same format PoseDetectionWorker emits:
-                    # list[list[np.ndarray(3,) | None]]
-                    all_persons_3d = []
-                    primary_index = 0
-                    min_origin_dist = float("inf")
+                # Build persons list
+                all_persons_3d = []
+                primary_index = 0
+                min_origin_dist = float("inf")
 
-                    for i, person in enumerate(result.persons):
-                        all_persons_3d.append(person.keypoints_3d)
+                for i, person in enumerate(result.persons):
+                    all_persons_3d.append(person.keypoints_3d)
+                    if person.com_3d is not None:
+                        dist = float(np.linalg.norm(person.com_3d))
+                        if dist < min_origin_dist:
+                            min_origin_dist = dist
+                            primary_index = i
 
-                        # Primary = closest COM to world origin
-                        if person.com_3d is not None:
-                            import numpy as np
-                            dist = float(np.linalg.norm(person.com_3d))
-                            if dist < min_origin_dist:
-                                min_origin_dist = dist
-                                primary_index = i
-
+                # Emit 3D keypoints
+                if all_persons_3d:
                     self.keypoints_3d_ready.emit(all_persons_3d, primary_index)
+
+                # Draw 2D overlays by reprojecting 3D → 2D per camera
+                for port, bgr in frames_snapshot.items():
+                    if all_persons_3d:
+                        annotated = self._draw_overlay(bgr, all_persons_3d, port)
+                    else:
+                        annotated = bgr
+                    self.detection_ready.emit(port, annotated)
 
             except Exception as e:
                 self.log_message.emit(f"[cuda_stream] Frame error: {e}")
