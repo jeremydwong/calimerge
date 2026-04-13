@@ -128,6 +128,29 @@ class WorkoutPage(QWidget):
         self.user_cal_status = QLabel("")
         self.user_cal_status.setStyleSheet("color: #888; font-size: 11px;")
         user_layout.addWidget(self.user_cal_status)
+
+        user_layout.addSpacing(10)
+
+        # Detection model + backend toggles (visible in user bar)
+        self.detect_model_combo = QComboBox()
+        self.detect_model_combo.addItem("VitPose (Body)", "vitpose")
+        self.detect_model_combo.addItem("MediaPipe Hands", "mediapipe_hands")
+        self.detect_model_combo.setToolTip("Detection model")
+        self.detect_model_combo.setFixedWidth(130)
+        user_layout.addWidget(self.detect_model_combo)
+
+        self.detect_backend_combo = QComboBox()
+        self.detect_backend_combo.addItem("PyTorch", "pytorch")
+        try:
+            from ..tracking.cuda_stream_binding import is_available
+            if is_available():
+                self.detect_backend_combo.addItem("Hardware (CUDA)", "cuda")
+        except Exception:
+            pass
+        self.detect_backend_combo.setToolTip("Backend: PyTorch or CUDA TensorRT")
+        self.detect_backend_combo.setFixedWidth(130)
+        user_layout.addWidget(self.detect_backend_combo)
+
         user_layout.addStretch()
 
         layout.addWidget(user_group)
@@ -151,30 +174,6 @@ class WorkoutPage(QWidget):
         self.detect_checkbox.setToolTip("Overlay 2D pose detection + 3D skeleton")
         self.detect_checkbox.toggled.connect(self._on_detect_toggled)
         cam_layout.addWidget(self.detect_checkbox)
-
-        # Model toggle: VitPose (body) vs MediaPipe Hands
-        self.detect_model_combo = QComboBox()
-        self.detect_model_combo.addItem("VitPose (Body)", "vitpose")
-        self.detect_model_combo.addItem("MediaPipe Hands", "mediapipe_hands")
-        self.detect_model_combo.setToolTip("Detection model to use")
-        self.detect_model_combo.setFixedWidth(130)
-        cam_layout.addWidget(self.detect_model_combo)
-
-        # Backend toggle: PyTorch vs Hardware (CUDA) — only for VitPose
-        self.detect_backend_combo = QComboBox()
-        self.detect_backend_combo.addItem("PyTorch", "pytorch")
-        try:
-            from ..tracking.cuda_stream_binding import is_available
-            if is_available():
-                self.detect_backend_combo.addItem("Hardware (CUDA)", "cuda")
-        except Exception:
-            pass
-        self.detect_backend_combo.setToolTip(
-            "PyTorch: 2D overlay + 3D skeleton (slower)\n"
-            "Hardware: 3D skeleton via TensorRT (~10ms/frame)"
-        )
-        self.detect_backend_combo.setFixedWidth(130)
-        cam_layout.addWidget(self.detect_backend_combo)
 
         self.camera_count_label = QLabel("No cameras")
         self.camera_count_label.setStyleSheet("color: #888;")
