@@ -121,8 +121,8 @@ def _find_cuda_lib() -> Path | None:
     else:
         lib_name = "libcalimerge_cuda.so"
 
-    module_dir = Path(__file__).parent
-    repo_root = module_dir.parent.parent
+    module_dir = Path(__file__).parent          # tracking/
+    repo_root = module_dir.parent.parent.parent  # calimerge/ (3 levels: tracking→calimerge→src→repo)
 
     candidates = [
         repo_root / "build" / "cuda" / lib_name,

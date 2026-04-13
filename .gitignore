@@ -85,6 +85,9 @@ analysis_output/
 recordings/
 models/
 
+# ── Downloaded model files ──
+*.task
+
 # ── Build output ──
 build/
 
