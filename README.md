@@ -260,7 +260,7 @@ cd src/native
 ./build_macos.sh release    # or 'debug' for symbols
 ```
 
-Produces `libcalimerge.dylib` using AVFoundation.
+Produces `build/native/libcalimerge.dylib` using AVFoundation.
 
 ### Windows
 
@@ -299,13 +299,11 @@ cl /LD /EHsc /O2 /DNDEBUG calimerge_win32.cpp mfplat.lib mfreadwrite.lib mfuuid.
 #### Test Native Library
 
 ```powershell
-# After building, test camera enumeration
+# After building, test from the build output directory
+cd build\native
+
 test_enumerate.exe
-
-# Test single camera capture (camera index 0)
 test_capture.exe 0
-
-# Test multi-camera sync
 test_multi.exe
 ```
 
@@ -318,7 +316,7 @@ uv run calimerge gui
 
 #### Troubleshooting
 
-**DLL not found**: Ensure `calimerge.dll` is in `src/native/` - the Python binding looks there.
+**DLL not found**: Ensure `calimerge.dll` is in `build/native/` — the Python binding looks there first, then falls back to `src/native/`.
 
 **No cameras detected**:
 - Check Device Manager for camera devices
@@ -366,14 +364,14 @@ set OPENCV_PATH=C:\OpenCV\opencv\build
 src\cuda_pipeline\build_cuda_win32.bat release
 ```
 
-Produces `pt_main.exe` (CLI) and `calimerge_cuda.dll` (for Python integration).
+Produces `build/cuda/pt_main.exe` (CLI) and `build/cuda/calimerge_cuda.dll` (for Python integration).
 
 ### Offline Processing (Recorded Videos)
 
 Process pre-recorded multi-camera videos through the full pipeline:
 
 ```bash
-pt_main.exe <recording_dir> <calibration.toml> [options]
+build\cuda\pt_main.exe <recording_dir> <calibration.toml> [options]
 
 Options:
   --batch-size N       Sync indices per batch (default 8)
@@ -422,7 +420,7 @@ pt_stream_destroy(stream);
 
 Test with recorded videos:
 ```bash
-pt_stream_main.exe <recording_dir> <calibration.toml> [options]
+build\cuda\pt_stream_main.exe <recording_dir> <calibration.toml> [options]
 ```
 
 **Performance:** 796 frames x 3 cameras in 8.2s (10.0 ms/frame, ~100 sync-frames/s).

@@ -85,15 +85,17 @@ analysis_output/
 recordings/
 models/
 
-# ── Build artifacts ──
+# ── Build output ──
+build/
+
+# ── Build artifacts (in case any end up outside build/) ──
 *.obj
 *.exe
 *.dll
 *.exp
 *.lib
 *.dylib
-src/cuda_pipeline/*.engine
-src/native/calimerge.def
+*.engine
 
 # ── Profiling output ──
 *.nsys-rep

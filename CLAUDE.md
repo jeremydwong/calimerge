@@ -101,6 +101,7 @@ eval "$('/c/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/Common7/
 Build the native Windows DLL:
 ```bash
 cd src/native && cmd //c build_win32.bat release && cd ../..
+# Output: build/native/calimerge.dll
 ```
 
 File search utility: **Everything** (voidtools) is installed with the `es.exe` CLI at:
@@ -111,7 +112,7 @@ C:\Program Files (x86)\Everything\es.exe
 ### Native C++ Tests (after building)
 
 ```bash
-cd src/native
+cd build/native
 ./test_enumerate    # List cameras with serial numbers
 ./test_capture 0    # Single camera capture test (camera index)
 ./test_multi        # Multi-camera synchronized capture
@@ -141,16 +142,16 @@ Requires a **cmd.exe** window (not Git Bash, not PowerShell — Anaconda's conda
 set OPENCV_PATH=C:\OpenCV\opencv\build
 set PATH=C:\TensorRT\lib;C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9\bin;C:\OpenCV\opencv\build\x64\vc16\bin;%PATH%
 
-:: 2. Build CUDA pipeline with OpenCV support
+:: 2. Build CUDA pipeline with OpenCV support (output goes to build\cuda\)
 cd src\cuda_pipeline
 build_cuda_win32.bat release
-cd ..\..
+cd ..\..\
 
 :: 3. Test run (verify it works before profiling)
-src\cuda_pipeline\pt_main.exe tests\data\coord_3x1_3 tests\data\coord_3x1_3\config.toml --yolo models\onnx\yolo_v10s.onnx --vitpose models\onnx\vitpose_base_coco.onnx 2>&1
+build\cuda\pt_main.exe tests\data\coord_3x1_3 tests\data\coord_3x1_3\config.toml --yolo models\onnx\yolo_v10s.onnx --vitpose models\onnx\vitpose_base_coco.onnx 2>&1
 
 :: 4. Profile with Nsight Systems
-"C:\Program Files\NVIDIA Corporation\Nsight Systems 2025.5.2\target-windows-x64\nsys.exe" profile --trace=cuda,nvtx --output=profile_batch --force-overwrite=true src\cuda_pipeline\pt_main.exe tests\data\coord_3x1_3 tests\data\coord_3x1_3\config.toml --yolo models\onnx\yolo_v10s.onnx --vitpose models\onnx\vitpose_base_coco.onnx 2>&1
+"C:\Program Files\NVIDIA Corporation\Nsight Systems 2025.5.2\target-windows-x64\nsys.exe" profile --trace=cuda,nvtx --output=profile_batch --force-overwrite=true build\cuda\pt_main.exe tests\data\coord_3x1_3 tests\data\coord_3x1_3\config.toml --yolo models\onnx\yolo_v10s.onnx --vitpose models\onnx\vitpose_base_coco.onnx 2>&1
 
 :: 5. Open profile in GUI
 "C:\Program Files\NVIDIA Corporation\Nsight Systems 2025.5.2\host-windows-x64\nsys-ui.exe" profile_batch.nsys-rep
