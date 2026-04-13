@@ -854,7 +854,7 @@ class PoseDetectionWorker(QThread):
             # Brighter variant for keypoints
             kp_color = tuple(min(255, int(c * 1.3)) for c in color)
 
-            n = min(17, kps.shape[0])
+            n = kps.shape[0]
 
             # Draw limbs
             for i, j in self._SKELETON:

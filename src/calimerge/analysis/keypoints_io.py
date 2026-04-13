@@ -21,7 +21,8 @@ from pathlib import Path
 import numpy as np
 
 
-# SynthPose uses 52 keypoints (superset of COCO-17).
+# SynthPose uses 52 keypoints. COCO uses 17. We store whatever the
+# model produces — the default here should match the active model.
 DEFAULT_NUM_KEYPOINTS = 52
 
 
