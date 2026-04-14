@@ -206,18 +206,3 @@ if errorlevel 1 (
 del /q *.obj 2>nul
 
 popd
-
-echo.
-echo ============================================================
-echo  Build Summary
-echo ============================================================
-echo  Output:  %BUILD_DIR%
-echo  Errors:  %BUILD_ERRORS%
-echo.
-echo  Artifacts:
-if exist "%BUILD_DIR%\calimerge_cuda.dll" (echo    OK  calimerge_cuda.dll) else (echo    MISSING  calimerge_cuda.dll)
-if exist "%BUILD_DIR%\pt_main.exe"        (echo    OK  pt_main.exe)        else (echo    MISSING  pt_main.exe)
-if exist "%BUILD_DIR%\pt_stream_main.exe" (echo    OK  pt_stream_main.exe) else (echo    MISSING  pt_stream_main.exe)
-echo ============================================================
-
-REM Success/failure is determined by the outer build_cuda.bat
