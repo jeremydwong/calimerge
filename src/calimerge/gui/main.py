@@ -173,6 +173,17 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self._save_project_settings()
 
+        # Stop all workout page workers before closing
+        try:
+            wp = self.workout_page
+            wp._stop_detection()
+            wp._stop_preview()
+            if wp.recording_worker is not None:
+                wp.recording_worker.running = False
+                wp.recording_worker.wait(2000)
+        except Exception:
+            pass
+
         if self._cal_dialog:
             self._cal_dialog.close()
 
