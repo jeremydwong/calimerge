@@ -86,10 +86,18 @@ _LOG_FUNC = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_void_p)
 
 
 class _StreamConfig(ctypes.Structure):
+    """Must match PT_StreamConfig in pt_stream.h exactly (field order matters!)."""
     _fields_ = [
+        # Paths come first (4 × char[512] = 2048 bytes)
+        ("yolo_onnx_path", ctypes.c_char * 512),
+        ("vitpose_onnx_path", ctypes.c_char * 512),
+        ("engine_cache_dir", ctypes.c_char * 512),
+        ("calibration_toml_path", ctypes.c_char * 512),
+        # Camera params
         ("num_cameras", ctypes.c_int),
         ("frame_width", ctypes.c_int),
         ("frame_height", ctypes.c_int),
+        # Processing params
         ("max_persons", ctypes.c_int),
         ("person_confidence", ctypes.c_float),
         ("keypoint_confidence", ctypes.c_float),
@@ -97,10 +105,7 @@ class _StreamConfig(ctypes.Structure):
         ("max_track_distance", ctypes.c_float),
         ("track_patience", ctypes.c_int),
         ("use_fp16_yolo", ctypes.c_int),
-        ("yolo_onnx_path", ctypes.c_char * 512),
-        ("vitpose_onnx_path", ctypes.c_char * 512),
-        ("engine_cache_dir", ctypes.c_char * 512),
-        ("calibration_toml_path", ctypes.c_char * 512),
+        # Callbacks
         ("log_callback", _LOG_FUNC),
         ("callback_user_data", ctypes.c_void_p),
     ]
