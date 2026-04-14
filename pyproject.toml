@@ -1,6 +1,6 @@
 [project]
 name = "calimerge"
-version = "0.2.0"
+version = "0.2.1"
 description = "Unified multi-camera motion capture with synchronized recording"
 license = "BSD-2-Clause"
 authors = [

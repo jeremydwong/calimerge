@@ -12,4 +12,4 @@ if errorlevel 1 (
 )
 cd ..\..
 echo.
-echo *** CUDA BUILD SUCCEEDED (v0.2.0) ***
+echo *** CUDA BUILD SUCCEEDED (v0.2.1) ***
