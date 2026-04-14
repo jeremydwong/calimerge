@@ -6,10 +6,10 @@ set TENSORRT_PATH=C:\TensorRT
 cd src\cuda_pipeline && call build_cuda_win32.bat %1
 if errorlevel 1 (
     echo.
-    echo *** CUDA BUILD FAILED ***
+    echo === CUDA BUILD FAILED ===
     cd ..\..
     exit /b 1
 )
 cd ..\..
 echo.
-echo *** CUDA BUILD SUCCEEDED (v0.2.1) ***
+echo === CUDA BUILD SUCCEEDED (v0.2.1) ===
