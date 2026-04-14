@@ -1691,7 +1691,8 @@ class WorkoutPage(QWidget):
         # Find ONNX model paths
         app = load_app_settings()
         project_folder = app.get("last_project_folder", "")
-        repo_root = str(Path(__file__).parent.parent.parent)
+        # workout_page.py is at src/calimerge/gui/ — 4 levels to repo root
+        repo_root = str(Path(__file__).resolve().parent.parent.parent.parent)
 
         yolo_onnx = str(Path(repo_root) / "models" / "onnx" / "yolo_v10s.onnx")
         vitpose_onnx = str(Path(repo_root) / "models" / "onnx" / "vitpose_base_coco.onnx")
