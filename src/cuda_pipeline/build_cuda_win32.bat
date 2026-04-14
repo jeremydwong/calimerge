@@ -176,10 +176,13 @@ cl %CFLAGS% %CL_INCLUDES% /Fe:"%BUILD_DIR%\pt_main.exe" pt_main.cpp ^
     "%BUILD_DIR%\pt_pipeline.obj" "%BUILD_DIR%\pt_stream.obj" ^
     /link %LINK_LIBS% %LINK_PATHS%
 
+set BUILD_ERRORS=0
+
 if errorlevel 1 (
-    echo WARNING: pt_main.exe build failed (non-fatal)
+    echo FAILED: pt_main.exe
+    set /a BUILD_ERRORS+=1
 ) else (
-    echo pt_main.exe built successfully
+    echo OK: pt_main.exe
 )
 
 echo.
@@ -193,9 +196,10 @@ cl %CFLAGS% %CL_INCLUDES% /Fe:"%BUILD_DIR%\pt_stream_main.exe" pt_stream_main.cp
     /link %LINK_LIBS% %LINK_PATHS%
 
 if errorlevel 1 (
-    echo WARNING: pt_stream_main.exe build failed (non-fatal)
+    echo FAILED: pt_stream_main.exe
+    set /a BUILD_ERRORS+=1
 ) else (
-    echo pt_stream_main.exe built successfully
+    echo OK: pt_stream_main.exe
 )
 
 :: Clean up .obj files left in source dir by cl
@@ -205,5 +209,18 @@ popd
 
 echo.
 echo ============================================================
-echo  Build complete. Output: %BUILD_DIR%
+echo  Build Summary
 echo ============================================================
+echo  Output:  %BUILD_DIR%
+echo  Errors:  %BUILD_ERRORS%
+echo.
+echo  Artifacts:
+if exist "%BUILD_DIR%\calimerge_cuda.dll" (echo    OK  calimerge_cuda.dll) else (echo    MISSING  calimerge_cuda.dll)
+if exist "%BUILD_DIR%\pt_main.exe"        (echo    OK  pt_main.exe)        else (echo    MISSING  pt_main.exe)
+if exist "%BUILD_DIR%\pt_stream_main.exe" (echo    OK  pt_stream_main.exe) else (echo    MISSING  pt_stream_main.exe)
+echo ============================================================
+
+if %BUILD_ERRORS% GTR 0 (
+    echo  *** BUILD HAD %BUILD_ERRORS% ERROR(S) ***
+    exit /b 1
+)
