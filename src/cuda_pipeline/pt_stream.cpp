@@ -434,6 +434,19 @@ extern "C" int pt_stream_process_frame(PT_Stream *s,
 
     cudaStreamSynchronize(s->cuda_stream);
 
+    /* Debug: print YOLO detection counts per camera */
+    {
+        static int debug_frame = 0;
+        if (debug_frame < 5) {
+            fprintf(stderr, "[pt_stream] YOLO detections (frame %d):", debug_frame);
+            for (int img = 0; img < valid_image_count; img++) {
+                fprintf(stderr, " cam%d=%d", img, s->arena.host_detection_counts[img]);
+            }
+            fprintf(stderr, " (conf_thresh=%.2f)\n", s->config.person_confidence);
+            debug_frame++;
+        }
+    }
+
     s->stats.yolo_ms += (stream_time_seconds() - t_yolo) * 1000.0;
 
     /* ================================================================
