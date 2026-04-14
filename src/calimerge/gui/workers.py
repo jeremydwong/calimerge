@@ -1313,6 +1313,7 @@ class CudaStreamDetectionWorker(QThread):
             return
 
         frames_snapshot = {}
+        frame_count = 0
 
         while self.running:
             with self._lock:
@@ -1331,6 +1332,15 @@ class CudaStreamDetectionWorker(QThread):
 
                 result = self._pipeline.process_frame(frame_list, self._sync_index)
                 self._sync_index += 1
+                frame_count += 1
+
+                if frame_count <= 3 or frame_count % 100 == 0:
+                    self.log_message.emit(
+                        f"[cuda_stream] frame {frame_count}: "
+                        f"{len(frame_list)} cams, "
+                        f"{result.num_persons} persons, "
+                        f"{result.processing_time_ms:.1f}ms"
+                    )
 
                 # Build persons list
                 all_persons_3d = []
@@ -1359,6 +1369,8 @@ class CudaStreamDetectionWorker(QThread):
 
             except Exception as e:
                 self.log_message.emit(f"[cuda_stream] Frame error: {e}")
+                import traceback
+                self.log_message.emit(f"[cuda_stream] {traceback.format_exc()}")
 
             frames_snapshot = {}
 
