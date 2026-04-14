@@ -23,7 +23,7 @@ import numpy as np
 
 # ── Constants (must match pt_common.h) ──
 PT_MAX_CAMERAS = 16
-PT_MAX_TRACKS = 8
+PT_MAX_TRACKS = 32  # must match pt_common.h
 PT_NUM_KEYPOINTS = 52  # SynthPose (must match pt_common.h)
 PT_OK = 0
 
