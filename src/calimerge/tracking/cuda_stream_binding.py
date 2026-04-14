@@ -153,17 +153,23 @@ def _load_lib():
             "Build with: src\\cuda_pipeline\\build_cuda_win32.bat release"
         )
 
-    # Add CUDA and TensorRT DLL directories to the search path so
-    # calimerge_cuda.dll can find its dependencies at load time.
+    # Add CUDA and TensorRT DLL directories to the search path.
+    # os.add_dll_directory helps ctypes find the main DLL, but TensorRT
+    # also loads builder resources dynamically (nvinfer_builder_resource_*)
+    # which requires the directories to be on PATH.
     if sys.platform == "win32":
         import os
-        for dep_dir in [
+        dep_dirs = [
             r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9\bin",
             r"C:\TensorRT\lib",
             os.environ.get("OPENCV_PATH", r"C:\OpenCV\opencv\build") + r"\x64\vc16\bin",
-        ]:
+        ]
+        for dep_dir in dep_dirs:
             if os.path.isdir(dep_dir):
                 os.add_dll_directory(dep_dir)
+                # Also prepend to PATH for TensorRT's internal dynamic loading
+                if dep_dir not in os.environ.get("PATH", ""):
+                    os.environ["PATH"] = dep_dir + ";" + os.environ.get("PATH", "")
 
     _lib = ctypes.CDLL(str(path))
     _lib_path = path
