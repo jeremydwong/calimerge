@@ -1647,9 +1647,14 @@ class WorkoutPage(QWidget):
 
     def _on_model_changed(self, _index: int = 0):
         """Restart detection when the model or backend dropdown changes."""
+        # Guard: don't restart during initial setup or if preview isn't running
+        if not self.state_manager.state.is_previewing:
+            return
         if self.detection_worker is not None:
             self._stop_detection()
-            self._start_detection()
+            # Small delay to let the old thread fully release resources
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(200, self._start_detection)
 
     def _start_detection(self):
         if self.detection_worker is not None:
@@ -1740,7 +1745,9 @@ class WorkoutPage(QWidget):
     def _stop_detection(self):
         if self.detection_worker is not None:
             self.detection_worker.stop()
-            self.detection_worker.wait()
+            if not self.detection_worker.wait(5000):
+                self.status_message.emit("Detection worker taking long to stop...")
+                self.detection_worker.wait(30000)
             self.detection_worker = None
             self._last_annotated.clear()
         self.skeleton_view.clear()
