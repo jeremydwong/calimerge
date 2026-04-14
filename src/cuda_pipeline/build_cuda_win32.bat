@@ -220,6 +220,4 @@ if exist "%BUILD_DIR%\pt_main.exe"        (echo    OK  pt_main.exe)        else 
 if exist "%BUILD_DIR%\pt_stream_main.exe" (echo    OK  pt_stream_main.exe) else (echo    MISSING  pt_stream_main.exe)
 echo ============================================================
 
-if %BUILD_ERRORS% GTR 0 (
-    echo  NOTE: %BUILD_ERRORS% test exe(s) failed (DLL is OK)
-)
+REM Success/failure is determined by the outer build_cuda.bat
