@@ -1801,7 +1801,7 @@ class WorkoutPage(QWidget):
     # ── Rotate to Human ──
 
     def _on_rotate_to_human(self):
-        self._rotate_countdown = 3
+        self._rotate_countdown = 5
         self.rotate_to_human_button.setEnabled(False)
         self.rotate_to_human_button.setText(f"Rotating in {self._rotate_countdown}s...")
         self._rotate_timer = QTimer()
@@ -1895,7 +1895,7 @@ class WorkoutPage(QWidget):
     # ── Zero at Left Foot ──
 
     def _on_zero_at_left_foot(self):
-        self._zero_countdown = 3
+        self._zero_countdown = 5
         self.zero_origin_button.setEnabled(False)
         self.zero_origin_button.setText(f"Zeroing in {self._zero_countdown}s...")
         self._zero_timer = QTimer()

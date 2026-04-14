@@ -524,162 +524,6 @@ class ExtrinsicCalibrationWorker(QThread):
         self.running = False
 
 
-class _PersonTrack:
-    """Frame-to-frame 3D person track with COM-based identity persistence.
-
-    Each track has a stable ``track_id`` that survives brief detection
-    dropouts (up to ``grace_frames``).  Matching is done via 3D hip-COM
-    proximity between consecutive frames.
-    """
-
-    __slots__ = (
-        "track_id",
-        "last_com_3d",
-        "last_keypoints_3d",
-        "frames_since_seen",
-        "is_active",
-    )
-
-    def __init__(self, track_id: int, com_3d: "np.ndarray", keypoints_3d: list):
-        self.track_id = track_id
-        self.last_com_3d = com_3d            # (3,) hip midpoint
-        self.last_keypoints_3d = keypoints_3d  # list[np.ndarray | None], len 17
-        self.frames_since_seen: int = 0
-        self.is_active: bool = True
-
-    def update(self, com_3d: "np.ndarray", keypoints_3d: list):
-        self.last_com_3d = com_3d
-        self.last_keypoints_3d = keypoints_3d
-        self.frames_since_seen = 0
-
-    def increment_lost(self, grace_frames: int = 5):
-        self.frames_since_seen += 1
-        if self.frames_since_seen > grace_frames:
-            self.is_active = False
-
-
-class _PersonTracker:
-    """Manages a set of ``_PersonTrack`` instances across frames.
-
-    Responsibilities:
-    * Match new 3D detections to existing tracks via COM proximity.
-    * Hold last-known keypoints for tracks that temporarily lose detection.
-    * Cap the number of tracked persons at ``max_persons``.
-    * Determine which person is the "primary" subject (closest to the
-      calibrated origin, i.e. the person doing the exercise).
-    """
-
-    def __init__(self, max_persons: int = 2, grace_frames: int = 5,
-                 max_com_jump_m: float = 0.3):
-        self.max_persons = max_persons
-        self.grace_frames = grace_frames
-        self.max_com_jump_m = max_com_jump_m
-        self._tracks: list[_PersonTrack] = []
-        self._next_id: int = 0
-        # Index into _tracks of the person closest to origin
-        self.primary_track_id: int | None = None
-
-    # ── public API ────────────────────────────────────────────────────
-
-    def update(self, detections: list[tuple["np.ndarray", list]]):
-        """Accept this frame's detections and update tracks.
-
-        Parameters
-        ----------
-        detections : list of (com_3d, keypoints_3d)
-            Each entry is a detected person in the current frame.
-            ``com_3d`` is a (3,) hip midpoint, ``keypoints_3d`` is the
-            list of 17 keypoints (np.ndarray | None).
-        """
-        import numpy as np
-
-        active = [t for t in self._tracks if t.is_active]
-
-        if not active and not detections:
-            return
-
-        # ── Greedy assignment by COM distance ──
-        used_det: set[int] = set()
-        used_track: set[int] = set()
-
-        if active and detections:
-            # Build cost matrix
-            n_tracks = len(active)
-            n_dets = len(detections)
-            costs = np.full((n_tracks, n_dets), 1e9)
-            for ti, track in enumerate(active):
-                for di, (com, _kps) in enumerate(detections):
-                    costs[ti, di] = float(np.linalg.norm(track.last_com_3d - com))
-
-            # Greedy assign smallest cost first (fast enough for <=4 persons)
-            for _ in range(min(n_tracks, n_dets)):
-                idx = np.argmin(costs)
-                ti, di = divmod(int(idx), n_dets)
-                dist = costs[ti, di]
-                if dist > self.max_com_jump_m:
-                    break
-                active[ti].update(detections[di][0], detections[di][1])
-                used_track.add(ti)
-                used_det.add(di)
-                costs[ti, :] = 1e9
-                costs[:, di] = 1e9
-
-        # Increment lost counter for unmatched tracks
-        for ti, track in enumerate(active):
-            if ti not in used_track:
-                track.increment_lost(self.grace_frames)
-
-        # Create new tracks for unmatched detections (up to max_persons)
-        n_active = sum(1 for t in self._tracks if t.is_active)
-        for di, (com, kps) in enumerate(detections):
-            if di in used_det:
-                continue
-            if n_active >= self.max_persons:
-                break
-            new_track = _PersonTrack(self._next_id, com, kps)
-            self._next_id += 1
-            self._tracks.append(new_track)
-            n_active += 1
-
-        # Prune dead tracks
-        self._tracks = [t for t in self._tracks if t.is_active]
-
-        # Update primary person (closest to world origin)
-        self._update_primary()
-
-    def get_ordered_persons(self) -> tuple[list[list], int]:
-        """Return (persons_3d, primary_index).
-
-        ``persons_3d`` is a list of keypoint lists, ordered by stable
-        track ID.  ``primary_index`` is the index into that list of the
-        person closest to the calibrated origin.
-        """
-        ordered = sorted(self._tracks, key=lambda t: t.track_id)
-        persons = [t.last_keypoints_3d for t in ordered]
-        primary_idx = 0
-        for i, t in enumerate(ordered):
-            if t.track_id == self.primary_track_id:
-                primary_idx = i
-                break
-        return persons, primary_idx
-
-    def reset(self):
-        self._tracks.clear()
-        self._next_id = 0
-        self.primary_track_id = None
-
-    # ── internals ─────────────────────────────────────────────────────
-
-    def _update_primary(self):
-        import numpy as np
-        if not self._tracks:
-            self.primary_track_id = None
-            return
-        best_track = min(self._tracks,
-                         key=lambda t: float(np.linalg.norm(t.last_com_3d)))
-        self.primary_track_id = best_track.track_id
-
-
 class PoseDetectionWorker(QThread):
     """Live 2D pose detection on preview frames.
 
@@ -689,24 +533,16 @@ class PoseDetectionWorker(QThread):
 
     models_loaded = Signal()           # emitted once models are ready
     detection_ready = Signal(int, object)  # port, annotated BGR frame
-    keypoints_3d_ready = Signal(list, int)  # list[list[np.ndarray | None]], primary_person_index
+    keypoints_3d_ready = Signal(list)  # list[list[np.ndarray | None]] — one entry per person
     log_message = Signal(str)
     error = Signal(str)
 
-    # SynthPose 52-keypoint skeleton (same as skeleton_view.py)
+    # COCO-17 skeleton: pairs of keypoint indices for limb drawing
     _SKELETON = [
-        (0, 1), (0, 2), (1, 3), (2, 4),
-        (0, 17), (17, 5), (17, 6), (17, 48),
-        (5, 19), (6, 18),
-        (5, 7), (7, 9), (7, 21), (7, 23), (9, 25), (9, 27),
-        (6, 8), (8, 10), (8, 20), (8, 22), (10, 24), (10, 26),
-        (5, 11), (6, 12), (11, 12),
-        (48, 51), (51, 50), (50, 49), (49, 29), (49, 28), (29, 31), (28, 30),
-        (11, 13), (13, 15), (13, 33), (13, 35), (15, 37), (15, 39),
-        (12, 14), (14, 16), (14, 32), (14, 34), (16, 36), (16, 38),
-        (15, 46), (15, 41), (41, 43), (43, 45),
-        (16, 47), (16, 40), (40, 42), (42, 44),
-        (5, 6),
+        (0, 1), (0, 2), (1, 3), (2, 4),        # head
+        (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),  # arms
+        (5, 11), (6, 12), (11, 12),              # torso
+        (11, 13), (13, 15), (12, 14), (14, 16),  # legs
     ]
 
     # Per-person color palette (BGR) — 8 distinct colors
@@ -721,8 +557,7 @@ class PoseDetectionWorker(QThread):
         (255, 140, 180),  # lavender
     ]
 
-    def __init__(self, device_name: str = "auto", cameras: dict | None = None,
-                 max_persons: int = 2):
+    def __init__(self, device_name: str = "auto", cameras: dict | None = None):
         super().__init__()
         self.device_name = device_name
         self.cameras = cameras  # dict[port, CalibratedCamera] or None
@@ -735,13 +570,6 @@ class PoseDetectionWorker(QThread):
         # Raw 2D keypoints per port for live triangulation
         # port -> list of (keypoints (17,2), scores (17,)) — one entry per detected person
         self._last_kps_per_port: dict[int, list[tuple["np.ndarray", "np.ndarray"]]] = {}
-
-        # Frame-to-frame person tracker (COM-based identity persistence)
-        self._person_tracker = _PersonTracker(
-            max_persons=max_persons,
-            grace_frames=5,
-            max_com_jump_m=0.3,
-        )
 
         # Frame queue: stores (port, frame_bgr). Only keep latest per port.
         import threading
@@ -845,7 +673,7 @@ class PoseDetectionWorker(QThread):
             # Brighter variant for keypoints
             kp_color = tuple(min(255, int(c * 1.3)) for c in color)
 
-            n = kps.shape[0]
+            n = min(17, kps.shape[0])
 
             # Draw limbs
             for i, j in self._SKELETON:
@@ -973,22 +801,8 @@ class PoseDetectionWorker(QThread):
 
         return [g for g in groups if len(g) >= 2]
 
-    @staticmethod
-    def _com_3d_from_keypoints(kps_3d: list) -> "np.ndarray | None":
-        """Compute 3D hip midpoint from a triangulated keypoint list."""
-        import numpy as np
-        L_HIP, R_HIP = 11, 12
-        pts = []
-        for idx in (L_HIP, R_HIP):
-            if idx < len(kps_3d) and kps_3d[idx] is not None and not np.isnan(kps_3d[idx]).any():
-                pts.append(np.asarray(kps_3d[idx], dtype=float))
-        if not pts:
-            return None
-        return np.mean(pts, axis=0)
-
     def _triangulate_live(self):
-        """Triangulate 3D keypoints for all matched persons, feed the
-        person tracker, and emit stable-ordered results."""
+        """Triangulate 3D keypoints for all matched persons and emit the results."""
         try:
             import cv2
             import numpy as np
@@ -1026,7 +840,7 @@ class PoseDetectionWorker(QThread):
             )
 
             # Triangulate full 17 keypoints for each matched group
-            frame_detections: list[tuple[np.ndarray, list]] = []
+            all_persons_3d = []
             for group in groups:
                 kp_dict = {}
                 for port, person_idx in group.items():
@@ -1035,16 +849,10 @@ class PoseDetectionWorker(QThread):
                 kps_3d = triangulate_keypoints(
                     kp_dict, port_to_cam_index, camera_params, projection_matrices
                 )
-                com = self._com_3d_from_keypoints(kps_3d)
-                if com is not None:
-                    frame_detections.append((com, kps_3d))
+                all_persons_3d.append(kps_3d)
 
-            # Feed into the person tracker for stable IDs + grace period
-            self._person_tracker.update(frame_detections)
-
-            persons_3d, primary_idx = self._person_tracker.get_ordered_persons()
-            if persons_3d:
-                self.keypoints_3d_ready.emit(persons_3d, primary_idx)
+            if all_persons_3d:
+                self.keypoints_3d_ready.emit(all_persons_3d)
         except Exception:
             pass
 
@@ -1054,340 +862,299 @@ class PoseDetectionWorker(QThread):
 
 
 class MediaPipeHandsDetectionWorker(QThread):
-    """Live hand detection using MediaPipe Hands.
+    """Live 2D hand detection with multi-view 3D triangulation.
 
-    Same signal interface as PoseDetectionWorker. Runs MediaPipe on each
-    camera frame independently (2D only — no triangulation). Draws hand
-    landmarks + connections on the annotated frame. Emits hand landmark
-    positions via keypoints_3d_ready (using 2D pixel coords as x,y and 0 as z
-    so the signal type matches, but the skeleton view won't be meaningful).
+    Uses MediaPipe Hands to detect 21 hand landmarks per camera,
+    matches hands across cameras by wrist landmark triangulation,
+    and emits triangulated 3D hand landmarks.
     """
 
     models_loaded = Signal()
-    detection_ready = Signal(int, object)
-    keypoints_3d_ready = Signal(list, int)
+    detection_ready = Signal(int, object)  # port, annotated BGR frame
+    keypoints_3d_ready = Signal(list)  # list[list[np.ndarray | None]] — one entry per hand
     log_message = Signal(str)
     error = Signal(str)
 
-    def __init__(self, max_hands: int = 2):
+    # MediaPipe hand landmark connections for drawing
+    _HAND_CONNECTIONS = [
+        # Thumb
+        (0, 1), (1, 2), (2, 3), (3, 4),
+        # Index finger
+        (0, 5), (5, 6), (6, 7), (7, 8),
+        # Middle finger
+        (0, 9), (9, 10), (10, 11), (11, 12),
+        # Ring finger
+        (0, 13), (13, 14), (14, 15), (15, 16),
+        # Pinky
+        (0, 17), (17, 18), (18, 19), (19, 20),
+        # Palm
+        (5, 9), (9, 13), (13, 17),
+    ]
+
+    # Per-hand colors (BGR)
+    _HAND_COLORS = [
+        (80, 200, 255),   # yellow-orange
+        (255, 160, 100),  # blue
+        (80, 255, 80),    # green
+        (220, 100, 220),  # purple
+    ]
+
+    def __init__(self, cameras: dict | None = None):
         super().__init__()
-        self.max_hands = max_hands
+        self.cameras = cameras  # dict[port, CalibratedCamera] or None
         self.running = True
+        self._mp_hands = None
+
+        self.confidence_threshold = 0.5
+
+        # Raw 2D landmarks per port for triangulation
+        # port -> list of (landmarks (21,2), handedness str)
+        self._last_hands_per_port: dict[int, list[tuple["np.ndarray", str]]] = {}
 
         import threading
         self._lock = threading.Lock()
-        self._pending_frames: dict[int, "np.ndarray"] = {}
-
-    def submit_frame(self, port: int, frame: "np.ndarray"):
-        with self._lock:
-            self._pending_frames[port] = frame.copy()
-
-    def run(self):
-        try:
-            from ..tracking.hand_detector import detect_hands, get_thumb_index_distance
-            import cv2
-            import numpy as np
-        except Exception as e:
-            self.error.emit(f"MediaPipe Hands init failed: {e}")
-            return
-
-        self.models_loaded.emit()
-        self.log_message.emit("[mediapipe_hands] Ready")
-
-        # MediaPipe hand connections for drawing
-        HAND_CONNECTIONS = [
-            (0, 1), (1, 2), (2, 3), (3, 4),      # thumb
-            (0, 5), (5, 6), (6, 7), (7, 8),      # index
-            (0, 9), (9, 10), (10, 11), (11, 12),  # middle
-            (0, 13), (13, 14), (14, 15), (15, 16), # ring
-            (0, 17), (17, 18), (18, 19), (19, 20), # pinky
-            (5, 9), (9, 13), (13, 17),             # palm
-        ]
-
-        while self.running:
-            with self._lock:
-                if self._pending_frames:
-                    frames_snapshot = dict(self._pending_frames)
-                    self._pending_frames.clear()
-                else:
-                    frames_snapshot = {}
-
-            if not frames_snapshot:
-                time.sleep(0.01)
-                continue
-
-            for port, bgr in frames_snapshot.items():
-                try:
-                    hands = detect_hands(bgr, max_hands=self.max_hands)
-                    annotated = bgr.copy()
-                    h, w = bgr.shape[:2]
-
-                    for hand in hands:
-                        # hand is a list of 21 (x, y, z) normalized landmarks
-                        pts = [(int(lm[0] * w), int(lm[1] * h)) for lm in hand]
-
-                        # Draw connections
-                        for i, j in HAND_CONNECTIONS:
-                            if i < len(pts) and j < len(pts):
-                                cv2.line(annotated, pts[i], pts[j],
-                                         (0, 255, 128), 2, cv2.LINE_AA)
-
-                        # Draw landmarks
-                        for pt in pts:
-                            cv2.circle(annotated, pt, 3, (0, 200, 255),
-                                       -1, cv2.LINE_AA)
-
-                        # Show thumb-index distance
-                        if len(hand) >= 9:
-                            dist = get_thumb_index_distance(hand)
-                            thumb_pt = pts[4]
-                            cv2.putText(annotated,
-                                        f"{dist:.0f}px",
-                                        (thumb_pt[0] + 10, thumb_pt[1]),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                                        (255, 255, 255), 1, cv2.LINE_AA)
-
-                    self.detection_ready.emit(port, annotated)
-
-                except Exception as e:
-                    self.log_message.emit(f"[mediapipe_hands] Error on port {port}: {e}")
-
-    def stop(self):
-        self.running = False
-
-
-class CudaStreamDetectionWorker(QThread):
-    """Live 3D pose detection using the CUDA TensorRT streaming pipeline.
-
-    Same signal interface as PoseDetectionWorker so the GUI can swap between
-    them transparently. This worker:
-    - Runs detection + matching + triangulation + tracking on GPU (~10ms/frame)
-    - Reprojects 3D keypoints to 2D per camera for overlays (zero GPU cost)
-    - Has its own built-in multiperson tracker with stable person IDs
-    """
-
-    models_loaded = Signal()
-    detection_ready = Signal(int, object)      # port, annotated_frame
-    keypoints_3d_ready = Signal(list, int)     # persons, primary_index
-    log_message = Signal(str)
-    error = Signal(str)
-
-    # SynthPose 52-keypoint skeleton (CUDA overlay, same side-correct ordering)
-    _SKELETON = [
-        (0, 1), (0, 2), (1, 3), (2, 4),
-        (0, 17), (17, 5), (17, 6), (17, 48),
-        (5, 19), (6, 18),
-        (5, 7), (7, 9), (7, 21), (7, 23), (9, 25), (9, 27),
-        (6, 8), (8, 10), (8, 20), (8, 22), (10, 24), (10, 26),
-        (5, 11), (6, 12), (11, 12),
-        (48, 51), (51, 50), (50, 49), (49, 29), (49, 28), (29, 31), (28, 30),
-        (11, 13), (13, 15), (13, 33), (13, 35), (15, 37), (15, 39),
-        (12, 14), (14, 16), (14, 32), (14, 34), (16, 36), (16, 38),
-        # Left foot (15=L_Ankle)
-        (15, 46), (15, 41), (41, 43), (43, 45),  # l_calc, l_5meta→l_toe→l_big_toe
-        # Right foot (16=R_Ankle)
-        (16, 47), (16, 40), (40, 42), (42, 44),  # r_calc, r_5meta→r_toe→r_big_toe
-        (5, 6),
-    ]
-    _PERSON_COLORS = [
-        (120, 200, 80), (255, 160, 100), (220, 100, 220),
-        (100, 100, 255), (100, 220, 220), (255, 220, 80),
-    ]
-
-    def __init__(self, cameras: dict, calibration_path: str,
-                 yolo_onnx: str = "", vitpose_onnx: str = "",
-                 engine_cache: str = "", max_persons: int = 2):
-        super().__init__()
-        self.cameras = cameras
-        self.calibration_path = calibration_path
-        self.yolo_onnx = yolo_onnx
-        self.vitpose_onnx = vitpose_onnx
-        self.engine_cache = engine_cache
-        self.max_persons = max_persons
-        self.running = True
-        self._pipeline = None
-        self._proj_matrices: dict[int, "np.ndarray"] = {}  # port → 3x4
-
-        import threading
-        self._lock = threading.Lock()
-        self._pending_frames: dict[int, "np.ndarray"] = {}
-        self._sync_index = 0
+        self._pending: dict[int, "np.ndarray"] = {}
+        self._has_work = threading.Event()
 
     def submit_frame(self, port: int, frame: "np.ndarray"):
         """Submit a frame for detection (non-blocking, keeps only latest per port)."""
         with self._lock:
-            self._pending_frames[port] = frame.copy()
+            self._pending[port] = frame
+        self._has_work.set()
 
-    def _build_projection_matrices(self):
-        """Precompute 3x4 projection matrices for each camera (for 3D→2D reprojection)."""
-        import numpy as np
-        for port, cam in self.cameras.items():
-            K = np.asarray(cam.intrinsics.matrix, dtype=np.float64)
-            R = np.asarray(cam.extrinsics.rotation, dtype=np.float64)
-            t = np.asarray(cam.extrinsics.translation, dtype=np.float64).reshape(3, 1)
-            Rt = np.hstack([R, t])
-            self._proj_matrices[port] = K @ Rt
+    def run(self):
+        try:
+            import mediapipe as mp
+            self._mp_hands = mp.solutions.hands.Hands(
+                static_image_mode=False,
+                max_num_hands=2,
+                min_detection_confidence=self.confidence_threshold,
+                min_tracking_confidence=0.5,
+            )
+            self.models_loaded.emit()
+            self.log_message.emit("MediaPipe Hands ready")
+        except Exception as e:
+            self.error.emit(f"Failed to load MediaPipe Hands: {e}")
+            return
 
-    def _project_3d_to_2d(self, point_3d, proj_matrix):
-        """Project a 3D point to 2D pixel coordinates. Returns (x, y) or None."""
-        import numpy as np
-        if point_3d is None:
-            return None
-        pt = np.asarray(point_3d, dtype=np.float64)
-        if pt.shape != (3,) or np.isnan(pt).any():
-            return None
-        h = proj_matrix @ np.append(pt, 1.0)
-        if abs(h[2]) < 1e-6:
-            return None
-        return (int(h[0] / h[2]), int(h[1] / h[2]))
+        while self.running:
+            self._has_work.wait(timeout=0.1)
+            if not self.running:
+                break
+            self._has_work.clear()
 
-    def _draw_overlay(self, frame, persons_3d, port):
-        """Draw reprojected 3D skeletons onto a BGR frame for one camera.
+            with self._lock:
+                work = dict(self._pending)
+                self._pending.clear()
 
-        Cost: ~0.2ms on CPU per frame (just cv2.circle + cv2.line).
-        """
+            if not work:
+                continue
+
+            for port, frame_bgr in work.items():
+                if not self.running:
+                    break
+                try:
+                    annotated = self._detect_and_draw(port, frame_bgr)
+                    self.detection_ready.emit(port, annotated)
+                except Exception:
+                    self.detection_ready.emit(port, frame_bgr)
+
+            # Attempt triangulation if calibration available
+            if self.cameras is not None and len(self._last_hands_per_port) >= 2:
+                self._triangulate_hands()
+
+        if self._mp_hands is not None:
+            self._mp_hands.close()
+
+    def _detect_and_draw(self, port: int, frame_bgr: "np.ndarray") -> "np.ndarray":
+        """Run MediaPipe Hands on a single frame and draw landmarks."""
         import cv2
         import numpy as np
 
-        proj = self._proj_matrices.get(port)
-        if proj is None:
-            return frame
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        results = self._mp_hands.process(rgb)
 
-        annotated = frame.copy()
+        if not results.multi_hand_landmarks:
+            self._last_hands_per_port.pop(port, None)
+            return frame_bgr
 
-        for p_idx, person_kps in enumerate(persons_3d):
-            color = self._PERSON_COLORS[p_idx % len(self._PERSON_COLORS)]
-            pts_2d = [self._project_3d_to_2d(kp, proj) for kp in person_kps]
+        h, w = frame_bgr.shape[:2]
+        vis = frame_bgr.copy()
+        port_hands: list[tuple[np.ndarray, str]] = []
+        n_colors = len(self._HAND_COLORS)
 
-            # Draw limbs
-            for i, j in self._SKELETON:
-                if i < len(pts_2d) and j < len(pts_2d):
-                    pi, pj = pts_2d[i], pts_2d[j]
-                    if pi is not None and pj is not None:
-                        cv2.line(annotated, pi, pj, color, 2, cv2.LINE_AA)
+        for hand_idx, (hand_lm, hand_info) in enumerate(
+            zip(results.multi_hand_landmarks, results.multi_handedness)
+        ):
+            color = self._HAND_COLORS[hand_idx % n_colors]
+            handedness = hand_info.classification[0].label  # "Left" or "Right"
 
-            # Draw keypoints
-            for pt in pts_2d:
-                if pt is not None:
-                    cv2.circle(annotated, pt, 4, color, -1, cv2.LINE_AA)
+            # Extract 21 landmarks as pixel coordinates
+            landmarks = np.array(
+                [(lm.x * w, lm.y * h) for lm in hand_lm.landmark],
+                dtype=np.float32,
+            )
+            port_hands.append((landmarks, handedness))
 
-        return annotated
+            # Draw connections
+            for i, j in self._HAND_CONNECTIONS:
+                pt1 = (int(landmarks[i, 0]), int(landmarks[i, 1]))
+                pt2 = (int(landmarks[j, 0]), int(landmarks[j, 1]))
+                cv2.line(vis, pt1, pt2, color, 2, cv2.LINE_AA)
 
-    def run(self):
-        import numpy as np
+            # Draw landmarks
+            for k in range(21):
+                pt = (int(landmarks[k, 0]), int(landmarks[k, 1]))
+                cv2.circle(vis, pt, 3, color, -1, cv2.LINE_AA)
 
+            # Label
+            wrist = (int(landmarks[0, 0]), int(landmarks[0, 1]) - 10)
+            cv2.putText(vis, handedness, wrist,
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+
+        self._last_hands_per_port[port] = port_hands
+        return vis
+
+    def _triangulate_hands(self):
+        """Triangulate 3D hand landmarks across cameras.
+
+        Matches hands across cameras by triangulating wrist landmarks (index 0)
+        and finding pairs with valid (in-front-of-camera) 3D positions.
+        """
         try:
-            from ..tracking.cuda_stream_binding import CudaStreamPipeline
+            import cv2
+            import numpy as np
+            from ..tracking.triangulation import calculate_projection_matrices, triangulate_keypoints
 
+            # Build camera_params
             sorted_ports = sorted(self.cameras.keys())
-            first_cam = self.cameras[sorted_ports[0]]
-            w, h = first_cam.intrinsics.resolution
+            camera_params, port_to_cam_index = [], {}
+            for i, port in enumerate(sorted_ports):
+                cam = self.cameras[port]
+                rvec, _ = cv2.Rodrigues(cam.extrinsics.rotation)
+                camera_params.append({
+                    "matrix": cam.intrinsics.matrix,
+                    "distortions": cam.intrinsics.distortion,
+                    "size": np.array(cam.intrinsics.resolution),
+                    "rotation": rvec.flatten(),
+                    "translation": cam.extrinsics.translation,
+                    "port": port,
+                })
+                port_to_cam_index[port] = i
 
-            self.log_message.emit(
-                f"[cuda_stream] Initializing pipeline "
-                f"({len(sorted_ports)} cameras, {w}x{h})..."
+            projection_matrices = calculate_projection_matrices(camera_params)
+
+            port_hands = {
+                port: hands
+                for port, hands in self._last_hands_per_port.items()
+                if port in port_to_cam_index and hands
+            }
+            if len(port_hands) < 2:
+                return
+
+            # Match hands across cameras using wrist landmark (index 0)
+            groups = self._match_hands_wrist(
+                port_hands, port_to_cam_index, camera_params, projection_matrices
             )
 
-            def _log(msg):
-                self.log_message.emit(f"[cuda_stream] {msg}")
-
-            self._pipeline = CudaStreamPipeline(
-                num_cameras=len(sorted_ports),
-                frame_width=w,
-                frame_height=h,
-                calibration_toml_path=self.calibration_path,
-                yolo_onnx_path=self.yolo_onnx,
-                vitpose_onnx_path=self.vitpose_onnx,
-                engine_cache_dir=self.engine_cache,
-                max_persons=self.max_persons,
-                log_callback=_log,
-            )
-
-            self._build_projection_matrices()
-
-            self.models_loaded.emit()
-            self.log_message.emit("[cuda_stream] Pipeline ready")
-
-        except Exception as e:
-            self.error.emit(f"CUDA pipeline init failed: {e}")
-            return
-
-        frames_snapshot = {}
-        frame_count = 0
-
-        while self.running:
-            with self._lock:
-                if self._pending_frames:
-                    frames_snapshot = dict(self._pending_frames)
-                    self._pending_frames.clear()
-
-            if not frames_snapshot:
-                time.sleep(0.005)
-                continue
-
-            try:
-                frame_list = []
-                for port in sorted(frames_snapshot.keys()):
-                    frame_list.append((frames_snapshot[port], port))
-
-                result = self._pipeline.process_frame(frame_list, self._sync_index)
-                self._sync_index += 1
-                frame_count += 1
-
-                if frame_count <= 3 or frame_count % 100 == 0:
-                    self.log_message.emit(
-                        f"[cuda_stream] frame {frame_count}: "
-                        f"{len(frame_list)} cams, "
-                        f"{result.num_persons} persons, "
-                        f"{result.processing_time_ms:.1f}ms"
+            # Triangulate full 21 landmarks for each matched hand
+            all_hands_3d = []
+            for group in groups:
+                kp_dict = {}
+                for port, hand_idx in group.items():
+                    landmarks, _handedness = port_hands[port][hand_idx]
+                    # Add confidence=1.0 column (MediaPipe doesn't give per-landmark confidence)
+                    kp_with_conf = np.concatenate(
+                        [landmarks, np.ones((21, 1), dtype=np.float32)], axis=1
                     )
-
-                # Build persons list
-                all_persons_3d = []
-                primary_index = 0
-                min_origin_dist = float("inf")
-
-                for i, person in enumerate(result.persons):
-                    all_persons_3d.append(person.keypoints_3d)
-                    if person.com_3d is not None:
-                        dist = float(np.linalg.norm(person.com_3d))
-                        if dist < min_origin_dist:
-                            min_origin_dist = dist
-                            primary_index = i
-
-                # Emit 3D keypoints
-                if all_persons_3d:
-                    self.keypoints_3d_ready.emit(all_persons_3d, primary_index)
-
-                # Draw 2D overlays by reprojecting 3D → 2D per camera
-                for port, bgr in frames_snapshot.items():
-                    if all_persons_3d:
-                        annotated = self._draw_overlay(bgr, all_persons_3d, port)
-                    else:
-                        annotated = bgr
-                    self.detection_ready.emit(port, annotated)
-
-            except Exception as e:
-                self.log_message.emit(f"[cuda_stream] Frame error: {e}")
-                import traceback
-                self.log_message.emit(f"[cuda_stream] {traceback.format_exc()}")
-
-            frames_snapshot = {}
-
-        # Cleanup
-        if self._pipeline is not None:
-            stats = self._pipeline.get_stats()
-            if stats.frames_processed > 0:
-                avg = stats.total_ms / stats.frames_processed
-                self.log_message.emit(
-                    f"[cuda_stream] Processed {stats.frames_processed} frames, "
-                    f"avg {avg:.1f}ms/frame"
+                    kp_dict[port] = kp_with_conf
+                kps_3d = triangulate_keypoints(
+                    kp_dict, port_to_cam_index, camera_params, projection_matrices
                 )
-            self._pipeline.close()
-            self._pipeline = None
+                all_hands_3d.append(kps_3d)
+
+            if all_hands_3d:
+                self.keypoints_3d_ready.emit(all_hands_3d)
+        except Exception:
+            pass
+
+    def _match_hands_wrist(
+        self,
+        port_hands: "dict[int, list[tuple]]",
+        port_to_cam_index: "dict[int, int]",
+        camera_params: list,
+        projection_matrices: list,
+    ) -> "list[dict[int, int]]":
+        """Match hands across ports via wrist (landmark 0) triangulation.
+
+        Similar to PoseDetectionWorker._match_persons_hip_com but uses
+        wrist position instead of hip COM.
+        """
+        import numpy as np
+        from ..tracking.triangulation import triangulate_keypoints
+
+        ref_port = max(port_hands, key=lambda p: len(port_hands[p]))
+        n_ref = len(port_hands[ref_port])
+        groups: list[dict[int, int]] = [{ref_port: i} for i in range(n_ref)]
+
+        # Extract wrist 2D + confidence for each hand in each port
+        wrist_pts: dict[int, list["np.ndarray | None"]] = {}
+        for port, hands in port_hands.items():
+            wrist_pts[port] = []
+            for landmarks, _handedness in hands:
+                # wrist is landmark 0
+                wrist_2d = landmarks[0]
+                wrist_pts[port].append(np.array([wrist_2d[0], wrist_2d[1], 1.0]))
+
+        for other_port in port_hands:
+            if other_port == ref_port:
+                continue
+            claimed: set[int] = set()
+            n_other = len(port_hands[other_port])
+
+            for i in range(n_ref):
+                ref_wrist = wrist_pts[ref_port][i]
+                if ref_wrist is None:
+                    continue
+
+                best_j = None
+                best_dist = float("inf")
+
+                for j in range(n_other):
+                    if j in claimed:
+                        continue
+                    other_wrist = wrist_pts[other_port][j]
+                    if other_wrist is None:
+                        continue
+
+                    result = triangulate_keypoints(
+                        {ref_port: ref_wrist[np.newaxis], other_port: other_wrist[np.newaxis]},
+                        port_to_cam_index, camera_params, projection_matrices,
+                    )
+                    pt3d = result[0] if result else None
+                    if pt3d is None or np.isnan(pt3d).any():
+                        continue
+
+                    # Check if point is in front of both cameras
+                    ref_cam = camera_params[port_to_cam_index[ref_port]]
+                    other_cam = camera_params[port_to_cam_index[other_port]]
+                    if not PoseDetectionWorker._is_in_front(pt3d, [ref_cam, other_cam]):
+                        continue
+
+                    dist = float(np.linalg.norm(pt3d))
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_j = j
+
+                if best_j is not None:
+                    groups[i][other_port] = best_j
+                    claimed.add(best_j)
+
+        return [g for g in groups if len(g) >= 2]
 
     def stop(self):
         self.running = False
+        self._has_work.set()
 
 
 class ProcessingWorker(QThread):
