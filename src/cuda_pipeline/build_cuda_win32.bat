@@ -74,6 +74,7 @@ nvcc -c %NVCC_OPT% --use_fast_math ^
     -Xcompiler "/MD %OPTIMIZE% /EHsc" ^
     -I"%CUDA_PATH%\include" ^
     -I"%TENSORRT_PATH%\include" ^
+    -I"..\pt_shared" ^
     -o "%BUILD_DIR%\pt_arena.obj" pt_arena.cu
 
 if errorlevel 1 (
@@ -87,6 +88,7 @@ nvcc -c %NVCC_OPT% --use_fast_math ^
     -Xcompiler "/MD %OPTIMIZE% /EHsc" ^
     -I"%CUDA_PATH%\include" ^
     -I"%TENSORRT_PATH%\include" ^
+    -I"..\pt_shared" ^
     -o "%BUILD_DIR%\pt_kernels.obj" pt_kernels.cu
 
 if errorlevel 1 (

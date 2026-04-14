@@ -346,23 +346,8 @@ typedef struct {
  * Matches Python SynthPoseMarkers dict in pose_detector.py:30.
  * ============================================================================ */
 
-static const char *PT_EXPORT_MARKER_NAMES[PT_NUM_KEYPOINTS] = {
-    /* 0-16: COCO keypoints (from VitPose model output) */
-    "Nose", "L_Eye", "R_Eye", "L_Ear", "R_Ear",
-    "L_Shoulder", "R_Shoulder", "L_Elbow", "R_Elbow",
-    "L_Wrist", "R_Wrist", "L_Hip", "R_Hip",
-    "L_Knee", "R_Knee", "L_Ankle", "R_Ankle",
-    /* 17-51: SynthPose extended markers (not produced by model, NaN in CSV) */
-    "sternum", "rshoulder", "lshoulder",
-    "r_lelbow", "l_lelbow", "r_melbow", "l_melbow",
-    "r_lwrist", "l_lwrist", "r_mwrist", "l_mwrist",
-    "r_ASIS", "l_ASIS", "r_PSIS", "l_PSIS",
-    "r_knee", "l_knee", "r_mknee", "l_mknee",
-    "r_ankle", "l_ankle", "r_mankle", "l_mankle",
-    "r_5meta", "l_5meta", "r_toe", "l_toe",
-    "r_big_toe", "l_big_toe", "l_calc", "r_calc",
-    "C7", "L2", "T11", "T6"
-};
+/* PT_EXPORT_MARKER_NAMES is defined in pt_export.cpp (not in this header)
+ * to avoid NVCC compilation issues with large static string arrays. */
 
 #ifdef __cplusplus
 }

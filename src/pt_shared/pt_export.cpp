@@ -18,10 +18,29 @@
  * The ring buffer in PT_PersonTrack is walked in chronological order
  * (oldest to newest) to produce sorted output.
  *
+ * PT_EXPORT_MARKER_NAMES is defined here (moved out of pt_common.h to
+ * avoid NVCC compilation issues with large static string arrays).
+ *
  * Style: Plain C structs + free functions. No classes, no templates, no STL.
  */
 
 #include "pt_export.h"
+
+static const char *PT_EXPORT_MARKER_NAMES[PT_NUM_KEYPOINTS] = {
+    "Nose", "L_Eye", "R_Eye", "L_Ear", "R_Ear",
+    "L_Shoulder", "R_Shoulder", "L_Elbow", "R_Elbow",
+    "L_Wrist", "R_Wrist", "L_Hip", "R_Hip",
+    "L_Knee", "R_Knee", "L_Ankle", "R_Ankle",
+    "sternum", "rshoulder", "lshoulder",
+    "r_lelbow", "l_lelbow", "r_melbow", "l_melbow",
+    "r_lwrist", "l_lwrist", "r_mwrist", "l_mwrist",
+    "r_ASIS", "l_ASIS", "r_PSIS", "l_PSIS",
+    "r_knee", "l_knee", "r_mknee", "l_mknee",
+    "r_ankle", "l_ankle", "r_mankle", "l_mankle",
+    "r_5meta", "l_5meta", "r_toe", "l_toe",
+    "r_big_toe", "l_big_toe", "l_calc", "r_calc",
+    "C7", "L2", "T11", "T6"
+};
 
 #include <stdio.h>
 #include <stdlib.h>
