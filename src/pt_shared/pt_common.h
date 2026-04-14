@@ -31,7 +31,7 @@ extern "C" {
 #define PT_MAX_CAMERAS          16
 #define PT_MAX_PERSONS          8       /* max tracked persons simultaneously */
 #define PT_MAX_TRACKS           32      /* max track slots (active + recently lost) */
-#define PT_NUM_KEYPOINTS        17      /* VitPose COCO keypoint count (model output) */
+#define PT_NUM_KEYPOINTS        52      /* VitPose SynthPose keypoint count (model output) */
 #define PT_MAX_DETECTIONS       16      /* max person detections per image */
 #define PT_MAX_GROUPS           32      /* max cross-view groups per sync index */
 #define PT_PIPELINE_DEPTH       2       /* double-buffer: decode N+1 while processing N */

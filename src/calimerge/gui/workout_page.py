@@ -1695,7 +1695,7 @@ class WorkoutPage(QWidget):
         repo_root = str(Path(__file__).resolve().parent.parent.parent.parent)
 
         yolo_onnx = str(Path(repo_root) / "models" / "onnx" / "yolo_v10s.onnx")
-        vitpose_onnx = str(Path(repo_root) / "models" / "onnx" / "vitpose_base_coco.onnx")
+        vitpose_onnx = str(Path(repo_root) / "models" / "onnx" / "vitpose_synthpose.onnx")
         engine_cache = str(Path(project_folder) / "engine_cache") if project_folder else ""
 
         self.detection_worker = CudaStreamDetectionWorker(
