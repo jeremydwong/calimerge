@@ -26,28 +26,43 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QPainter, QColor, QPen, QFont
 
 
-# SynthPose 52-keypoint skeleton connections (draws whatever keypoints are available)
+# SynthPose 52-keypoint skeleton connections.
+# Convention: r_ = right side body, l_ = left side body.
+# 20=r_lelbow (right lateral elbow) → connects to 8 (R_Elbow), NOT 7.
 _SKELETON = [
     # Head
     (0, 1), (0, 2), (1, 3), (2, 4),
     # Neck / shoulders
     (0, 17), (17, 5), (17, 6), (17, 48),
-    # Arms
-    (5, 7), (7, 9), (6, 8), (8, 10),
-    (7, 20), (7, 22), (8, 21), (8, 23),
-    (9, 24), (9, 26), (10, 25), (10, 27),
+    (5, 19), (6, 18),                         # shoulder landmarks (l/r)
+    # Left arm: 5→7→9 with landmarks
+    (5, 7), (7, 9),
+    (7, 21), (7, 23),                         # l_lelbow, l_melbow
+    (9, 25), (9, 27),                         # l_lwrist, l_mwrist
+    # Right arm: 6→8→10 with landmarks
+    (6, 8), (8, 10),
+    (8, 20), (8, 22),                         # r_lelbow, r_melbow
+    (10, 24), (10, 26),                       # r_lwrist, r_mwrist
     # Torso
     (5, 11), (6, 12), (11, 12),
-    (48, 51), (51, 50), (50, 49),
-    (49, 28), (49, 29), (28, 30), (29, 31),
-    # Legs
-    (11, 13), (13, 15), (12, 14), (14, 16),
-    (13, 32), (13, 34), (14, 33), (14, 35),
-    (15, 36), (15, 38), (16, 37), (16, 39),
-    # Feet
-    (15, 46), (16, 47), (15, 40), (16, 41),
-    (40, 42), (41, 43), (42, 44), (43, 45),
-    # Fallback COCO-only connections (used when SynthPose kps 17+ are absent)
+    (48, 51), (51, 50), (50, 49),             # spine: C7→T6→T11→L2
+    (49, 29), (49, 28),                       # L2→ASIS (l/r)
+    (29, 31), (28, 30),                       # ASIS→PSIS (l/r)
+    # Left leg: 11→13→15 with landmarks
+    (11, 13), (13, 15),
+    (13, 33), (13, 35),                       # l_knee, l_mknee
+    (15, 37), (15, 39),                       # l_ankle, l_mankle
+    # Right leg: 12→14→16 with landmarks
+    (12, 14), (14, 16),
+    (14, 32), (14, 34),                       # r_knee, r_mknee
+    (16, 36), (16, 38),                       # r_ankle, r_mankle
+    # Left foot
+    (15, 46), (15, 41),                       # l_calc, l_5meta
+    (41, 43), (43, 45),                       # l_5meta→l_toe→l_big_toe
+    # Right foot
+    (16, 47), (16, 40),                       # r_calc, r_5meta
+    (40, 42), (42, 44),                       # r_5meta→r_toe→r_big_toe
+    # Fallback COCO (used when SynthPose kps 17+ are absent)
     (5, 6),
 ]
 
