@@ -148,6 +148,18 @@ def _load_lib():
             "Build with: src\\cuda_pipeline\\build_cuda_win32.bat release"
         )
 
+    # Add CUDA and TensorRT DLL directories to the search path so
+    # calimerge_cuda.dll can find its dependencies at load time.
+    if sys.platform == "win32":
+        import os
+        for dep_dir in [
+            r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9\bin",
+            r"C:\TensorRT\lib",
+            os.environ.get("OPENCV_PATH", r"C:\OpenCV\opencv\build") + r"\x64\vc16\bin",
+        ]:
+            if os.path.isdir(dep_dir):
+                os.add_dll_directory(dep_dir)
+
     _lib = ctypes.CDLL(str(path))
     _lib_path = path
 
@@ -185,8 +197,14 @@ def _load_lib():
 
 
 def is_available() -> bool:
-    """Return True if the CUDA streaming pipeline DLL is found."""
-    return _find_cuda_lib() is not None
+    """Return True if the CUDA streaming pipeline DLL can be loaded."""
+    if _find_cuda_lib() is None:
+        return False
+    try:
+        _load_lib()
+        return True
+    except Exception:
+        return False
 
 
 # ── High-level API ──
@@ -376,4 +394,7 @@ class CudaStreamPipeline:
             self._handle = ctypes.c_void_p(None)
 
     def __del__(self):
-        self.close()
+        try:
+            self.close()
+        except AttributeError:
+            pass
