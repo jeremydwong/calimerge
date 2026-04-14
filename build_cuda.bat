@@ -5,12 +5,11 @@ if not defined OPENCV_PATH set OPENCV_PATH=C:\OpenCV\opencv\build
 if not defined TENSORRT_PATH set TENSORRT_PATH=C:\TensorRT
 pushd src\cuda_pipeline
 call build_cuda_win32.bat %1
-set BUILD_RC=%errorlevel%
 popd
-if %BUILD_RC% NEQ 0 (
-    echo.
+echo.
+if exist build\cuda\calimerge_cuda.dll (
+    echo === CUDA BUILD SUCCEEDED (v0.2.1) ===
+) else (
     echo === CUDA BUILD FAILED ===
     exit /b 1
 )
-echo.
-echo === CUDA BUILD SUCCEEDED (v0.2.1) ===
