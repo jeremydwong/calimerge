@@ -298,11 +298,12 @@ static int load_calibration_toml(PT_CameraConstants *constants, const char *path
             continue;
         }
 
-        /* Section header: [camera_N] or [cam_N] (caliscope format) */
+        /* Section header: [camera_N], [cam_N] (caliscope) or [cameras.N] (calimerge) */
         if (*trimmed == '[') {
             int cam_idx = -1;
             if (sscanf(trimmed, "[camera_%d]", &cam_idx) == 1 ||
-                sscanf(trimmed, "[cam_%d]", &cam_idx) == 1) {
+                sscanf(trimmed, "[cam_%d]", &cam_idx) == 1 ||
+                sscanf(trimmed, "[cameras.%d]", &cam_idx) == 1) {
                 if (cam_idx >= 0 && cam_idx < PT_MAX_CAMERAS) {
                     current_cam = cam_idx;
                     /* Default port to section index (matches Python cs_parse.py:648

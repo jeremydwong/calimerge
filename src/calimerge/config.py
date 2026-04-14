@@ -1083,6 +1083,43 @@ def save_session_result(session_id: int, metric_name: str, metric_value: float,
     conn.close()
 
 
+def write_cuda_calibration_toml(cameras: dict, output_path: Path) -> None:
+    """Write a calibration TOML in the format the CUDA C parser expects.
+
+    The CUDA parser needs intrinsics (matrix, distortion, size) inline per
+    camera section, unlike the calimerge format which stores them in SQLite.
+    This function writes a complete file from CalibratedCamera objects.
+    """
+    import cv2
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w") as f:
+        for port in sorted(cameras.keys()):
+            cam = cameras[port]
+            f.write(f"[cam_{port}]\n")
+            f.write(f"port = {port}\n")
+
+            w, h = cam.intrinsics.resolution
+            f.write(f"size = [{w}, {h}]\n")
+
+            # Camera matrix as nested array
+            K = cam.intrinsics.matrix
+            f.write(f"matrix = [[{K[0,0]}, {K[0,1]}, {K[0,2]}], "
+                    f"[{K[1,0]}, {K[1,1]}, {K[1,2]}], "
+                    f"[{K[2,0]}, {K[2,1]}, {K[2,2]}]]\n")
+
+            d = cam.intrinsics.distortion
+            f.write(f"distortions = [{d[0]}, {d[1]}, {d[2]}, {d[3]}, {d[4]}]\n")
+
+            # Rotation as Rodrigues (3 values)
+            rvec = cv2.Rodrigues(cam.extrinsics.rotation)[0].flatten()
+            f.write(f"rotation = [{rvec[0]}, {rvec[1]}, {rvec[2]}]\n")
+
+            t = cam.extrinsics.translation
+            f.write(f"translation = [{t[0]}, {t[1]}, {t[2]}]\n")
+            f.write("\n")
+
+
 def delete_session_results(session_id: int,
                            db_path: Path = DEFAULT_WORKOUTS_DB) -> None:
     """Remove all stored metrics for a session. Used before re-analysis."""

@@ -1686,21 +1686,27 @@ class WorkoutPage(QWidget):
     def _start_cuda_detection(self, cameras):
         """Start the CUDA TensorRT streaming detection worker."""
         from .workers import CudaStreamDetectionWorker
-        from ..config import load_app_settings
+        from ..config import load_app_settings, write_cuda_calibration_toml
+        import tempfile
+
+        # Write a CUDA-compatible calibration TOML (C parser needs intrinsics inline)
+        cuda_cal_path = Path(tempfile.gettempdir()) / "calimerge_cuda_calibration.toml"
+        write_cuda_calibration_toml(cameras, cuda_cal_path)
 
         # Find ONNX model paths
         app = load_app_settings()
         project_folder = app.get("last_project_folder", "")
-        # workout_page.py is at src/calimerge/gui/ — 4 levels to repo root
         repo_root = str(Path(__file__).resolve().parent.parent.parent.parent)
 
         yolo_onnx = str(Path(repo_root) / "models" / "onnx" / "yolo_v10s.onnx")
         vitpose_onnx = str(Path(repo_root) / "models" / "onnx" / "vitpose_synthpose.onnx")
         engine_cache = str(Path(project_folder) / "engine_cache") if project_folder else ""
+        if engine_cache:
+            Path(engine_cache).mkdir(parents=True, exist_ok=True)
 
         self.detection_worker = CudaStreamDetectionWorker(
             cameras=cameras,
-            calibration_path=str(self._calibration_path),
+            calibration_path=str(cuda_cal_path),
             yolo_onnx=yolo_onnx,
             vitpose_onnx=vitpose_onnx,
             engine_cache=engine_cache,
