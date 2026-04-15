@@ -305,17 +305,27 @@ static int pt_build_from_onnx(PT_TrtEngine *eng, int max_batch, int use_fp16) {
         if (builder->platformHasFastFp16()) {
             config->setFlag(nvinfer1::BuilderFlag::kFP16);
 
-            /* Set input tensor type to kHALF so the engine accepts __half input.
-             * TensorRT's kFP16 flag only enables FP16 internal computation;
-             * I/O tensor types default to the ONNX model's dtype (FP32).
-             * Our letterbox kernel writes __half, so we need FP16 I/O. */
-            for (int i = 0; i < network->getNbInputs(); ++i) {
-                network->getInput(i)->setType(nvinfer1::DataType::kHALF);
+            /* Only set input I/O to kHALF for YOLO — its letterbox kernel
+             * writes __half directly.  VitPose's crop kernel writes float,
+             * so it must keep FP32 input I/O (TRT will insert a cast). */
+            int is_yolo = 0;
+            {
+                char name_buf[256];
+                pt_extract_model_name(eng->onnx_path, name_buf, sizeof(name_buf));
+                for (char *p = name_buf; *p; p++)
+                    if (*p >= 'A' && *p <= 'Z') *p += 32;
+                if (strstr(name_buf, "yolo")) is_yolo = 1;
             }
-            /* Leave output as FP32 — the filter_detections kernel reads float,
-             * and YOLO output is small (300*6 floats per image). */
-
-            fprintf(stderr, "[TRT]   FP16 enabled (input I/O set to HALF)\n");
+            if (is_yolo) {
+                for (int i = 0; i < network->getNbInputs(); ++i) {
+                    network->getInput(i)->setType(nvinfer1::DataType::kHALF);
+                }
+                fprintf(stderr, "[TRT]   FP16 enabled (input I/O set to HALF for YOLO)\n");
+            } else {
+                /* Leave input as FP32; TRT will handle internal FP16 compute. */
+                fprintf(stderr, "[TRT]   FP16 enabled (input I/O stays FP32)\n");
+            }
+            /* Leave output as FP32 — the downstream kernels read float. */
         } else {
             fprintf(stderr, "[TRT]   FP16 requested but not supported on this GPU -- using FP32\n");
         }

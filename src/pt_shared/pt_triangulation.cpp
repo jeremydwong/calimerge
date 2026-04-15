@@ -14,6 +14,7 @@
 #include "pt_triangulation.h"
 #include <math.h>
 #include <string.h>
+#include <stdio.h>
 
 /* ============================================================================
  * Jacobi eigenvalue algorithm for 4x4 symmetric matrices

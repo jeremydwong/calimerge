@@ -8,12 +8,12 @@ if not defined TENSORRT_PATH set TENSORRT_PATH=C:\TensorRT
 del /q build\cuda\calimerge_cuda.dll 2>nul
 
 pushd src\cuda_pipeline
-call build_cuda_win32.bat %1
+call .\build_cuda_win32.bat %1
 popd
 
 echo.
 if exist build\cuda\calimerge_cuda.dll (
-    echo === CUDA BUILD SUCCEEDED (v0.2.1) ===
+    echo === CUDA BUILD SUCCEEDED v0.2.1 ===
 ) else (
     echo === CUDA BUILD FAILED ===
     exit /b 1

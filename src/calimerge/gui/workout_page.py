@@ -1645,8 +1645,20 @@ class WorkoutPage(QWidget):
         else:
             self._stop_detection()
 
+    def _zero_point_for_model(self) -> tuple[int, str]:
+        """Return (keypoint_index, label) for the active model's zero origin."""
+        model = self.detect_model_combo.currentData() or "vitpose"
+        if model == "mediapipe_hands":
+            return (4, "L_Thumb")  # MediaPipe hand landmark 4 = thumb tip
+        return (15, "L_Ankle")    # SynthPose/COCO keypoint 15
+
+    def _update_zero_button_label(self):
+        _, label = self._zero_point_for_model()
+        self.zero_origin_button.setText(f"Zero at {label}")
+
     def _on_model_changed(self, _index: int = 0):
         """Restart detection when the model or backend dropdown changes."""
+        self._update_zero_button_label()
         # Guard: don't restart during initial setup or if preview isn't running
         if not self.state_manager.state.is_previewing:
             return
@@ -1909,28 +1921,29 @@ class WorkoutPage(QWidget):
         else:
             self._zero_timer.stop()
             self._zero_timer = None
-            self.zero_origin_button.setText("Zero at L_Ankle")
+            self._update_zero_button_label()
             self._compute_zero_origin()
 
     def _compute_zero_origin(self):
         kps = self.skeleton_view.get_keypoints()
-        l_ankle = None
-        if kps and len(kps) > 15 and kps[15] is not None:
-            l_ankle = np.array(kps[15], dtype=float)
+        kp_idx, label = self._zero_point_for_model()
+        origin_pt = None
+        if kps and len(kps) > kp_idx and kps[kp_idx] is not None:
+            origin_pt = np.array(kps[kp_idx], dtype=float)
 
-        if l_ankle is None:
+        if origin_pt is None:
             self.zero_origin_button.setEnabled(True)
             return
 
         R = self._view_rotation[:3, :3]
         T = np.eye(4)
         T[:3, :3] = R
-        T[:3, 3] = -R @ l_ankle
+        T[:3, 3] = -R @ origin_pt
 
         self._view_has_origin = True
         self.skeleton_view.set_view_transform(T, has_origin=True)
         self._save_view_transform(T, has_origin=True)
-        self._save_body_transform(R, l_ankle)
+        self._save_body_transform(R, origin_pt)
         self.zero_origin_button.setEnabled(True)
 
     # ── View transform persistence ──

@@ -537,12 +537,42 @@ class PoseDetectionWorker(QThread):
     log_message = Signal(str)
     error = Signal(str)
 
-    # COCO-17 skeleton: pairs of keypoint indices for limb drawing
+    # SynthPose-52 skeleton (superset of COCO-17, matches skeleton_view.py)
     _SKELETON = [
-        (0, 1), (0, 2), (1, 3), (2, 4),        # head
-        (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),  # arms
-        (5, 11), (6, 12), (11, 12),              # torso
-        (11, 13), (13, 15), (12, 14), (14, 16),  # legs
+        # Head
+        (0, 1), (0, 2), (1, 3), (2, 4),
+        # Neck / shoulders
+        (0, 17), (17, 5), (17, 6), (17, 48),
+        (5, 19), (6, 18),
+        # Left arm: 5→7→9 with landmarks
+        (5, 7), (7, 9),
+        (7, 21), (7, 23),
+        (9, 25), (9, 27),
+        # Right arm: 6→8→10 with landmarks
+        (6, 8), (8, 10),
+        (8, 20), (8, 22),
+        (10, 24), (10, 26),
+        # Torso
+        (5, 11), (6, 12), (11, 12),
+        (48, 51), (51, 50), (50, 49),
+        (49, 29), (49, 28),
+        (29, 31), (28, 30),
+        # Left leg: 11→13→15 with landmarks
+        (11, 13), (13, 15),
+        (13, 33), (13, 35),
+        (15, 37), (15, 39),
+        # Right leg: 12→14→16 with landmarks
+        (12, 14), (14, 16),
+        (14, 32), (14, 34),
+        (16, 36), (16, 38),
+        # Left foot
+        (15, 46), (15, 41),
+        (41, 43), (43, 45),
+        # Right foot
+        (16, 47), (16, 40),
+        (40, 42), (42, 44),
+        # Fallback (used when SynthPose kps 17+ absent)
+        (5, 6),
     ]
 
     # Per-person color palette (BGR) — 8 distinct colors
@@ -673,7 +703,7 @@ class PoseDetectionWorker(QThread):
             # Brighter variant for keypoints
             kp_color = tuple(min(255, int(c * 1.3)) for c in color)
 
-            n = min(17, kps.shape[0])
+            n = kps.shape[0]
 
             # Draw limbs
             for i, j in self._SKELETON:
@@ -891,17 +921,17 @@ class MediaPipeHandsDetectionWorker(QThread):
         (5, 9), (9, 13), (13, 17),
     ]
 
-    # Per-hand colors (BGR)
-    _HAND_COLORS = [
-        (80, 200, 255),   # yellow-orange
-        (255, 160, 100),  # blue
-        (80, 255, 80),    # green
-        (220, 100, 220),  # purple
-    ]
+    # Per-hand colors keyed by handedness (BGR)
+    _HAND_COLOR_BY_LABEL = {
+        "Left":    (80, 200, 255),   # yellow-orange
+        "Right":   (255, 160, 100),  # blue
+        "Unknown": (80, 255, 80),    # green
+    }
 
-    def __init__(self, cameras: dict | None = None):
+    def __init__(self, cameras: dict | None = None, max_hands: int = 2):
         super().__init__()
         self.cameras = cameras  # dict[port, CalibratedCamera] or None
+        self.max_hands = max_hands
         self.running = True
         self._mp_hands = None
 
@@ -925,12 +955,27 @@ class MediaPipeHandsDetectionWorker(QThread):
     def run(self):
         try:
             import mediapipe as mp
-            self._mp_hands = mp.solutions.hands.Hands(
-                static_image_mode=False,
-                max_num_hands=2,
-                min_detection_confidence=self.confidence_threshold,
+
+            # Download hand_landmarker.task model if needed
+            model_dir = Path(__file__).resolve().parent.parent.parent.parent / "models" / "mediapipe"
+            model_dir.mkdir(parents=True, exist_ok=True)
+            model_path = model_dir / "hand_landmarker.task"
+            if not model_path.exists():
+                self.log_message.emit("Downloading hand_landmarker.task...")
+                import urllib.request
+                url = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
+                urllib.request.urlretrieve(url, str(model_path))
+                self.log_message.emit("Download complete")
+
+            opts = mp.tasks.vision.HandLandmarkerOptions(
+                base_options=mp.tasks.BaseOptions(model_asset_path=str(model_path)),
+                running_mode=mp.tasks.vision.RunningMode.IMAGE,
+                num_hands=self.max_hands,
+                min_hand_detection_confidence=self.confidence_threshold,
+                min_hand_presence_confidence=0.5,
                 min_tracking_confidence=0.5,
             )
+            self._mp_hands = mp.tasks.vision.HandLandmarker.create_from_options(opts)
             self.models_loaded.emit()
             self.log_message.emit("MediaPipe Hands ready")
         except Exception as e:
@@ -970,28 +1015,30 @@ class MediaPipeHandsDetectionWorker(QThread):
         """Run MediaPipe Hands on a single frame and draw landmarks."""
         import cv2
         import numpy as np
+        import mediapipe as mp
 
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        results = self._mp_hands.process(rgb)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        results = self._mp_hands.detect(mp_image)
 
-        if not results.multi_hand_landmarks:
-            self._last_hands_per_port.pop(port, None)
+        if not results.hand_landmarks:
+            # Don't clear — let stale data persist so triangulation can
+            # continue using the last known hand positions for a few frames.
             return frame_bgr
 
         h, w = frame_bgr.shape[:2]
         vis = frame_bgr.copy()
         port_hands: list[tuple[np.ndarray, str]] = []
-        n_colors = len(self._HAND_COLORS)
 
-        for hand_idx, (hand_lm, hand_info) in enumerate(
-            zip(results.multi_hand_landmarks, results.multi_handedness)
-        ):
-            color = self._HAND_COLORS[hand_idx % n_colors]
-            handedness = hand_info.classification[0].label  # "Left" or "Right"
+        for hand_idx, hand_lm in enumerate(results.hand_landmarks):
+            handedness = "Unknown"
+            if hand_idx < len(results.handedness):
+                handedness = results.handedness[hand_idx][0].category_name
+            color = self._HAND_COLOR_BY_LABEL.get(handedness, (80, 255, 80))
 
             # Extract 21 landmarks as pixel coordinates
             landmarks = np.array(
-                [(lm.x * w, lm.y * h) for lm in hand_lm.landmark],
+                [(lm.x * w, lm.y * h) for lm in hand_lm],
                 dtype=np.float32,
             )
             port_hands.append((landmarks, handedness))
@@ -1058,12 +1105,14 @@ class MediaPipeHandsDetectionWorker(QThread):
             )
 
             # Triangulate full 21 landmarks for each matched hand
-            all_hands_3d = []
+            hands_with_label = []  # (handedness_str, kps_3d)
             for group in groups:
                 kp_dict = {}
+                # Use reference port's handedness label for stable ordering
+                ref_port = max(group, key=lambda p: len(port_hands.get(p, [])))
+                _, handedness = port_hands[ref_port][group[ref_port]]
                 for port, hand_idx in group.items():
-                    landmarks, _handedness = port_hands[port][hand_idx]
-                    # Add confidence=1.0 column (MediaPipe doesn't give per-landmark confidence)
+                    landmarks, _ = port_hands[port][hand_idx]
                     kp_with_conf = np.concatenate(
                         [landmarks, np.ones((21, 1), dtype=np.float32)], axis=1
                     )
@@ -1071,7 +1120,11 @@ class MediaPipeHandsDetectionWorker(QThread):
                 kps_3d = triangulate_keypoints(
                     kp_dict, port_to_cam_index, camera_params, projection_matrices
                 )
-                all_hands_3d.append(kps_3d)
+                hands_with_label.append((handedness, kps_3d))
+
+            # Sort consistently: Left first, Right second
+            hands_with_label.sort(key=lambda x: (0 if x[0] == "Left" else 1))
+            all_hands_3d = [kps for _, kps in hands_with_label]
 
             if all_hands_3d:
                 self.keypoints_3d_ready.emit(all_hands_3d)
@@ -1219,3 +1272,232 @@ class ProcessingWorker(QThread):
 
     def stop(self):
         self.running = False
+
+
+class CudaStreamDetectionWorker(QThread):
+    """Live 2D/3D pose detection using the CUDA TensorRT streaming pipeline.
+
+    Same interface as PoseDetectionWorker but uses CudaStreamPipeline
+    for ~10ms/frame inference instead of PyTorch.
+    """
+
+    detection_ready = Signal(int, object)  # port, annotated BGR frame
+    keypoints_3d_ready = Signal(list)      # list of person keypoints
+    log_message = Signal(str)
+    error = Signal(str)
+
+    # SynthPose-52 skeleton (matches skeleton_view.py and PoseDetectionWorker)
+    _SKELETON = [
+        (0, 1), (0, 2), (1, 3), (2, 4),
+        (0, 17), (17, 5), (17, 6), (17, 48),
+        (5, 19), (6, 18),
+        (5, 7), (7, 9), (7, 21), (7, 23), (9, 25), (9, 27),
+        (6, 8), (8, 10), (8, 20), (8, 22), (10, 24), (10, 26),
+        (5, 11), (6, 12), (11, 12),
+        (48, 51), (51, 50), (50, 49),
+        (49, 29), (49, 28), (29, 31), (28, 30),
+        (11, 13), (13, 15), (13, 33), (13, 35), (15, 37), (15, 39),
+        (12, 14), (14, 16), (14, 32), (14, 34), (16, 36), (16, 38),
+        (15, 46), (15, 41), (41, 43), (43, 45),
+        (16, 47), (16, 40), (40, 42), (42, 44),
+        (5, 6),
+    ]
+
+    _PERSON_COLORS = [
+        (120, 200, 80), (255, 160, 100), (80, 180, 255), (220, 100, 220),
+        (100, 100, 255), (220, 220, 100), (80, 220, 255), (255, 140, 180),
+    ]
+
+    def __init__(
+        self,
+        cameras: dict,
+        calibration_path: str,
+        yolo_onnx: str,
+        vitpose_onnx: str,
+        engine_cache: str,
+        max_persons: int = 2,
+    ):
+        super().__init__()
+        self._cameras = cameras
+        self._calibration_path = calibration_path
+        self._yolo_onnx = yolo_onnx
+        self._vitpose_onnx = vitpose_onnx
+        self._engine_cache = engine_cache
+        self._max_persons = max_persons
+        self._pipeline = None
+        self._sync_index = 0
+        self.running = True
+
+        import threading
+        self._lock = threading.Lock()
+        self._pending: dict[int, object] = {}
+        self._has_work = threading.Event()
+
+    def submit_frame(self, port: int, frame):
+        """Submit a frame for detection (non-blocking, keeps only latest per port)."""
+        with self._lock:
+            self._pending[port] = frame
+            have_all = len(self._pending) >= len(self._cameras)
+        if have_all:
+            self._has_work.set()
+
+    def run(self):
+        try:
+            from ..tracking.cuda_stream_binding import CudaStreamPipeline
+
+            ports = sorted(self._cameras.keys())
+            w, h = self._cameras[ports[0]].intrinsics.resolution
+
+            self.log_message.emit("Initializing CUDA pipeline...")
+            self._pipeline = CudaStreamPipeline(
+                num_cameras=len(ports),
+                frame_width=w,
+                frame_height=h,
+                calibration_toml_path=self._calibration_path,
+                yolo_onnx_path=self._yolo_onnx,
+                vitpose_onnx_path=self._vitpose_onnx,
+                engine_cache_dir=self._engine_cache,
+                max_persons=self._max_persons,
+            )
+            self.log_message.emit("CUDA pipeline ready")
+        except Exception as e:
+            import traceback
+            self.error.emit(f"CUDA pipeline init failed: {e}\n{traceback.format_exc()}")
+            return
+
+        import cv2
+
+        ports = sorted(self._cameras.keys())
+        w, h = self._cameras[ports[0]].intrinsics.resolution
+        # Keep latest frame per port across iterations
+        latest_frames: dict[int, object] = {}
+
+        while self.running:
+            self._has_work.wait(timeout=0.05)
+            if not self.running:
+                break
+            self._has_work.clear()
+
+            with self._lock:
+                latest_frames.update(self._pending)
+                self._pending.clear()
+
+            # Need at least 2 cameras to triangulate
+            if len(latest_frames) < 2:
+                continue
+
+            # Build frame list from latest frames
+            frame_list = []
+            raw_frames = {}
+            for port in ports:
+                if port in latest_frames:
+                    f = cv2.resize(latest_frames[port], (w, h))
+                    frame_list.append((f, port))
+                    raw_frames[port] = f
+
+            if len(frame_list) < 2:
+                continue
+
+            try:
+                result = self._pipeline.process_frame(frame_list, sync_index=self._sync_index)
+                self._sync_index += 1
+
+                # Reproject 3D keypoints onto each camera's frame
+                for port, frame in raw_frames.items():
+                    vis = self._draw_reprojected(port, frame, result)
+                    self.detection_ready.emit(port, vis)
+
+                # Emit 3D keypoints
+                if result.num_persons > 0:
+                    self.keypoints_3d_ready.emit([
+                        p.keypoints_3d for p in result.persons
+                    ])
+
+            except Exception as e:
+                import traceback
+                self.error.emit(f"CUDA error: {e}\n{traceback.format_exc()}")
+
+    def _build_projection_params(self):
+        """Precompute per-camera projection parameters for 3D→2D reprojection."""
+        import numpy as np
+        import cv2
+        self._proj_params = {}
+        for port, cam in self._cameras.items():
+            R = cam.extrinsics.rotation       # 3x3
+            t = cam.extrinsics.translation    # (3,)
+            rvec, _ = cv2.Rodrigues(R)
+            self._proj_params[port] = {
+                "rvec": rvec,
+                "tvec": t.reshape(3, 1),
+                "K": cam.intrinsics.matrix,
+                "dist": cam.intrinsics.distortion,
+            }
+
+    def _draw_reprojected(self, port, frame, result):
+        """Draw reprojected 3D keypoints and skeleton onto a camera frame."""
+        import cv2
+        import numpy as np
+
+        if result.num_persons == 0:
+            return frame
+
+        if not hasattr(self, "_proj_params"):
+            self._build_projection_params()
+
+        params = self._proj_params.get(port)
+        if params is None:
+            return frame
+
+        vis = frame.copy()
+        n_colors = len(self._PERSON_COLORS)
+
+        for pi, person in enumerate(result.persons):
+            color = self._PERSON_COLORS[pi % n_colors]
+            kp_color = tuple(min(255, int(c * 1.3)) for c in color)
+
+            # Collect valid 3D keypoints
+            pts_3d = {}
+            for k, kp in enumerate(person.keypoints_3d):
+                if kp is not None:
+                    pts_3d[k] = kp
+
+            if not pts_3d:
+                continue
+
+            # Project all valid 3D points to 2D at once
+            indices = sorted(pts_3d.keys())
+            arr_3d = np.array([pts_3d[k] for k in indices], dtype=np.float64)
+            pts_2d, _ = cv2.projectPoints(
+                arr_3d, params["rvec"], params["tvec"],
+                params["K"], params["dist"]
+            )
+            pts_2d = pts_2d.reshape(-1, 2)
+
+            # Map keypoint index -> 2D pixel
+            kp_2d = {}
+            for idx, ki in enumerate(indices):
+                kp_2d[ki] = (int(pts_2d[idx, 0]), int(pts_2d[idx, 1]))
+
+            # Draw skeleton limbs
+            for i, j in self._SKELETON:
+                if i in kp_2d and j in kp_2d:
+                    cv2.line(vis, kp_2d[i], kp_2d[j], color, 2, cv2.LINE_AA)
+
+            # Draw keypoints
+            for ki, pt in kp_2d.items():
+                cv2.circle(vis, pt, 4, kp_color, -1, cv2.LINE_AA)
+
+            # Person label
+            if 0 in kp_2d:
+                lx, ly = kp_2d[0]
+                cv2.putText(vis, f"P{pi}", (lx, ly - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+
+        return vis
+
+    def stop(self):
+        self.running = False
+        self._has_work.set()  # unblock wait
+        if self._pipeline is not None:
+            self._pipeline.close()
+            self._pipeline = None
