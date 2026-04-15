@@ -744,6 +744,6 @@ See [CLAUDE.md](CLAUDE.md) for detailed design documentation including:
 
 ## License
 
-BSD-2-Clause
+Apache-2.0
 
 

@@ -2,9 +2,9 @@
 name = "calimerge"
 version = "0.2.1"
 description = "Unified multi-camera motion capture with synchronized recording"
-license = "BSD-2-Clause"
+license = "Apache-2.0"
 authors = [
-    { name = "Mac Prible", email = "prible@gmail.com" }
+    { name = "Jeremy Wong", email = "wong.jeremy.d@gmail.com" }
 ]
 requires-python = ">=3.10,<3.13"
 dependencies = [
