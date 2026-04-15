@@ -4,7 +4,7 @@
 
   > **Status:** Active development. Camera capture, calibration pipeline, and GPU pose tracking working on Windows and macOS.
 
-  [![Demo video](https://img.youtube.com/vi/Ebvx4vCMTxE/maxresdefault.jpg)](https://youtu.be/Ebvx4vCMTxE)
+  [![Demo video](https://img.youtube.com/vi/9XOLORjxKuY/maxresdefault.jpg)](https://youtu.be/9XOLORjxKuY)
 
   ### Acknowledgements
 
