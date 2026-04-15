@@ -26,12 +26,44 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QPainter, QColor, QPen, QFont
 
 
-# COCO-17 skeleton connections
+# SynthPose 52-keypoint skeleton connections.
+# Convention: r_ = right side body, l_ = left side body.
+# 20=r_lelbow (right lateral elbow) → connects to 8 (R_Elbow), NOT 7.
 _SKELETON = [
+    # Head
     (0, 1), (0, 2), (1, 3), (2, 4),
-    (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
+    # Neck / shoulders
+    (0, 17), (17, 5), (17, 6), (17, 48),
+    (5, 19), (6, 18),                         # shoulder landmarks (l/r)
+    # Left arm: 5→7→9 with landmarks
+    (5, 7), (7, 9),
+    (7, 21), (7, 23),                         # l_lelbow, l_melbow
+    (9, 25), (9, 27),                         # l_lwrist, l_mwrist
+    # Right arm: 6→8→10 with landmarks
+    (6, 8), (8, 10),
+    (8, 20), (8, 22),                         # r_lelbow, r_melbow
+    (10, 24), (10, 26),                       # r_lwrist, r_mwrist
+    # Torso
     (5, 11), (6, 12), (11, 12),
-    (11, 13), (13, 15), (12, 14), (14, 16),
+    (48, 51), (51, 50), (50, 49),             # spine: C7→T6→T11→L2
+    (49, 29), (49, 28),                       # L2→ASIS (l/r)
+    (29, 31), (28, 30),                       # ASIS→PSIS (l/r)
+    # Left leg: 11→13→15 with landmarks
+    (11, 13), (13, 15),
+    (13, 33), (13, 35),                       # l_knee, l_mknee
+    (15, 37), (15, 39),                       # l_ankle, l_mankle
+    # Right leg: 12→14→16 with landmarks
+    (12, 14), (14, 16),
+    (14, 32), (14, 34),                       # r_knee, r_mknee
+    (16, 36), (16, 38),                       # r_ankle, r_mankle
+    # Left foot
+    (15, 46), (15, 41),                       # l_calc, l_5meta
+    (41, 43), (43, 45),                       # l_5meta→l_toe→l_big_toe
+    # Right foot
+    (16, 47), (16, 40),                       # r_calc, r_5meta
+    (40, 42), (42, 44),                       # r_5meta→r_toe→r_big_toe
+    # Fallback COCO (used when SynthPose kps 17+ are absent)
+    (5, 6),
 ]
 
 # Per-person colors (limbs + keypoints use the same color per person)
@@ -68,12 +100,19 @@ _DEFAULT_TRANSFORM = np.array([
 class SkeletonViewWidget(QWidget):
     """Displays a 3D skeleton with an oblique three-quarter projection."""
 
+    # Maximum age (in frames) that a held keypoint survives before being dropped.
+    # After this many frames without an update, the keypoint is considered lost.
+    HOLD_MAX_AGE = 10
+
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setMinimumSize(200, 300)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         # list of persons; each person is list[np.ndarray(3,) | None] length 17
         self._persons: list[list] = []
+        # Parallel structure: per-person, per-keypoint "age" (frames since last seen).
+        # 0 = fresh, ≥1 = held from previous frame, <0 unused.
+        self._persons_age: list[list[int]] = []
         self._message: str = "No detection"
         self._view_transform: np.ndarray = _DEFAULT_TRANSFORM.copy()
         # True once "Set Origin at L_Ankle" has been applied → static view + floor grid.
@@ -84,11 +123,43 @@ class SkeletonViewWidget(QWidget):
     def update_keypoints(self, persons: list) -> None:
         """Set raw world-space keypoints for one or more persons and repaint.
 
+        Missing keypoints (None) are held from the previous frame at increasing
+        age so the display dims rather than flickers. After HOLD_MAX_AGE frames
+        without an update the held value is dropped.
+
         Args:
             persons: list[list[np.ndarray(3,) | None]]
                      Outer list = persons; inner list = 17 COCO-17 keypoints.
         """
-        self._persons = [list(p) for p in persons]
+        new_persons: list[list] = []
+        new_ages: list[list[int]] = []
+
+        for p_idx, incoming in enumerate(persons):
+            # Recover previous person's buffer (may not exist yet)
+            prev_person = self._persons[p_idx] if p_idx < len(self._persons) else []
+            prev_age = self._persons_age[p_idx] if p_idx < len(self._persons_age) else []
+
+            held_person: list = []
+            held_age: list[int] = []
+            for k_idx, kp in enumerate(incoming):
+                if kp is not None:
+                    held_person.append(kp)
+                    held_age.append(0)
+                else:
+                    # Try to hold the previous value if still fresh enough
+                    if k_idx < len(prev_person) and prev_person[k_idx] is not None:
+                        age = prev_age[k_idx] + 1 if k_idx < len(prev_age) else 1
+                        if age <= self.HOLD_MAX_AGE:
+                            held_person.append(prev_person[k_idx])
+                            held_age.append(age)
+                            continue
+                    held_person.append(None)
+                    held_age.append(-1)
+            new_persons.append(held_person)
+            new_ages.append(held_age)
+
+        self._persons = new_persons
+        self._persons_age = new_ages
         self._message = ""
         self.update()
 
@@ -107,11 +178,13 @@ class SkeletonViewWidget(QWidget):
 
     def set_message(self, msg: str) -> None:
         self._persons = []
+        self._persons_age = []
         self._message = msg
         self.update()
 
     def clear(self) -> None:
         self._persons = []
+        self._persons_age = []
         self._message = "No detection"
         self._has_origin = False
         self._view_transform = _DEFAULT_TRANSFORM.copy()
@@ -235,25 +308,44 @@ class SkeletonViewWidget(QWidget):
             painter.drawLine(ax0, ay0, ay_1, ay_2)
 
         # ── Skeletons — one per person, each in a distinct colour ──
-        for person_idx, view_pts in enumerate(all_view_pts):
-            color = _PERSON_COLORS[person_idx % len(_PERSON_COLORS)]
-            n = len(view_pts)
+        def alpha_for_age(age: int) -> int:
+            """Linearly fade from 255 (fresh) to ~60 (max held age)."""
+            if age <= 0:
+                return 255
+            # Fade from 255 to 60 across HOLD_MAX_AGE frames
+            max_age = max(1, self.HOLD_MAX_AGE)
+            frac = min(1.0, age / max_age)
+            return int(255 - frac * (255 - 60))
 
-            # Limbs
-            painter.setPen(QPen(color, 2))
+        for person_idx, view_pts in enumerate(all_view_pts):
+            base_color = _PERSON_COLORS[person_idx % len(_PERSON_COLORS)]
+            n = len(view_pts)
+            ages = self._persons_age[person_idx] if person_idx < len(self._persons_age) else []
+
+            def age_of(k: int) -> int:
+                return ages[k] if k < len(ages) else 0
+
+            # Limbs — dim to the older of the two endpoints
             for i, j in _SKELETON:
                 if i >= n or j >= n:
                     continue
                 if view_pts[i] is None or view_pts[j] is None:
                     continue
+                limb_age = max(age_of(i), age_of(j))
+                a = alpha_for_age(limb_age)
+                limb_color = QColor(base_color.red(), base_color.green(), base_color.blue(), a)
+                painter.setPen(QPen(limb_color, 2))
                 painter.drawLine(*to_screen(*view_pts[i]), *to_screen(*view_pts[j]))
 
-            # Keypoints
-            painter.setBrush(color)
-            painter.setPen(QPen(QColor(30, 30, 30), 1))
-            for vp in view_pts:
+            # Keypoints — dim each by its own age
+            for k_idx, vp in enumerate(view_pts):
                 if vp is None:
                     continue
+                a = alpha_for_age(age_of(k_idx))
+                dot_color = QColor(base_color.red(), base_color.green(), base_color.blue(), a)
+                outline_color = QColor(30, 30, 30, a)
+                painter.setBrush(dot_color)
+                painter.setPen(QPen(outline_color, 1))
                 sp = to_screen(*vp)
                 painter.drawEllipse(sp[0] - 4, sp[1] - 4, 8, 8)
 

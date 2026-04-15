@@ -245,6 +245,8 @@ class CamerasTab(QWidget):
         self._rotate_countdown = 0
         self._zero_timer: QTimer | None = None
         self._zero_countdown = 0
+        self._thumb_timer: QTimer | None = None
+        self._thumb_countdown = 0
 
         self._init_ui()
         self._connect_signals()
@@ -434,7 +436,7 @@ class CamerasTab(QWidget):
         self.rotate_to_human_button = QPushButton("Rotate to Human")
         self.rotate_to_human_button.setEnabled(False)
         self.rotate_to_human_button.setToolTip(
-            "Orient view: Y=up (head), X=foot-to-foot, Z=forward. Stand still, triggers in 3s."
+            "Orient view: Y=up (head), X=foot-to-foot, Z=forward. Stand still, triggers in 5s."
         )
         self.rotate_to_human_button.clicked.connect(self._on_rotate_to_human)
         skel_header.addWidget(self.rotate_to_human_button)
@@ -442,10 +444,18 @@ class CamerasTab(QWidget):
         self.zero_origin_button = QPushButton("Zero at L_Ankle")
         self.zero_origin_button.setEnabled(False)
         self.zero_origin_button.setToolTip(
-            "Set left ankle as floor origin (0,0,0). Stand still, triggers in 3s."
+            "Set left ankle as floor origin (0,0,0). Stand still, triggers in 5s."
         )
         self.zero_origin_button.clicked.connect(self._on_zero_at_left_foot)
         skel_header.addWidget(self.zero_origin_button)
+
+        self.zero_thumb_button = QPushButton("Zero at L_Thumb")
+        self.zero_thumb_button.setEnabled(False)
+        self.zero_thumb_button.setToolTip(
+            "Set left thumb tip as origin (0,0,0). Hold still, triggers in 5s."
+        )
+        self.zero_thumb_button.clicked.connect(self._on_zero_at_left_thumb)
+        skel_header.addWidget(self.zero_thumb_button)
 
         skel_layout.addLayout(skel_header)
         self.skeleton_view = SkeletonViewWidget()
@@ -1206,6 +1216,7 @@ class CamerasTab(QWidget):
         self.skeleton_view.clear()
         self.rotate_to_human_button.setEnabled(False)
         self.zero_origin_button.setEnabled(False)
+        self.zero_thumb_button.setEnabled(False)
 
     def _on_detection_finished(self):
         """Handle detection worker thread finishing (could be normal or crash)."""
@@ -1243,6 +1254,7 @@ class CamerasTab(QWidget):
         has_kps = any(any(k is not None for k in p) for p in clean_persons)
         self.rotate_to_human_button.setEnabled(has_kps)
         self.zero_origin_button.setEnabled(has_kps)
+        self.zero_thumb_button.setEnabled(has_kps)
 
     # ── Rotate to Human ──────────────────────────────────────────────────
 
@@ -1401,7 +1413,64 @@ class CamerasTab(QWidget):
         self._save_view_transform(T, has_origin=True)
         self.zero_origin_button.setEnabled(True)
 
-    def _save_view_transform(self, T: np.ndarray, has_origin: bool = False):
+    # ── Zero at Left Thumb ─────────────────────────────────────────────────
+
+    def _on_zero_at_left_thumb(self):
+        """Start 5s countdown then anchor view origin to current L_Thumb tip."""
+        self._thumb_countdown = 5
+        self.zero_thumb_button.setEnabled(False)
+        self.zero_thumb_button.setText(f"Zeroing in {self._thumb_countdown}s...")
+        self._thumb_timer = QTimer()
+        self._thumb_timer.timeout.connect(self._thumb_countdown_tick)
+        self._thumb_timer.start(1000)
+
+    def _thumb_countdown_tick(self):
+        self._thumb_countdown -= 1
+        if self._thumb_countdown > 0:
+            self.zero_thumb_button.setText(f"Zeroing in {self._thumb_countdown}s...")
+        else:
+            self._thumb_timer.stop()
+            self._thumb_timer = None
+            self.zero_thumb_button.setText("Zero at L_Thumb")
+            self._compute_zero_thumb()
+
+    def _compute_zero_thumb(self):
+        """Translate the view so the current left thumb tip maps to origin (0,0,0).
+
+        Uses COCO-17 body keypoint index 9 (L_Wrist) as a fallback if hand
+        landmarks are not available.  When hand tracking is active, the thumb
+        tip is MediaPipe hand landmark 4.
+        """
+        kps = self.skeleton_view.get_keypoints()
+        thumb_pt = None
+
+        if kps:
+            # Try body keypoint 9 (L_Wrist) as a proxy for the left hand region.
+            # If hand landmarks are being tracked separately, the skeleton_view
+            # may have additional keypoints beyond COCO-17 (indices 17+).
+            # MediaPipe hand landmark 4 = thumb tip.  If we have 21+ extra
+            # keypoints appended after the 17 body keypoints, use index 17+4=21.
+            if len(kps) > 21 and kps[21] is not None:
+                thumb_pt = np.array(kps[21], dtype=float)
+            elif len(kps) > 9 and kps[9] is not None:
+                # Fallback: left wrist from body pose
+                thumb_pt = np.array(kps[9], dtype=float)
+
+        if thumb_pt is None:
+            self.zero_thumb_button.setEnabled(True)
+            return
+
+        R = self._view_rotation[:3, :3]
+        T = np.eye(4)
+        T[:3, :3] = R
+        T[:3, 3] = -R @ thumb_pt
+
+        self._view_has_origin = True
+        self.skeleton_view.set_view_transform(T, has_origin=True)
+        self._save_view_transform(T, has_origin=True, section="thumb_transform")
+        self.zero_thumb_button.setEnabled(True)
+
+    def _save_view_transform(self, T: np.ndarray, has_origin: bool = False, section: str = "live_view"):
         """Save view transform to camera_rig.toml in the project folder."""
         try:
             import rtoml
@@ -1411,7 +1480,7 @@ class CamerasTab(QWidget):
             data = {}
             if rig_path.exists():
                 data = rtoml.load(rig_path)
-            data["live_view"] = {
+            data[section] = {
                 "transform": T.flatten().tolist(),
                 "has_origin": has_origin,
             }

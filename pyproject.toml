@@ -1,6 +1,6 @@
 [project]
 name = "calimerge"
-version = "0.1.0"
+version = "0.2.1"
 description = "Unified multi-camera motion capture with synchronized recording"
 license = "BSD-2-Clause"
 authors = [
@@ -22,6 +22,8 @@ dependencies = [
     "pandas>=2.0.0",
     "onnxscript>=0.6.2",
     "matplotlib>=3.7.0",
+    "pyqtgraph>=0.13.0",
+    "mediapipe>=0.10.0",
 ]
 
 [project.optional-dependencies]
@@ -29,7 +31,6 @@ dev = [
     "pytest>=7.0.0",
     "pytest-qt>=4.2.0",
     "ruff>=0.1.0",
-    "posetrack",
 ]
 
 [project.scripts]
@@ -52,7 +53,6 @@ url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [tool.uv.sources]
-posetrack = { path = "posetrack", editable = true }
 # Use CUDA wheels on Windows/Linux, standard PyPI wheels on macOS
 torch = [
     { index = "pytorch-cu128", marker = "sys_platform != 'darwin'" },

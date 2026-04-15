@@ -212,6 +212,17 @@ def compute_transformation_matrix(extrinsics: CameraExtrinsics) -> np.ndarray:
     return t
 
 
+def extrinsic_to_view_transform(extrinsics: CameraExtrinsics) -> np.ndarray:
+    """
+    Build a world→camera-view 4x4 transform matching a camera's extrinsic.
+
+    Suitable for driving SkeletonViewWidget.set_view_transform so the 3D
+    projection matches what the given camera sees. Uses the same convention
+    as compute_transformation_matrix: X_cam = R * X_world + t.
+    """
+    return compute_transformation_matrix(extrinsics)
+
+
 def compute_projection_matrix(camera: CalibratedCamera) -> np.ndarray:
     """
     Compute 3x4 projection matrix from calibrated camera.

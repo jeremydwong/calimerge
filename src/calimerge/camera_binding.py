@@ -59,10 +59,13 @@ def _find_library() -> Path:
 
     # Look relative to this file
     module_dir = Path(__file__).parent
+    repo_root = module_dir.parent.parent  # calimerge/
 
-    # Try various locations
+    # Try various locations (build/ first, then legacy src/ paths)
     candidates = [
-        module_dir.parent.parent / "native" / lib_name,  # src/native/
+        repo_root / "build" / "native" / lib_name,        # build/native/
+        repo_root / "src" / "native" / lib_name,           # legacy: src/native/
+        module_dir.parent.parent / "native" / lib_name,
         module_dir.parent / "native" / lib_name,
         module_dir / lib_name,
     ]

@@ -12,6 +12,7 @@
 #include "pt_matching.h"  /* For pt_hungarian */
 #include <math.h>
 #include <string.h>
+#include <stdio.h>
 
 /* Python default: min_new_track_distance = 0.3m (process_synced_poses.py:322) */
 #define PT_MIN_NEW_TRACK_DISTANCE  0.3
@@ -103,16 +104,30 @@ static void track_update(
     track->frames_since_seen = 0;
 }
 
-/* Create a new track from a candidate */
+/* Create a new track from a candidate, reusing inactive slots first */
 static void track_create(
     PT_TrackState *state,
     const PT_Candidate3D *candidate,
     int sync_index,
     int patience)
 {
-    if (state->num_tracks >= PT_MAX_TRACKS) return;
+    PT_PersonTrack *track = NULL;
 
-    PT_PersonTrack *track = &state->tracks[state->num_tracks];
+    /* Try to reuse an inactive slot */
+    for (int i = 0; i < state->num_tracks; i++) {
+        if (!state->tracks[i].is_active) {
+            track = &state->tracks[i];
+            break;
+        }
+    }
+
+    /* No inactive slot — append if space remains */
+    if (track == NULL) {
+        if (state->num_tracks >= PT_MAX_TRACKS) return;
+        track = &state->tracks[state->num_tracks];
+        state->num_tracks++;
+    }
+
     memset(track, 0, sizeof(PT_PersonTrack));
 
     track->person_id = state->next_person_id++;
@@ -134,8 +149,6 @@ static void track_create(
 
     /* Write first frame to history */
     track_write_history(track, candidate, sync_index);
-
-    state->num_tracks++;
 }
 
 /* ============================================================================

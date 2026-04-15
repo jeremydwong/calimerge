@@ -21,7 +21,7 @@ from PIL import Image
 # Model identifiers
 YOLO_FILENAME = "yolov10s.pt"
 YOLO_DOWNLOAD_URL = "https://github.com/THU-MIG/yolov10/releases/download/v1.1/yolov10s.pt"
-VITPOSE_MODEL_ID = "usyd-community/vitpose-base-simple"
+VITPOSE_MODEL_ID = "stanfordmimi/synthpose-vitpose-base-hf"  # 52 SynthPose keypoints
 
 # Model directories: project_root/models/
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent

@@ -228,7 +228,7 @@ extern "C" int pt_stream_create(PT_Stream **out, const PT_StreamConfig *config) 
     stream_log(s, "Building VitPose engine (max_batch=%d)...", vitpose_max_batch);
     memset(&s->vitpose_engine, 0, sizeof(PT_TrtEngine));
     rc = pt_trt_build_engine(&s->vitpose_engine, s->config.vitpose_onnx_path,
-                              s->config.engine_cache_dir, vitpose_max_batch, 0);
+                              s->config.engine_cache_dir, vitpose_max_batch, 1);
     if (rc != PT_OK) {
         fprintf(stderr, "[pt_stream] VitPose engine build failed (error %d)\n", rc);
         pt_trt_destroy_engine(&s->yolo_engine);
@@ -433,6 +433,19 @@ extern "C" int pt_stream_process_frame(PT_Stream *s,
                      cudaMemcpyDeviceToHost, s->cuda_stream);
 
     cudaStreamSynchronize(s->cuda_stream);
+
+    /* Debug: print YOLO detection counts per camera */
+    {
+        static int debug_frame = 0;
+        if (debug_frame < 5) {
+            fprintf(stderr, "[pt_stream] YOLO detections (frame %d):", debug_frame);
+            for (int img = 0; img < valid_image_count; img++) {
+                fprintf(stderr, " cam%d=%d", img, s->arena.host_detection_counts[img]);
+            }
+            fprintf(stderr, " (conf_thresh=%.2f)\n", s->config.person_confidence);
+            debug_frame++;
+        }
+    }
 
     s->stats.yolo_ms += (stream_time_seconds() - t_yolo) * 1000.0;
 

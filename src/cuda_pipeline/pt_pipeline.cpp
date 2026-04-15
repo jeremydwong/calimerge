@@ -228,8 +228,12 @@ static int try_parse_array_inline(const char *trimmed, char *array_buf, int buf_
 }
 
 static int load_calibration_toml(PT_CameraConstants *constants, const char *path) {
+    fprintf(stderr, "[pt_calib] Opening: %s\n", path);
     FILE *f = fopen(path, "r");
-    if (!f) return PT_ERR_FILE_NOT_FOUND;
+    if (!f) {
+        fprintf(stderr, "[pt_calib] FAILED to open file: %s\n", path);
+        return PT_ERR_FILE_NOT_FOUND;
+    }
 
     char line[2048];
     int current_cam = -1;
@@ -298,11 +302,14 @@ static int load_calibration_toml(PT_CameraConstants *constants, const char *path
             continue;
         }
 
-        /* Section header: [camera_N] or [cam_N] (caliscope format) */
+        /* Section header: [camera_N], [cam_N] (caliscope) or [cameras.N] (calimerge) */
         if (*trimmed == '[') {
+            fprintf(stderr, "[pt_calib] Section: %s", trimmed);
             int cam_idx = -1;
             if (sscanf(trimmed, "[camera_%d]", &cam_idx) == 1 ||
-                sscanf(trimmed, "[cam_%d]", &cam_idx) == 1) {
+                sscanf(trimmed, "[cam_%d]", &cam_idx) == 1 ||
+                sscanf(trimmed, "[cameras.%d]", &cam_idx) == 1 ||
+                sscanf(trimmed, "[cameras.\"%d\"]", &cam_idx) == 1) {
                 if (cam_idx >= 0 && cam_idx < PT_MAX_CAMERAS) {
                     current_cam = cam_idx;
                     /* Default port to section index (matches Python cs_parse.py:648
@@ -389,9 +396,12 @@ static int load_calibration_toml(PT_CameraConstants *constants, const char *path
     }
 
     fclose(f);
+    fprintf(stderr, "[pt_calib] Parsing complete: found %d cameras in %s\n",
+            num_cameras_found, path);
 
     if (num_cameras_found <= 0) {
-        fprintf(stderr, "[pt_pipeline] No cameras found in TOML file: %s\n", path);
+        fprintf(stderr, "[pt_calib] ERROR: No cameras found! Check TOML section headers.\n");
+        fprintf(stderr, "[pt_calib] Expected: [cam_0] or [camera_0] or [cameras.0]\n");
         return PT_ERR_INVALID_PARAM;
     }
 
@@ -850,7 +860,7 @@ extern "C" int pt_pipeline_run(PT_Pipeline *p) {
     pipeline_log(p, "Building VitPose engine (max_batch=%d)...", vitpose_max_batch);
     memset(&p->vitpose_engine, 0, sizeof(PT_TrtEngine));
     rc = pt_trt_build_engine(&p->vitpose_engine, p->config.vitpose_onnx_path,
-                              p->config.engine_cache_dir, vitpose_max_batch, 0);
+                              p->config.engine_cache_dir, vitpose_max_batch, 1);
     if (rc != PT_OK) {
         fprintf(stderr, "[pt_pipeline] VitPose engine build failed (error %d)\n", rc);
         return rc;

@@ -75,10 +75,43 @@ poetry.lock
 # Jupyter
 .ipynb_checkpoints/
 
-# Project specific
-*.pkl
+# ── Legacy packages (archived, not part of calimerge) ──
+caliscope/
+multiwebcam/
+posetrack/
+analysis_output/
+
+# ── User data (lives outside the repo) ──
+recordings/
+models/
+
+# ── Downloaded model files ──
+*.task
+
+# ── Build output ──
+build/
+
+# ── Build artifacts (in case any end up outside build/) ──
+*.obj
+*.exe
+*.dll
+*.exp
+*.lib
+*.dylib
+*.engine
+
+# ── Profiling output ──
+*.nsys-rep
+*.ncu-rep
+*.qdrep
+*.sqlite
+output.txt
+
+# ── Media files ──
 *.mp4
 *.avi
+*.pkl
+*.pdf
 
-# ML model weights (auto-downloaded from HuggingFace)
-models/
+# ── Claude Code worktrees ──
+.claude/worktrees/

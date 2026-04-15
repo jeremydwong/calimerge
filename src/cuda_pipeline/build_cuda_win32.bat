@@ -2,6 +2,7 @@
 :: build_cuda_win32.bat - Build the CUDA pose tracking pipeline DLL (Windows)
 ::
 :: Usage: build_cuda_win32.bat [release]
+:: Output: build\cuda\ (relative to repo root)
 ::
 :: Requires:
 ::   - MSVC Build Tools 2022
@@ -54,7 +55,15 @@ if "%1"=="release" (
     echo Build mode: DEBUG
 )
 
-pushd %~dp0
+:: ---- Resolve paths ----
+set SCRIPT_DIR=%~dp0
+set REPO_ROOT=%SCRIPT_DIR%..\..\
+set BUILD_DIR=%REPO_ROOT%build\cuda
+set SRC_DIR=%SCRIPT_DIR%
+
+if not exist "%BUILD_DIR%" mkdir "%BUILD_DIR%"
+
+pushd %SRC_DIR%
 
 echo.
 echo ---- Compiling CUDA sources (.cu) ----
@@ -65,7 +74,8 @@ nvcc -c %NVCC_OPT% --use_fast_math ^
     -Xcompiler "/MD %OPTIMIZE% /EHsc" ^
     -I"%CUDA_PATH%\include" ^
     -I"%TENSORRT_PATH%\include" ^
-    -o pt_arena.obj pt_arena.cu
+    -I"..\pt_shared" ^
+    -o "%BUILD_DIR%\pt_arena.obj" pt_arena.cu
 
 if errorlevel 1 (
     echo BUILD FAILED: pt_arena.cu
@@ -78,7 +88,8 @@ nvcc -c %NVCC_OPT% --use_fast_math ^
     -Xcompiler "/MD %OPTIMIZE% /EHsc" ^
     -I"%CUDA_PATH%\include" ^
     -I"%TENSORRT_PATH%\include" ^
-    -o pt_kernels.obj pt_kernels.cu
+    -I"..\pt_shared" ^
+    -o "%BUILD_DIR%\pt_kernels.obj" pt_kernels.cu
 
 if errorlevel 1 (
     echo BUILD FAILED: pt_kernels.cu
@@ -95,28 +106,28 @@ if defined OPENCV_PATH (
     set CL_INCLUDES=%CL_INCLUDES% /I"%OPENCV_PATH%\include" /DHAS_OPENCV
 )
 
-cl /c %CFLAGS% %CL_INCLUDES% /Fo:pt_tensorrt.obj pt_tensorrt.cpp
+cl /c %CFLAGS% %CL_INCLUDES% /Fo:"%BUILD_DIR%\pt_tensorrt.obj" pt_tensorrt.cpp
 if errorlevel 1 ( echo BUILD FAILED: pt_tensorrt.cpp & popd & exit /b 1 )
 
-cl /c %CFLAGS% %CL_INCLUDES% /Fo:pt_nvdec.obj pt_nvdec.cpp
+cl /c %CFLAGS% %CL_INCLUDES% /Fo:"%BUILD_DIR%\pt_nvdec.obj" pt_nvdec.cpp
 if errorlevel 1 ( echo BUILD FAILED: pt_nvdec.cpp & popd & exit /b 1 )
 
-cl /c %CFLAGS% %CL_INCLUDES% /Fo:pt_matching.obj ..\pt_shared\pt_matching.cpp
+cl /c %CFLAGS% %CL_INCLUDES% /Fo:"%BUILD_DIR%\pt_matching.obj" ..\pt_shared\pt_matching.cpp
 if errorlevel 1 ( echo BUILD FAILED: pt_matching.cpp & popd & exit /b 1 )
 
-cl /c %CFLAGS% %CL_INCLUDES% /Fo:pt_triangulation.obj ..\pt_shared\pt_triangulation.cpp
+cl /c %CFLAGS% %CL_INCLUDES% /Fo:"%BUILD_DIR%\pt_triangulation.obj" ..\pt_shared\pt_triangulation.cpp
 if errorlevel 1 ( echo BUILD FAILED: pt_triangulation.cpp & popd & exit /b 1 )
 
-cl /c %CFLAGS% %CL_INCLUDES% /Fo:pt_tracker.obj ..\pt_shared\pt_tracker.cpp
+cl /c %CFLAGS% %CL_INCLUDES% /Fo:"%BUILD_DIR%\pt_tracker.obj" ..\pt_shared\pt_tracker.cpp
 if errorlevel 1 ( echo BUILD FAILED: pt_tracker.cpp & popd & exit /b 1 )
 
-cl /c %CFLAGS% %CL_INCLUDES% /Fo:pt_export.obj ..\pt_shared\pt_export.cpp
+cl /c %CFLAGS% %CL_INCLUDES% /Fo:"%BUILD_DIR%\pt_export.obj" ..\pt_shared\pt_export.cpp
 if errorlevel 1 ( echo BUILD FAILED: pt_export.cpp & popd & exit /b 1 )
 
-cl /c %CFLAGS% %CL_INCLUDES% /Fo:pt_pipeline.obj pt_pipeline.cpp
+cl /c %CFLAGS% %CL_INCLUDES% /Fo:"%BUILD_DIR%\pt_pipeline.obj" pt_pipeline.cpp
 if errorlevel 1 ( echo BUILD FAILED: pt_pipeline.cpp & popd & exit /b 1 )
 
-cl /c %CFLAGS% %CL_INCLUDES% /Fo:pt_stream.obj pt_stream.cpp
+cl /c %CFLAGS% %CL_INCLUDES% /Fo:"%BUILD_DIR%\pt_stream.obj" pt_stream.cpp
 if errorlevel 1 ( echo BUILD FAILED: pt_stream.cpp & popd & exit /b 1 )
 
 echo.
@@ -137,11 +148,11 @@ if defined OPENCV_PATH (
     )
 )
 
-link /DLL /DEF:calimerge_cuda.def /OUT:calimerge_cuda.dll ^
-    pt_arena.obj pt_kernels.obj ^
-    pt_tensorrt.obj pt_nvdec.obj pt_matching.obj ^
-    pt_triangulation.obj pt_tracker.obj pt_export.obj ^
-    pt_pipeline.obj pt_stream.obj ^
+link /DLL /DEF:calimerge_cuda.def /OUT:"%BUILD_DIR%\calimerge_cuda.dll" ^
+    "%BUILD_DIR%\pt_arena.obj" "%BUILD_DIR%\pt_kernels.obj" ^
+    "%BUILD_DIR%\pt_tensorrt.obj" "%BUILD_DIR%\pt_nvdec.obj" "%BUILD_DIR%\pt_matching.obj" ^
+    "%BUILD_DIR%\pt_triangulation.obj" "%BUILD_DIR%\pt_tracker.obj" "%BUILD_DIR%\pt_export.obj" ^
+    "%BUILD_DIR%\pt_pipeline.obj" "%BUILD_DIR%\pt_stream.obj" ^
     %LINK_LIBS% ^
     %LINK_PATHS%
 
@@ -153,44 +164,45 @@ if errorlevel 1 (
 
 echo.
 echo ---- DLL Exports ----
-dumpbin /exports calimerge_cuda.dll 2>nul | findstr "pt_"
+dumpbin /exports "%BUILD_DIR%\calimerge_cuda.dll" 2>nul | findstr "pt_"
 
 echo.
-echo ---- Building test program (pt_main.exe) - monolithic build ----
-echo      (links .obj files directly, bypasses DLL boundary)
+echo ---- Building test program (pt_main.exe) ----
 
-cl %CFLAGS% %CL_INCLUDES% /Fe:pt_main.exe pt_main.cpp ^
-    pt_arena.obj pt_kernels.obj ^
-    pt_tensorrt.obj pt_nvdec.obj pt_matching.obj ^
-    pt_triangulation.obj pt_tracker.obj pt_export.obj ^
-    pt_pipeline.obj pt_stream.obj ^
+cl %CFLAGS% %CL_INCLUDES% /Fe:"%BUILD_DIR%\pt_main.exe" pt_main.cpp ^
+    "%BUILD_DIR%\pt_arena.obj" "%BUILD_DIR%\pt_kernels.obj" ^
+    "%BUILD_DIR%\pt_tensorrt.obj" "%BUILD_DIR%\pt_nvdec.obj" "%BUILD_DIR%\pt_matching.obj" ^
+    "%BUILD_DIR%\pt_triangulation.obj" "%BUILD_DIR%\pt_tracker.obj" "%BUILD_DIR%\pt_export.obj" ^
+    "%BUILD_DIR%\pt_pipeline.obj" "%BUILD_DIR%\pt_stream.obj" ^
     /link %LINK_LIBS% %LINK_PATHS%
 
+set BUILD_ERRORS=0
+
 if errorlevel 1 (
-    echo WARNING: pt_main.exe build failed (non-fatal)
+    echo FAILED: pt_main.exe
+    set /a BUILD_ERRORS+=1
 ) else (
-    echo pt_main.exe built successfully
+    echo OK: pt_main.exe
 )
 
 echo.
 echo ---- Building streaming test program (pt_stream_main.exe) ----
 
-cl %CFLAGS% %CL_INCLUDES% /Fe:pt_stream_main.exe pt_stream_main.cpp ^
-    pt_arena.obj pt_kernels.obj ^
-    pt_tensorrt.obj pt_nvdec.obj pt_matching.obj ^
-    pt_triangulation.obj pt_tracker.obj pt_export.obj ^
-    pt_pipeline.obj pt_stream.obj ^
+cl %CFLAGS% %CL_INCLUDES% /Fe:"%BUILD_DIR%\pt_stream_main.exe" pt_stream_main.cpp ^
+    "%BUILD_DIR%\pt_arena.obj" "%BUILD_DIR%\pt_kernels.obj" ^
+    "%BUILD_DIR%\pt_tensorrt.obj" "%BUILD_DIR%\pt_nvdec.obj" "%BUILD_DIR%\pt_matching.obj" ^
+    "%BUILD_DIR%\pt_triangulation.obj" "%BUILD_DIR%\pt_tracker.obj" "%BUILD_DIR%\pt_export.obj" ^
+    "%BUILD_DIR%\pt_pipeline.obj" "%BUILD_DIR%\pt_stream.obj" ^
     /link %LINK_LIBS% %LINK_PATHS%
 
 if errorlevel 1 (
-    echo WARNING: pt_stream_main.exe build failed (non-fatal)
+    echo FAILED: pt_stream_main.exe
+    set /a BUILD_ERRORS+=1
 ) else (
-    echo pt_stream_main.exe built successfully
+    echo OK: pt_stream_main.exe
 )
 
-popd
+:: Clean up .obj files left in source dir by cl
+del /q *.obj 2>nul
 
-echo.
-echo ============================================================
-echo  Build complete.
-echo ============================================================
+popd

@@ -1,16 +1,116 @@
-# Calimerge
+  # Calimerge
 
-Unified multi-camera motion capture: synchronized recording, calibration, and 3D pose estimation.
+  Unified multi-camera motion capture: synchronized recording, calibration, and 3D pose estimation.
 
-> **Status:** Active development. Camera capture, calibration pipeline, and GPU pose tracking working on Windows and macOS.
+  > **Status:** Active development. Camera capture, calibration pipeline, and GPU pose tracking working on Windows and macOS.
 
-Note: this work is heavily-inspired by both Jon Matthis' Freemocap project, and Mac Prible's caliscope --'calimerge' is an attempt to respect his efforts. 
+  [![Demo video](https://img.youtube.com/vi/Ebvx4vCMTxE/maxresdefault.jpg)](https://youtu.be/Ebvx4vCMTxE)
 
-the main goals of this work are:
-- a single app for simple use (and minimal collisions with file ownership)
-- multi person recording
-- support for cuda/mps rapid keypoint detection.
-- management of serial devices to avoid port-order sensitivity. One camera, one intrinsic, stored in a database. 
+  ### Acknowledgements
+
+  This project is inspired by and builds on the work of:
+  - **Jon Matthis** and the [FreeMoCap](https://github.com/freemocap/freemocap) project
+  - **Mac Prible** and [Caliscope](https://github.com/mprib/caliscope) — the name "calimerge" is an attempt to respect his efforts
+
+  ### Goals
+
+  - A single app for simple use (minimal collisions with file ownership)
+  - Multi-person recording and tracking
+  - CUDA/MPS-accelerated keypoint detection
+  - Serial-number-based camera management (one camera = one intrinsic, stored in a database, independent of USB port order)
+
+  ---
+
+## Live Streaming
+
+Calimerge supports real-time 3D pose estimation from live camera feeds. Once cameras are calibrated (intrinsic + extrinsic), the Workout page provides live detection with three backends:
+
+### Detection backends
+
+| Backend | Model | Speed | Requirements |
+|---------|-------|-------|-------------|
+| **CUDA TensorRT** | YOLO v10s + VitPose SynthPose-52 | ~5 ms/frame | NVIDIA GPU, TensorRT, `calimerge_cuda.dll` |
+| **PyTorch** | YOLO + VitPose SynthPose-52 | ~50-100 ms/frame | PyTorch (CPU or CUDA) |
+| **MediaPipe Hands** | MediaPipe HandLandmarker | ~15 ms/frame | No GPU required |
+
+### CUDA live pipeline
+
+The CUDA backend (`CudaStreamDetectionWorker`) runs the full TensorRT pipeline in a background thread:
+
+1. Camera frames arrive via `submit_frame()` (non-blocking, keeps latest per port)
+2. When all cameras have a frame, the pipeline processes them as a synchronized set
+3. YOLO detects persons, VitPose estimates 52 keypoints per person per camera
+4. Cross-view epipolar matching associates detections across cameras
+5. SVD triangulation produces 3D keypoints
+6. Multi-person tracking maintains identity across frames
+7. 3D keypoints are reprojected back onto each camera view using `cv2.projectPoints` for skeleton overlay
+
+The first run after a model or GPU change rebuilds TensorRT engines (~30s). Subsequent runs load cached engines in <1s.
+
+### Hand tracking
+
+MediaPipe Hands detects 21 landmarks per hand per camera. Hands are matched across cameras via wrist-landmark triangulation with in-front-of-camera validation. Hand identity is stabilized by sorting consistently by handedness label (Left always first). Stale detections are held for a few frames to bridge brief detection gaps.
+
+### Workout page controls
+
+- **Model dropdown**: VitPose (body) or MediaPipe Hands
+- **Backend dropdown**: CUDA TensorRT or PyTorch (body only)
+- **Detect checkbox**: Toggle live detection on/off
+- **Rotate to Human**: Aligns the 3D view so the person faces forward (5s countdown)
+- **Zero at X**: Sets the origin based on the active model — L_Ankle for body, L_Thumb for hands. Uses the same rotation computed by "Rotate to Human", stored in `camera_rig.toml`
+
+### Workout recording
+
+During live detection, pressing Record captures:
+- Synchronized video per camera (`.mp4`)
+- Frame timing CSV (`frame_time_history.csv`)
+- Camera mapping CSV (serial number to port)
+- Buffered 3D keypoints (saved as `.npz` on stop)
+
+Recordings are organized under `recordings/workouts/` with timestamps and workout type labels (e.g., `20260413_145752_pushup/`).
+
+  ---
+
+## Dependencies
+
+### Required (all platforms)
+
+| Dependency | Version | Purpose |
+|------------|---------|---------|
+| [Python](https://www.python.org/) | 3.10 - 3.12 | Runtime |
+| [uv](https://astral.sh/uv) | latest | Python package manager (replaces pip/Poetry) |
+| [NumPy](https://numpy.org/) | >= 1.24 | Array math |
+| [OpenCV](https://opencv.org/) (Python) | >= 4.8 | Calibration, video I/O, image processing |
+| [PySide6](https://doc.qt.io/qtforpython/) | >= 6.6 | GUI framework |
+| [SciPy](https://scipy.org/) | >= 1.11 | Bundle adjustment optimization |
+| [Numba](https://numba.pydata.org/) | >= 0.59 | JIT-compiled triangulation |
+| [rtoml](https://github.com/samuelcolvin/rtoml) | >= 0.10 | TOML config files |
+| [PyTorch](https://pytorch.org/) | >= 2.0 | Neural network inference (CPU or CUDA) |
+| [Transformers](https://huggingface.co/docs/transformers) | >= 4.36 | VitPose model loading |
+| [Ultralytics](https://docs.ultralytics.com/) | >= 8.0 | YOLO person detection |
+
+### Required for native camera capture
+
+| Dependency | Platform | Purpose |
+|------------|----------|---------|
+| [MSVC Build Tools 2022](https://visualstudio.microsoft.com/visual-cpp-build-tools/) | Windows | Compile `calimerge.dll` (Media Foundation backend) |
+| Xcode Command Line Tools | macOS | Compile `libcalimerge.dylib` (AVFoundation backend) |
+
+### Optional (GPU-accelerated pose tracking)
+
+The CUDA pipeline (`src/cuda_pipeline/`) provides ~15x faster 3D pose tracking. Without it, the Python pipeline (PyTorch + Transformers) is used instead.
+
+| Dependency | Version | Purpose |
+|------------|---------|---------|
+| NVIDIA GPU | Compute >= 7.0 | Hardware requirement |
+| [CUDA Toolkit](https://developer.nvidia.com/cuda-toolkit) | 12.x | GPU compute runtime |
+| [TensorRT](https://developer.nvidia.com/tensorrt) | 10.x | Optimized neural network inference |
+| [OpenCV](https://opencv.org/) (C++) | 4.x | CPU video decode fallback for batch pipeline |
+
+### What works without a GPU?
+
+The GUI, camera capture, recording, and calibration all work on CPU — no GPU required. The Python pose tracking pipeline (PyTorch on CPU) works but is significantly slower (~10x). The CUDA pipeline is optional and only needed for real-time or high-throughput pose estimation.
+
 ---
 
 ## Implementation Languages
@@ -161,14 +261,18 @@ Prerequisites: [uv](https://astral.sh/uv), [Visual Studio Build Tools 2022](http
 
 ---
 
-## GUI Tabs
+## GUI Layout
 
-| Tab | Name | Purpose |
-|-----|------|---------|
-| 1 | Record | Camera detection, live preview, settings (resolution/FPS/exposure), FPS graph, synchronized recording |
-| 2 | Intrinsic | Per-camera lens calibration from ChArUco board videos |
-| 3 | Extrinsic | Multi-camera spatial calibration via bundle adjustment |
-| 4 | Process | 2D tracking + triangulation → 3D export |
+The default landing page is the **Workout Page** — user login, camera initialization, workout recording, and analysis results. Calibration tools are under `Tools → Calibration`.
+
+| Location | Name | Purpose |
+|----------|------|---------|
+| Main page | Workout | User login, camera preview, workout recording + analysis |
+| File menu | Workout Directory | Set the working directory for recordings and calibrations |
+| Tools → Calibration | 1. Record | Camera detection, live preview, settings, synchronized recording |
+| Tools → Calibration | 2. Intrinsic | Per-camera lens calibration from ChArUco board videos |
+| Tools → Calibration | 3. Extrinsic | Multi-camera spatial calibration via bundle adjustment |
+| Tools → Calibration | 4. Process | 2D tracking + triangulation → 3D export |
 
 ## ChArUco Board Configuration
 
@@ -208,7 +312,7 @@ cd src/native
 ./build_macos.sh release    # or 'debug' for symbols
 ```
 
-Produces `libcalimerge.dylib` using AVFoundation.
+Produces `build/native/libcalimerge.dylib` using AVFoundation.
 
 ### Windows
 
@@ -247,13 +351,11 @@ cl /LD /EHsc /O2 /DNDEBUG calimerge_win32.cpp mfplat.lib mfreadwrite.lib mfuuid.
 #### Test Native Library
 
 ```powershell
-# After building, test camera enumeration
+# After building, test from the build output directory
+cd build\native
+
 test_enumerate.exe
-
-# Test single camera capture (camera index 0)
 test_capture.exe 0
-
-# Test multi-camera sync
 test_multi.exe
 ```
 
@@ -266,7 +368,7 @@ uv run calimerge gui
 
 #### Troubleshooting
 
-**DLL not found**: Ensure `calimerge.dll` is in `src/native/` - the Python binding looks there.
+**DLL not found**: Ensure `calimerge.dll` is in `build/native/` — the Python binding looks there first, then falls back to `src/native/`.
 
 **No cameras detected**:
 - Check Device Manager for camera devices
@@ -314,14 +416,14 @@ set OPENCV_PATH=C:\OpenCV\opencv\build
 src\cuda_pipeline\build_cuda_win32.bat release
 ```
 
-Produces `pt_main.exe` (CLI) and `calimerge_cuda.dll` (for Python integration).
+Produces `build/cuda/pt_main.exe` (CLI) and `build/cuda/calimerge_cuda.dll` (for Python integration).
 
 ### Offline Processing (Recorded Videos)
 
 Process pre-recorded multi-camera videos through the full pipeline:
 
 ```bash
-pt_main.exe <recording_dir> <calibration.toml> [options]
+build\cuda\pt_main.exe <recording_dir> <calibration.toml> [options]
 
 Options:
   --batch-size N       Sync indices per batch (default 8)
@@ -340,8 +442,8 @@ Video Decode (NVDEC or CPU fallback)
   → Letterbox + Normalize to FP16 640x640 (CUDA kernel, writes __half directly)
   → YOLO v10s Person Detection (TensorRT, FP16 input, FP32 output)
   → Filter Detections (CUDA kernel, class=0 person, undo letterbox)
-  → VitPose Crop + Normalize 192x256 (CUDA kernel, 1.25x box expansion, ImageNet stats)
-  → VitPose Base COCO (TensorRT, 17 keypoints)
+  → VitPose Crop + Normalize 192x256 (CUDA kernel, 1.25x box expansion, ImageNet stats, FP32)
+  → VitPose SynthPose (TensorRT, 52 keypoints, FP16 internal / FP32 I/O)
   → Heatmap Decode with DARK Refinement (CUDA kernel, sub-pixel via Taylor expansion)
   → Cross-View Epipolar Matching (CPU, Hungarian algorithm + union-find)
   → SVD Triangulation (CPU, Jacobi eigendecomposition)
@@ -370,7 +472,7 @@ pt_stream_destroy(stream);
 
 Test with recorded videos:
 ```bash
-pt_stream_main.exe <recording_dir> <calibration.toml> [options]
+build\cuda\pt_stream_main.exe <recording_dir> <calibration.toml> [options]
 ```
 
 **Performance:** 796 frames x 3 cameras in 8.2s (10.0 ms/frame, ~100 sync-frames/s).
@@ -388,7 +490,7 @@ YOLO inference is batched across multiple sync indices: 8 sync indices x 3 camer
 
 #### TensorRT FP16 I/O
 
-The letterbox CUDA kernel writes `__half` (FP16) values directly into the arena's YOLO input buffer -- no FP32-to-FP16 conversion step. The TensorRT engine's input tensor type is explicitly set to `kHALF` during engine build so it accepts the FP16 data natively. Output is left as FP32 (the `filter_detections` kernel reads FP32). TensorRT engines are cached to disk with keys encoding `{model_name}_{sm_version}_{max_batch}_{precision}.engine`, so engine rebuilds only happen when the model, GPU, or config changes.
+YOLO and VitPose both use FP16 internal computation via `BuilderFlag::kFP16`, but their input I/O formats differ. The YOLO letterbox kernel writes `__half` directly, so YOLO's input tensor is set to `kHALF` during engine build. VitPose's crop kernel writes `float`, so VitPose keeps FP32 input I/O — TensorRT handles the internal FP32→FP16 cast automatically. Both models output FP32. The model type is detected from the ONNX filename (`"yolo"` → FP16 input, anything else → FP32 input). TensorRT engines are cached to disk with keys encoding `{model_name}_{sm_version}_{max_batch}_{precision}.engine`, so engine rebuilds only happen when the model, GPU, or config changes.
 
 #### Pinned Memory for Async GPU-to-CPU Transfer
 
@@ -419,12 +521,19 @@ calimerge/
 │   │   │   ├── intrinsic.py    # Per-camera lens calibration
 │   │   │   └── extrinsic.py    # Multi-camera bundle adjustment
 │   │   │
+│   │   ├── tracking/            # Pose detection and triangulation
+│   │   │   ├── pose_detector.py       # PyTorch YOLO + VitPose inference
+│   │   │   ├── cuda_stream_binding.py # ctypes wrapper for CUDA streaming DLL
+│   │   │   ├── triangulation.py       # Numba-optimized 3D reconstruction
+│   │   │   └── pipeline.py            # Batch processing orchestrator
+│   │   │
 │   │   └── gui/                # PySide6 interface
-│   │       ├── main.py         # MainWindow with tabs
+│   │       ├── main.py         # MainWindow
 │   │       ├── state.py        # Immutable AppState + StateManager
-│   │       ├── workers.py      # QThread workers
-│   │       ├── tabs/           # Cameras, Record, Intrinsic, Extrinsic, Process
-│   │       └── widgets/        # CameraGrid, VideoPlayer
+│   │       ├── workers.py      # QThread workers (preview, detection, recording)
+│   │       ├── workout_page.py # Main workout interface
+│   │       ├── tabs/           # Calibration tabs (Intrinsic, Extrinsic, Process)
+│   │       └── widgets/        # CameraGrid, VideoPlayer, SkeletonView
 │   │
 │   ├── native/                 # C++ camera module
 │   │   ├── calimerge_platform.h
@@ -448,9 +557,8 @@ calimerge/
 │
 ├── tests/                      # Test suite
 ├── recordings/                 # Output directory
-├── caliscope/                  # Legacy: GUI calibration package
-├── multiwebcam/                # Legacy: webcam recording package
-└── posetrack/                  # Legacy: pose estimation package
+├── tests/data/                 # Test recordings (coord_3x1_3, recording_3by1, etc.)
+└── tests/                      # Test suite
 ```
 
 ## Recording Output Format
@@ -573,17 +681,7 @@ uv run pytest tests/test_triangulation.py -v
 
 ## Legacy Packages
 
-The original packages are preserved for reference during migration:
-
-- **caliscope/** - Full calibration + pose estimation GUI (Poetry)
-- **multiwebcam/** - Synchronized webcam recording (Poetry)
-- **posetrack/** - VitPose-based pose estimation
-
-To run legacy packages:
-```bash
-cd caliscope && poetry install && poetry run caliscope
-cd multiwebcam && poetry install && poetry run mwc clock
-```
+The original packages (caliscope, multiwebcam, posetrack) have been removed from the repository. Their functionality has been merged into `src/calimerge/`. Key test recordings are preserved in `tests/data/`.
 
 ## Memory Management
 
@@ -647,26 +745,5 @@ See [CLAUDE.md](CLAUDE.md) for detailed design documentation including:
 ## License
 
 BSD-2-Clause
-
-## Todo
-
-<li>
-2026-03-19
-
-1- move this main interface into a 'configure' dialog from the menu. so, we might as well build a file menu now as well, and 'file' only options should be the 'new project'; 'open project folder'; and 'recent projects'. if there are files within, point that out to the user that we're opening an existing project.
-
-2- bake in 
-
-- 2 i not 
-2026-03-11
-- nickname ghost text should be empty, not 'A'
-- default exposure for non-exposure controlled cams should be -4
-- enabled click does what we want now! great. but can you please make it not take so long? it's really a crazy long delay between click and anything happening. 
-
-- we have no file menu so far! perhaps we won't need one but we'll probably eventually need one. Implement an 'open project' file menu. show the pathname in a 'status bar' which the applciation does currently have, along the bottom of (all of the ) gui tabs. ASSOCIATED WITH THIS, please save all of the files and configurations for each camera and project there.
-
-- extrinsic results get blown away by the summary, rather than appended. no amount of scrolling up works 
-- you seem to be concatenating the frames into a single buffer, rather than showing simultaneously matched frames from n buffers for n synced cameras. i'd prefer the latter, it makes sense!
-
 
 

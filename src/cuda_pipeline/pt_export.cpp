@@ -10,7 +10,7 @@
  *
  * The model outputs 17 COCO keypoints (PT_NUM_KEYPOINTS).
  * Columns 17-51 are padded with empty fields (NaN) to match the
- * Python SynthPoseMarkers format (PT_EXPORT_KEYPOINTS = 52).
+ * Python SynthPoseMarkers format (PT_NUM_KEYPOINTS = 52).
  *
  * Invalid (non-triangulated) keypoints are written as empty fields (,,)
  * which Python/pandas reads as NaN.
@@ -22,6 +22,22 @@
  */
 
 #include "pt_export.h"
+
+static const char *PT_EXPORT_MARKER_NAMES[PT_NUM_KEYPOINTS] = {
+    "Nose", "L_Eye", "R_Eye", "L_Ear", "R_Ear",
+    "L_Shoulder", "R_Shoulder", "L_Elbow", "R_Elbow",
+    "L_Wrist", "R_Wrist", "L_Hip", "R_Hip",
+    "L_Knee", "R_Knee", "L_Ankle", "R_Ankle",
+    "sternum", "rshoulder", "lshoulder",
+    "r_lelbow", "l_lelbow", "r_melbow", "l_melbow",
+    "r_lwrist", "l_lwrist", "r_mwrist", "l_mwrist",
+    "r_ASIS", "l_ASIS", "r_PSIS", "l_PSIS",
+    "r_knee", "l_knee", "r_mknee", "l_mknee",
+    "r_ankle", "l_ankle", "r_mankle", "l_mankle",
+    "r_5meta", "l_5meta", "r_toe", "l_toe",
+    "r_big_toe", "l_big_toe", "l_calc", "r_calc",
+    "C7", "L2", "T11", "T6"
+};
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,7 +61,7 @@
 static int write_csv_header(FILE *f) {
     if (fprintf(f, "sync_index,person_id") < 0) return -1;
 
-    for (int k = 0; k < PT_EXPORT_KEYPOINTS; k++) {
+    for (int k = 0; k < PT_NUM_KEYPOINTS; k++) {
         if (fprintf(f, ",%s_X,%s_Y,%s_Z",
                     PT_EXPORT_MARKER_NAMES[k],
                     PT_EXPORT_MARKER_NAMES[k],
@@ -87,8 +103,8 @@ static int write_csv_row(FILE *f, int sync_index, int person_id,
         }
     }
 
-    /* Pad remaining columns (PT_NUM_KEYPOINTS to PT_EXPORT_KEYPOINTS-1 = 17..51) with NaN */
-    for (int k = PT_NUM_KEYPOINTS; k < PT_EXPORT_KEYPOINTS; k++) {
+    /* Pad remaining columns (PT_NUM_KEYPOINTS to PT_NUM_KEYPOINTS-1 = 17..51) with NaN */
+    for (int k = PT_NUM_KEYPOINTS; k < PT_NUM_KEYPOINTS; k++) {
         if (fprintf(f, ",,,") < 0) return -1;
     }
 
