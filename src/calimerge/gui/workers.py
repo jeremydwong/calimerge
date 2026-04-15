@@ -1404,7 +1404,10 @@ class CudaStreamDetectionWorker(QThread):
 
                 # Reproject 3D keypoints onto each camera's frame
                 for port, frame in raw_frames.items():
-                    vis = self._draw_reprojected(port, frame, result)
+                    try:
+                        vis = self._draw_reprojected(port, frame, result)
+                    except Exception:
+                        vis = frame
                     self.detection_ready.emit(port, vis)
 
                 # Emit 3D keypoints
@@ -1455,10 +1458,10 @@ class CudaStreamDetectionWorker(QThread):
             color = self._PERSON_COLORS[pi % n_colors]
             kp_color = tuple(min(255, int(c * 1.3)) for c in color)
 
-            # Collect valid 3D keypoints
+            # Collect valid 3D keypoints (skip NaN)
             pts_3d = {}
             for k, kp in enumerate(person.keypoints_3d):
-                if kp is not None:
+                if kp is not None and not np.isnan(kp).any():
                     pts_3d[k] = kp
 
             if not pts_3d:
@@ -1473,10 +1476,15 @@ class CudaStreamDetectionWorker(QThread):
             )
             pts_2d = pts_2d.reshape(-1, 2)
 
-            # Map keypoint index -> 2D pixel
+            # Map keypoint index -> 2D pixel, clamp to sane range
+            h_frame, w_frame = vis.shape[:2]
             kp_2d = {}
             for idx, ki in enumerate(indices):
-                kp_2d[ki] = (int(pts_2d[idx, 0]), int(pts_2d[idx, 1]))
+                x, y = pts_2d[idx, 0], pts_2d[idx, 1]
+                if np.isnan(x) or np.isnan(y) or abs(x) > 1e6 or abs(y) > 1e6:
+                    continue
+                kp_2d[ki] = (int(np.clip(x, -9999, 9999)),
+                             int(np.clip(y, -9999, 9999)))
 
             # Draw skeleton limbs
             for i, j in self._SKELETON:

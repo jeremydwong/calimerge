@@ -1935,15 +1935,20 @@ class WorkoutPage(QWidget):
             self.zero_origin_button.setEnabled(True)
             return
 
-        R = self._view_rotation[:3, :3]
+        # If Rotate to Human hasn't been done yet, compute it now automatically
+        R_current = self._view_rotation[:3, :3]
+        if np.allclose(R_current, np.eye(3)):
+            self._compute_rotate_to_human()
+            R_current = self._view_rotation[:3, :3]
+
         T = np.eye(4)
-        T[:3, :3] = R
-        T[:3, 3] = -R @ origin_pt
+        T[:3, :3] = R_current
+        T[:3, 3] = -R_current @ origin_pt
 
         self._view_has_origin = True
         self.skeleton_view.set_view_transform(T, has_origin=True)
         self._save_view_transform(T, has_origin=True)
-        self._save_body_transform(R, origin_pt)
+        self._save_body_transform(R_current, origin_pt)
         self.zero_origin_button.setEnabled(True)
 
     # ── View transform persistence ──
