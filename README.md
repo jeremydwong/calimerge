@@ -1,23 +1,75 @@
-# Calimerge
+  # Calimerge
 
-Unified multi-camera motion capture: synchronized recording, calibration, and 3D pose estimation.
+  Unified multi-camera motion capture: synchronized recording, calibration, and 3D pose estimation.
 
-> **Status:** Active development. Camera capture, calibration pipeline, and GPU pose tracking working on Windows and macOS.
+  > **Status:** Active development. Camera capture, calibration pipeline, and GPU pose tracking working on Windows and macOS.
 
-### Acknowledgements
+  [![Demo video](https://img.youtube.com/vi/Ebvx4vCMTxE/maxresdefault.jpg)](https://youtu.be/Ebvx4vCMTxE)
 
-This project is inspired by and builds on the work of:
-- **Jon Matthis** and the [FreeMoCap](https://github.com/freemocap/freemocap) project
-- **Mac Prible** and [Caliscope](https://github.com/mprib/caliscope) — the name "calimerge" is an attempt to respect his efforts
+  ### Acknowledgements
 
-### Goals
+  This project is inspired by and builds on the work of:
+  - **Jon Matthis** and the [FreeMoCap](https://github.com/freemocap/freemocap) project
+  - **Mac Prible** and [Caliscope](https://github.com/mprib/caliscope) — the name "calimerge" is an attempt to respect his efforts
 
-- A single app for simple use (minimal collisions with file ownership)
-- Multi-person recording and tracking
-- CUDA/MPS-accelerated keypoint detection
-- Serial-number-based camera management (one camera = one intrinsic, stored in a database, independent of USB port order)
+  ### Goals
 
----
+  - A single app for simple use (minimal collisions with file ownership)
+  - Multi-person recording and tracking
+  - CUDA/MPS-accelerated keypoint detection
+  - Serial-number-based camera management (one camera = one intrinsic, stored in a database, independent of USB port order)
+
+  ---
+
+## Live Streaming
+
+Calimerge supports real-time 3D pose estimation from live camera feeds. Once cameras are calibrated (intrinsic + extrinsic), the Workout page provides live detection with three backends:
+
+### Detection backends
+
+| Backend | Model | Speed | Requirements |
+|---------|-------|-------|-------------|
+| **CUDA TensorRT** | YOLO v10s + VitPose SynthPose-52 | ~5 ms/frame | NVIDIA GPU, TensorRT, `calimerge_cuda.dll` |
+| **PyTorch** | YOLO + VitPose SynthPose-52 | ~50-100 ms/frame | PyTorch (CPU or CUDA) |
+| **MediaPipe Hands** | MediaPipe HandLandmarker | ~15 ms/frame | No GPU required |
+
+### CUDA live pipeline
+
+The CUDA backend (`CudaStreamDetectionWorker`) runs the full TensorRT pipeline in a background thread:
+
+1. Camera frames arrive via `submit_frame()` (non-blocking, keeps latest per port)
+2. When all cameras have a frame, the pipeline processes them as a synchronized set
+3. YOLO detects persons, VitPose estimates 52 keypoints per person per camera
+4. Cross-view epipolar matching associates detections across cameras
+5. SVD triangulation produces 3D keypoints
+6. Multi-person tracking maintains identity across frames
+7. 3D keypoints are reprojected back onto each camera view using `cv2.projectPoints` for skeleton overlay
+
+The first run after a model or GPU change rebuilds TensorRT engines (~30s). Subsequent runs load cached engines in <1s.
+
+### Hand tracking
+
+MediaPipe Hands detects 21 landmarks per hand per camera. Hands are matched across cameras via wrist-landmark triangulation with in-front-of-camera validation. Hand identity is stabilized by sorting consistently by handedness label (Left always first). Stale detections are held for a few frames to bridge brief detection gaps.
+
+### Workout page controls
+
+- **Model dropdown**: VitPose (body) or MediaPipe Hands
+- **Backend dropdown**: CUDA TensorRT or PyTorch (body only)
+- **Detect checkbox**: Toggle live detection on/off
+- **Rotate to Human**: Aligns the 3D view so the person faces forward (5s countdown)
+- **Zero at X**: Sets the origin based on the active model — L_Ankle for body, L_Thumb for hands. Uses the same rotation computed by "Rotate to Human", stored in `camera_rig.toml`
+
+### Workout recording
+
+During live detection, pressing Record captures:
+- Synchronized video per camera (`.mp4`)
+- Frame timing CSV (`frame_time_history.csv`)
+- Camera mapping CSV (serial number to port)
+- Buffered 3D keypoints (saved as `.npz` on stop)
+
+Recordings are organized under `recordings/workouts/` with timestamps and workout type labels (e.g., `20260413_145752_pushup/`).
+
+  ---
 
 ## Dependencies
 
@@ -390,8 +442,8 @@ Video Decode (NVDEC or CPU fallback)
   → Letterbox + Normalize to FP16 640x640 (CUDA kernel, writes __half directly)
   → YOLO v10s Person Detection (TensorRT, FP16 input, FP32 output)
   → Filter Detections (CUDA kernel, class=0 person, undo letterbox)
-  → VitPose Crop + Normalize 192x256 (CUDA kernel, 1.25x box expansion, ImageNet stats)
-  → VitPose Base COCO (TensorRT, 17 keypoints)
+  → VitPose Crop + Normalize 192x256 (CUDA kernel, 1.25x box expansion, ImageNet stats, FP32)
+  → VitPose SynthPose (TensorRT, 52 keypoints, FP16 internal / FP32 I/O)
   → Heatmap Decode with DARK Refinement (CUDA kernel, sub-pixel via Taylor expansion)
   → Cross-View Epipolar Matching (CPU, Hungarian algorithm + union-find)
   → SVD Triangulation (CPU, Jacobi eigendecomposition)
@@ -438,7 +490,7 @@ YOLO inference is batched across multiple sync indices: 8 sync indices x 3 camer
 
 #### TensorRT FP16 I/O
 
-The letterbox CUDA kernel writes `__half` (FP16) values directly into the arena's YOLO input buffer -- no FP32-to-FP16 conversion step. The TensorRT engine's input tensor type is explicitly set to `kHALF` during engine build so it accepts the FP16 data natively. Output is left as FP32 (the `filter_detections` kernel reads FP32). TensorRT engines are cached to disk with keys encoding `{model_name}_{sm_version}_{max_batch}_{precision}.engine`, so engine rebuilds only happen when the model, GPU, or config changes.
+YOLO and VitPose both use FP16 internal computation via `BuilderFlag::kFP16`, but their input I/O formats differ. The YOLO letterbox kernel writes `__half` directly, so YOLO's input tensor is set to `kHALF` during engine build. VitPose's crop kernel writes `float`, so VitPose keeps FP32 input I/O — TensorRT handles the internal FP32→FP16 cast automatically. Both models output FP32. The model type is detected from the ONNX filename (`"yolo"` → FP16 input, anything else → FP32 input). TensorRT engines are cached to disk with keys encoding `{model_name}_{sm_version}_{max_batch}_{precision}.engine`, so engine rebuilds only happen when the model, GPU, or config changes.
 
 #### Pinned Memory for Async GPU-to-CPU Transfer
 
@@ -469,12 +521,19 @@ calimerge/
 │   │   │   ├── intrinsic.py    # Per-camera lens calibration
 │   │   │   └── extrinsic.py    # Multi-camera bundle adjustment
 │   │   │
+│   │   ├── tracking/            # Pose detection and triangulation
+│   │   │   ├── pose_detector.py       # PyTorch YOLO + VitPose inference
+│   │   │   ├── cuda_stream_binding.py # ctypes wrapper for CUDA streaming DLL
+│   │   │   ├── triangulation.py       # Numba-optimized 3D reconstruction
+│   │   │   └── pipeline.py            # Batch processing orchestrator
+│   │   │
 │   │   └── gui/                # PySide6 interface
-│   │       ├── main.py         # MainWindow with tabs
+│   │       ├── main.py         # MainWindow
 │   │       ├── state.py        # Immutable AppState + StateManager
-│   │       ├── workers.py      # QThread workers
-│   │       ├── tabs/           # Cameras, Record, Intrinsic, Extrinsic, Process
-│   │       └── widgets/        # CameraGrid, VideoPlayer
+│   │       ├── workers.py      # QThread workers (preview, detection, recording)
+│   │       ├── workout_page.py # Main workout interface
+│   │       ├── tabs/           # Calibration tabs (Intrinsic, Extrinsic, Process)
+│   │       └── widgets/        # CameraGrid, VideoPlayer, SkeletonView
 │   │
 │   ├── native/                 # C++ camera module
 │   │   ├── calimerge_platform.h
@@ -686,26 +745,5 @@ See [CLAUDE.md](CLAUDE.md) for detailed design documentation including:
 ## License
 
 BSD-2-Clause
-
-## Todo
-
-<li>
-2026-03-19
-
-1- move this main interface into a 'configure' dialog from the menu. so, we might as well build a file menu now as well, and 'file' only options should be the 'new project'; 'open project folder'; and 'recent projects'. if there are files within, point that out to the user that we're opening an existing project.
-
-2- the main interface should be converted into an interface reflecting the task that you wish to analyze. the idea is that you can record 
-
-- 2 i not 
-2026-03-11
-- nickname ghost text should be empty, not 'A'
-- default exposure for non-exposure controlled cams should be -4
-- enabled click does what we want now! great. but can you please make it not take so long? it's really a crazy long delay between click and anything happening. 
-
-- we have no file menu so far! perhaps we won't need one but we'll probably eventually need one. Implement an 'open project' file menu. show the pathname in a 'status bar' which the applciation does currently have, along the bottom of (all of the ) gui tabs. ASSOCIATED WITH THIS, please save all of the files and configurations for each camera and project there.
-
-- extrinsic results get blown away by the summary, rather than appended. no amount of scrolling up works 
-- you seem to be concatenating the frames into a single buffer, rather than showing simultaneously matched frames from n buffers for n synced cameras. i'd prefer the latter, it makes sense!
-
 
 
