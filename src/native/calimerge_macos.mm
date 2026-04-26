@@ -706,6 +706,11 @@ int cm_enumerate_cameras(CM_Camera *out_cameras, int max_cameras) {
             CM_Camera *cam = &out_cameras[count];
             memset(cam, 0, sizeof(CM_Camera));
 
+            /* Always record the AVF uniqueID so cm_open_camera can find the
+             * device again regardless of what we chose for serial_number. */
+            const char *avfUid = [device.uniqueID UTF8String];
+            strncpy(cam->avf_unique_id, avfUid ? avfUid : "", CM_SERIAL_LEN - 1);
+
             /* Prefer the real USB iSerialNumber so serial numbers match
              * the Windows implementation.  Fall back to AVF uniqueID for
              * cameras that have no hardware serial (e.g. built-in webcam). */
@@ -715,8 +720,7 @@ int cm_enumerate_cameras(CM_Camera *out_cameras, int max_cameras) {
                 fprintf(stderr, "[enum] camera %d '%s'  serial=%s  (from USB iSerialNumber)\n",
                         count, device.localizedName.UTF8String ?: "?", cam->serial_number);
             } else {
-                const char *uid = [device.uniqueID UTF8String];
-                strncpy(cam->serial_number, uid ? uid : "unknown", CM_SERIAL_LEN - 1);
+                strncpy(cam->serial_number, avfUid ? avfUid : "unknown", CM_SERIAL_LEN - 1);
                 fprintf(stderr, "[enum] camera %d '%s'  serial=%s  (from AVF uniqueID)\n",
                         count, device.localizedName.UTF8String ?: "?", cam->serial_number);
             }
@@ -861,16 +865,25 @@ int cm_open_camera(CM_Camera *camera) {
             position:AVCaptureDevicePositionUnspecified];
 
         AVCaptureDevice *device = nil;
-        NSString *targetSerial = [NSString stringWithUTF8String:camera->serial_number];
+        /* Match by avf_unique_id (always AVF's uniqueID). Fall back to
+         * serial_number for records created before the field existed or if
+         * something zeroed it out. */
+        NSString *targetUid = (camera->avf_unique_id[0] != '\0')
+            ? [NSString stringWithUTF8String:camera->avf_unique_id]
+            : [NSString stringWithUTF8String:camera->serial_number];
 
         for (AVCaptureDevice *d in discovery.devices) {
-            if ([d.uniqueID isEqualToString:targetSerial]) {
+            if ([d.uniqueID isEqualToString:targetUid]) {
                 device = d;
                 break;
             }
         }
 
-        if (!device) return CM_ERROR_NO_CAMERA;
+        if (!device) {
+            fprintf(stderr, "[open] no AVF device with uniqueID '%s' (serial='%s')\n",
+                    [targetUid UTF8String] ?: "?", camera->serial_number);
+            return CM_ERROR_NO_CAMERA;
+        }
 
         MacOSCameraHandle *handle = (MacOSCameraHandle *)calloc(1, sizeof(MacOSCameraHandle));
         if (!handle) return CM_ERROR_OPEN_FAILED;

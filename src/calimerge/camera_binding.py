@@ -100,6 +100,7 @@ class CM_Camera(ctypes.Structure):
     _fields_ = [
         ("serial_number", ctypes.c_char * CM_SERIAL_LEN),
         ("display_name", ctypes.c_char * CM_NAME_LEN),
+        ("avf_unique_id", ctypes.c_char * CM_SERIAL_LEN),
         ("device_index", ctypes.c_int),
         ("width", ctypes.c_int),
         ("height", ctypes.c_int),

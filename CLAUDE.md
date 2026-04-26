@@ -49,11 +49,11 @@ VIRTUAL_ENV= ~/.local/bin/uv run pytest ...
 
 ## Repository Overview
 
-**calimerge** is a unified multi-camera motion capture application. It merges three legacy packages:
+**calimerge** is a unified multi-camera motion capture application. It merges the functionality of three legacy packages:
 
-- **caliscope** (removed, was GUI calibration and 3D pose estimation)
-- **multiwebcam** (removed, was synchronized webcam recording)
-- **posetrack** (removed, was VitPose-based pose estimation)
+- **caliscope** (Prible: removed, was GUI calibration and 3D pose estimation)
+- **multiwebcam** (MPrible: host-side synchronized webcam recording)
+- **posetrack** (JWong: VitPose-based pose estimation)
 
 The active unified package is in `src/calimerge/` and uses **uv** (not Poetry).
 

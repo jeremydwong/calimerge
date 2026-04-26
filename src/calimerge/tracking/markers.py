@@ -22,5 +22,15 @@ SYNTHPOSE_MARKERS = {
 
 NUM_MARKERS = len(SYNTHPOSE_MARKERS)  # 52
 
-# Default hip indices for center-of-mass calculation (COCO format)
-HIP_INDICES = (11, 12)
+
+def find_marker_index(markers: dict[int, str], name: str) -> int:
+    for idx, marker_name in markers.items():
+        if marker_name == name:
+            return idx
+    raise KeyError(f"marker {name!r} not found in schema (have {sorted(markers.values())})")
+
+
+HIP_INDICES = (
+    find_marker_index(SYNTHPOSE_MARKERS, "L_Hip"),
+    find_marker_index(SYNTHPOSE_MARKERS, "R_Hip"),
+)

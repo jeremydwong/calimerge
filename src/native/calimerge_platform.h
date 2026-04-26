@@ -40,8 +40,9 @@ typedef struct {
 } CM_Format;
 
 typedef struct {
-    char serial_number[CM_SERIAL_LEN];   /* Unique device identifier */
+    char serial_number[CM_SERIAL_LEN];   /* Unique device identifier (USB iSerialNumber when available) */
     char display_name[CM_NAME_LEN];      /* Human-readable name */
+    char avf_unique_id[CM_SERIAL_LEN];   /* macOS: AVFoundation uniqueID used for device lookup in cm_open_camera. Unused on Windows. */
     int  device_index;                   /* Platform device index */
 
     /* Current settings */

@@ -173,6 +173,46 @@ class XYZPoints:
     xyz: np.ndarray  # (n, 3)
 
 
+@dataclass(frozen=True, slots=True)
+class KeypointSchema:
+    """
+    Ordered keypoint names for a pose model.
+    Analyzers address joints by name (schema.index("L_Hip")) rather than
+    by raw integer index, so the same analyzer works across models.
+    """
+
+    names: tuple[str, ...]
+
+    @property
+    def K(self) -> int:
+        return len(self.names)
+
+    def index(self, name: str) -> int:
+        try:
+            return self.names.index(name)
+        except ValueError:
+            raise KeyError(
+                f"keypoint {name!r} not in schema (have {list(self.names)})"
+            ) from None
+
+
+@dataclass(frozen=True, slots=True)
+class Skeleton3D:
+    """
+    Dense, time-aligned 3D skeleton trajectory.
+
+    Produced by stacking a list of XYZPoints (per sync index) into a single
+    array and joining timestamps from frame_time_history.csv. This is the
+    shape analysis functions consume: xyz[frame, person, joint, xyz_axis].
+    """
+
+    xyz: np.ndarray              # (N, P, K, 3) float32, NaN where missing
+    timestamps: np.ndarray       # (N,) float64, seconds from first frame
+    sync_indices: np.ndarray     # (N,) int64, original sync indices
+    track_ids: tuple[int, ...]   # length P, stable person identifiers
+    schema: KeypointSchema
+
+
 # ============================================================================
 # Project Configuration
 # ============================================================================
