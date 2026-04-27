@@ -930,7 +930,23 @@ class WorkoutPage(QWidget):
         self._apply_plot_mode(self._selected_workout_type())
 
     def _selected_workout_type(self) -> str:
-        """Return the string identifier for the currently selected workout."""
+        """Return the string identifier for the currently selected workout.
+
+        Priority order:
+          1. The exercise the user picked from Today's Plan (program-driven,
+             includes FGA tasks like 'fga_horizontal_head_turns'). Without
+             this lookup, recording an FGA task silently saved as
+             'sit_to_stand' and ran the wrong analyzer.
+          2. The legacy radio buttons (sit-to-stand, push-up, etc.) from the
+             pre-program-system UI.
+          3. Sit-to-stand as a default of last resort.
+        """
+        ex = self._current_program_exercise
+        if ex is not None:
+            wt = ex.get("workout_type")
+            if wt:
+                return str(wt)
+
         if self.sts_radio.isChecked():
             return "sit_to_stand"
         if self.tug_radio.isChecked():
@@ -1502,11 +1518,22 @@ class WorkoutPage(QWidget):
                     self._current_user_id, ex["id"],
                     week_start.strftime("%Y-%m-%d %H:%M:%S"),
                 )
-                total = ex["sets_per_day"] * ex["days_per_week"]
+                total = max(1, ex["sets_per_day"] * ex["days_per_week"])
                 next_set = done + 1
-                self.record_btn.setText(
-                    f"Record {ex['display_name']} — Set {next_set} of {total}"
-                )
+                # Once the weekly target is met, "Set N of total" with
+                # N > total is nonsense (e.g. "Set 2 of 1" for an
+                # assessment). Show "Complete" so the operator knows
+                # they've already finished, but keep the button clickable
+                # in case they want to re-record an extra trial.
+                if done >= total:
+                    self.record_btn.setText(
+                        f"Record {ex['display_name']} — Complete "
+                        f"({done}/{total})"
+                    )
+                else:
+                    self.record_btn.setText(
+                        f"Record {ex['display_name']} — Set {next_set} of {total}"
+                    )
                 return
             except Exception:
                 pass
