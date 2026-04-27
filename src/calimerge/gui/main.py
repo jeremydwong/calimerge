@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QFileDialog,
 )
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QFont
 from .state import StateManager
 from .workout_page import WorkoutPage
 from .calibration_dialog import CalibrationDialog
@@ -273,6 +273,23 @@ def main():
 
     app.setApplicationName("Calimerge")
     app.setOrganizationName("Calimerge")
+
+    # Application-wide font: Gill Sans, with platform fallbacks so we
+    # degrade gracefully on machines that don't have it. Explicit
+    # `setFont(QFont("monospace", ...))` calls in widgets that show
+    # code/log/numeric output remain unaffected — those are intentional.
+    _ui_font = QFont()
+    _ui_font.setFamilies([
+        "Gill Sans",        # macOS / Windows (if installed)
+        "Gill Sans MT",     # Windows (Office bundled)
+        "Gill Sans Std",    # Adobe-installed variant
+        "Gill Sans Nova",   # Microsoft 365 variant
+        "Helvetica Neue",   # macOS fallback
+        "Helvetica",        # macOS fallback
+        "Segoe UI",         # Windows fallback
+        "Arial",            # universal sans fallback
+    ])
+    app.setFont(_ui_font)
 
     window = MainWindow()
     window.show()

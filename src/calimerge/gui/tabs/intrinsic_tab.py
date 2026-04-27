@@ -467,7 +467,12 @@ class IntrinsicTab(QWidget):
             nick_item.setData(Qt.ItemDataRole.UserRole + 1, serial)
             nick_item.setFlags(nick_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             if nickname:
-                nick_item.setFont(QFont("sans-serif", 10, QFont.Weight.Bold))
+                # Inherit application font (Gill Sans + fallbacks); only the
+                # weight needs to differ from the default for emphasis.
+                nick_font = QFont(self.font())
+                nick_font.setPointSize(10)
+                nick_font.setBold(True)
+                nick_item.setFont(nick_font)
             self.camera_table.setItem(row, 2, nick_item)
 
             # Camera name (column 3)

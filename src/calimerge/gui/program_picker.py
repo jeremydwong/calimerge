@@ -81,7 +81,7 @@ class ProgramPickerDialog(QDialog):
                         f"{e['days_per_week']}/wk ({target})"
                     )
                 ex_label = QLabel("\n".join(ex_lines))
-                ex_label.setStyleSheet("color: #ccc; font-family: monospace;")
+                ex_label.setStyleSheet("color: #ccc;")
                 group_layout.addWidget(ex_label)
 
             layout.addWidget(group)
