@@ -270,8 +270,12 @@ def run_cuda_pipeline(
     if vitpose_onnx is None:
         vitpose_onnx = recording_dir / "vitpose_base_coco_wholebody.onnx"
 
-    # Build engine cache dir next to the output
-    engine_cache_dir = output_path / "engine_cache"
+    # Engine cache lives under the app data dir — the engine depends on
+    # (model, GPU, TRT version, precision), not the session, so reusing
+    # it across recordings avoids the ~30-60s rebuild cost per session.
+    from ..config import engine_cache_dir as _engine_cache_dir
+    engine_cache_dir = _engine_cache_dir()
+    engine_cache_dir.mkdir(parents=True, exist_ok=True)
 
     # --- Fill config struct ---
     config = PT_PipelineConfig()

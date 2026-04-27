@@ -524,6 +524,134 @@ class ExtrinsicCalibrationWorker(QThread):
         self.running = False
 
 
+class _LiveTracker:
+    """Cross-frame association of triangulated 3D persons by hip-COM continuity.
+
+    Light port of tracker.assign_3d_candidates_to_tracks for the live PyTorch
+    worker. The cost matrix is tiny (≤ N_persons × N_persons, typically 2×2 or
+    3×3) so Hungarian + COM bookkeeping costs microseconds per frame. Stable
+    track ids let downstream consumers (CSV export, foot-placement viz) trust
+    that "person 0 in frame N+1" really is "person 0 from frame N".
+
+    Track ids start at 1; 0 is reserved for "untrackable" (no valid hip COM).
+    """
+
+    def __init__(
+        self,
+        hip_indices: "tuple[int, int] | None" = None,
+        max_match_distance: float = 0.5,   # meters; ≤ this still considered the same person
+        patience: int = 10,                # frames a track can be lost before being dropped
+        max_persons: int = 8,
+    ):
+        # Lazy-import HIP_INDICES so Qt threads don't trigger heavy imports
+        # in module init.
+        if hip_indices is None:
+            from ..tracking.markers import HIP_INDICES as _HIP
+            hip_indices = _HIP
+        self.hip_indices = hip_indices
+        self.max_match_distance = max_match_distance
+        self.patience = patience
+        self.max_persons = max_persons
+        self._tracks: list[dict] = []   # each: {id, com (np.ndarray), frames_since_seen}
+        self._next_id = 1
+
+    def reset(self) -> None:
+        self._tracks = []
+        self._next_id = 1
+
+    def _hip_com_from_kps(self, kps_3d: list) -> "np.ndarray | None":
+        import numpy as _np
+        valid = []
+        for hip_idx in self.hip_indices:
+            if hip_idx < len(kps_3d):
+                kp = kps_3d[hip_idx]
+                if kp is not None:
+                    arr = _np.asarray(kp, dtype=float)
+                    if arr.size >= 3 and not _np.isnan(arr[:3]).any():
+                        valid.append(arr[:3])
+        if valid:
+            return _np.mean(valid, axis=0)
+        return None
+
+    def step(self, persons_kps: list) -> list[int]:
+        """Given the current frame's triangulated persons, return parallel ids.
+
+        Each entry in `persons_kps` is `list[np.ndarray | None]` (length = num
+        keypoints). Returns a list of the same length. id 0 means "could not
+        compute COM, no track assigned this frame".
+        """
+        import numpy as _np
+        from scipy.optimize import linear_sum_assignment as _lsa
+
+        n = len(persons_kps)
+        coms = [self._hip_com_from_kps(kps) for kps in persons_kps]
+
+        if n == 0:
+            for t in self._tracks:
+                t["frames_since_seen"] += 1
+            self._tracks = [t for t in self._tracks
+                            if t["frames_since_seen"] <= self.patience]
+            return []
+
+        # No existing tracks: assign new ids to anyone with a valid COM.
+        if not self._tracks:
+            ids = [0] * n
+            for j, c in enumerate(coms):
+                if c is not None and len(self._tracks) < self.max_persons:
+                    self._tracks.append({"id": self._next_id, "com": c,
+                                         "frames_since_seen": 0})
+                    ids[j] = self._next_id
+                    self._next_id += 1
+            return ids
+
+        # Build cost matrix: tracks × candidates. Far-apart pairs get HI so
+        # the linear assignment can't pick them.
+        m = len(self._tracks)
+        HI = 1e6
+        cost = _np.full((m, n), HI)
+        for i, t in enumerate(self._tracks):
+            for j, c in enumerate(coms):
+                if c is None:
+                    continue
+                d = float(_np.linalg.norm(t["com"] - c))
+                if d <= self.max_match_distance:
+                    cost[i, j] = d
+
+        # Hungarian even for non-square matrices.
+        rows, cols = _lsa(cost)
+
+        ids = [0] * n
+        track_seen = [False] * m
+        person_assigned = [False] * n
+        for r, c in zip(rows, cols):
+            if cost[r, c] < HI:
+                ids[c] = self._tracks[r]["id"]
+                self._tracks[r]["com"] = coms[c]
+                self._tracks[r]["frames_since_seen"] = 0
+                track_seen[r] = True
+                person_assigned[c] = True
+
+        # Unmatched candidates spawn fresh tracks (subject to max_persons).
+        for j in range(n):
+            if person_assigned[j] or coms[j] is None:
+                continue
+            if len(self._tracks) >= self.max_persons:
+                break
+            self._tracks.append({"id": self._next_id, "com": coms[j],
+                                 "frames_since_seen": 0})
+            ids[j] = self._next_id
+            self._next_id += 1
+
+        # Age unmatched tracks; drop those past patience.
+        for i, t in enumerate(self._tracks[:m]):  # only original tracks
+            if not track_seen[i]:
+                t["frames_since_seen"] += 1
+        self._tracks = [t for t in self._tracks
+                        if t["frames_since_seen"] <= self.patience]
+
+        return ids
+
+
 class PoseDetectionWorker(QThread):
     """Live 2D pose detection on preview frames.
 
@@ -601,6 +729,13 @@ class PoseDetectionWorker(QThread):
         # port -> list of (keypoints (17,2), scores (17,)) — one entry per detected person
         self._last_kps_per_port: dict[int, list[tuple["np.ndarray", "np.ndarray"]]] = {}
 
+        # Cross-frame person tracking. Stable ids parallel to the persons list
+        # emitted on keypoints_3d_ready, exposed as `last_person_ids` so
+        # downstream consumers (CSV export, foot-placement viz) can correlate
+        # person N from frame T with the same person in frame T+1.
+        self._tracker = _LiveTracker()
+        self.last_person_ids: list[int] = []
+
         # Frame queue: stores (port, frame_bgr). Only keep latest per port.
         import threading
         self._lock = threading.Lock()
@@ -615,6 +750,11 @@ class PoseDetectionWorker(QThread):
 
     def run(self):
         try:
+            # Fresh tracker state for every detection-worker run so track ids
+            # don't carry over from a previous session.
+            self._tracker.reset()
+            self.last_person_ids = []
+
             from ..tracking.pose_detector import setup_device, load_models
             self._device = setup_device(self.device_name)
             self.log_message.emit(f"Loading pose models on {self._device}...")
@@ -832,11 +972,22 @@ class PoseDetectionWorker(QThread):
         return [g for g in groups if len(g) >= 2]
 
     def _triangulate_live(self):
-        """Triangulate 3D keypoints for all matched persons and emit the results."""
+        """Triangulate 3D keypoints for all matched persons and emit the results.
+
+        Uses the same posetrack-style cross-view association as the batch
+        pipeline: per-pair epipolar Hungarian on hip-COM, then union-find to
+        merge into groups. Greedy "closest to origin" matching mis-associates
+        people who are at similar depths.
+        """
         try:
             import cv2
             import numpy as np
             from ..tracking.triangulation import calculate_projection_matrices, triangulate_keypoints
+            from ..tracking.tracker import (
+                group_detections_across_views_bipartite,
+                calculate_2d_com,
+            )
+            from ..tracking.markers import HIP_INDICES
 
             # Build camera_params
             sorted_ports = sorted(self.cameras.keys())
@@ -864,22 +1015,55 @@ class PoseDetectionWorker(QThread):
             if len(port_persons) < 2:
                 return
 
-            # Match persons across ports by 3D hip COM
-            groups = self._match_persons_hip_com(
-                port_persons, port_to_cam_index, camera_params, projection_matrices
+            # Build the per-port detection-dict format the bipartite grouper
+            # expects: each detection carries `keypoints` (N,3 with score) and
+            # the 2D hip COM used for the cost matrix.
+            detected_persons_2d: dict[int, list[dict]] = {}
+            for port, persons in port_persons.items():
+                port_dets: list[dict] = []
+                for kps, scores in persons:
+                    # Stitch (x,y,score) per keypoint and compute COM in the
+                    # same way the batch pipeline does.
+                    kps_with_score = np.concatenate([kps, scores[:, None]], axis=1)
+                    com_2d = calculate_2d_com(kps_with_score.tolist(), HIP_INDICES)
+                    if com_2d is None:
+                        continue
+                    port_dets.append({
+                        "keypoints": kps_with_score,
+                        "com_2d": com_2d,
+                    })
+                if port_dets:
+                    detected_persons_2d[port] = port_dets
+
+            if len(detected_persons_2d) < 2:
+                return
+
+            groups = group_detections_across_views_bipartite(
+                detected_persons_2d,
+                projection_matrices,
+                port_to_cam_index,
+                camera_params,
+                # Live frames have more detection noise than batch processing,
+                # so loosen the gate compared to the batch default (30).
+                epipolar_threshold=50.0,
             )
 
-            # Triangulate full 17 keypoints for each matched group
+            # Triangulate full keypoints for each matched group
             all_persons_3d = []
             for group in groups:
-                kp_dict = {}
-                for port, person_idx in group.items():
-                    kps, scores = port_persons[port][person_idx]
-                    kp_dict[port] = np.concatenate([kps, scores[:, None]], axis=1)
+                if len(group) < 2:
+                    continue
+                kp_dict = {port: det["keypoints"] for port, det in group.items()}
                 kps_3d = triangulate_keypoints(
                     kp_dict, port_to_cam_index, camera_params, projection_matrices
                 )
                 all_persons_3d.append(kps_3d)
+
+            # Cross-frame association: turn the per-frame group list into a
+            # set of stable track ids before emitting. Stored on the worker
+            # so downstream consumers (CSV export, foot-placement viz) can
+            # correlate without changing the existing signal contract.
+            self.last_person_ids = self._tracker.step(all_persons_3d)
 
             if all_persons_3d:
                 self.keypoints_3d_ready.emit(all_persons_3d)
@@ -933,8 +1117,15 @@ class MediaPipeHandsDetectionWorker(QThread):
         self.cameras = cameras  # dict[port, CalibratedCamera] or None
         self.max_hands = max_hands
         self.running = True
-        self._mp_hands = None
+        # One detector per port — VIDEO mode requires monotonic per-stream
+        # timestamps and per-stream tracking state to be stable.
+        self._mp_hands_per_port: dict[int, object] = {}
+        self._mp_options = None  # cached HandLandmarkerOptions for lazy per-port creation
+        self._mp_module = None
+        # Per-port monotonic timestamp counter (ms) for detect_for_video
+        self._port_ts_ms: dict[int, int] = {}
 
+        # Detection threshold (used to gate first-frame detection only)
         self.confidence_threshold = 0.5
 
         # Raw 2D landmarks per port for triangulation
@@ -955,29 +1146,46 @@ class MediaPipeHandsDetectionWorker(QThread):
     def run(self):
         try:
             import mediapipe as mp
+            from ..config import mediapipe_dir
 
-            # Download hand_landmarker.task model if needed
-            model_dir = Path(__file__).resolve().parent.parent.parent.parent / "models" / "mediapipe"
+            # Cache hand_landmarker.task under the app data dir
+            model_dir = mediapipe_dir()
             model_dir.mkdir(parents=True, exist_ok=True)
             model_path = model_dir / "hand_landmarker.task"
             if not model_path.exists():
-                self.log_message.emit("Downloading hand_landmarker.task...")
+                msg = (f"[DOWNLOAD] hand_landmarker.task not cached at "
+                       f"{model_path} -- downloading from Google CDN")
+                print(msg, flush=True)
+                self.log_message.emit(msg)
                 import urllib.request
                 url = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
                 urllib.request.urlretrieve(url, str(model_path))
-                self.log_message.emit("Download complete")
+                done = f"[DOWNLOAD] hand_landmarker.task saved to {model_path}"
+                print(done, flush=True)
+                self.log_message.emit(done)
+            else:
+                msg = (f"[CACHE HIT] hand_landmarker.task loaded from "
+                       f"{model_path} (no download)")
+                print(msg, flush=True)
+                self.log_message.emit(msg)
 
-            opts = mp.tasks.vision.HandLandmarkerOptions(
+            # VIDEO mode is the stable choice for live streams: when a hand is
+            # already tracked the detector skips full re-detection and runs the
+            # cheaper tracker, which kills the per-frame flicker. Detection
+            # threshold stays at 0.5 (only used to acquire a hand); the
+            # presence/tracking thresholds are dropped so partial occlusions
+            # don't cause repeated full re-detections.
+            self._mp_module = mp
+            self._mp_options = mp.tasks.vision.HandLandmarkerOptions(
                 base_options=mp.tasks.BaseOptions(model_asset_path=str(model_path)),
-                running_mode=mp.tasks.vision.RunningMode.IMAGE,
+                running_mode=mp.tasks.vision.RunningMode.VIDEO,
                 num_hands=self.max_hands,
                 min_hand_detection_confidence=self.confidence_threshold,
-                min_hand_presence_confidence=0.5,
-                min_tracking_confidence=0.5,
+                min_hand_presence_confidence=0.3,
+                min_tracking_confidence=0.3,
             )
-            self._mp_hands = mp.tasks.vision.HandLandmarker.create_from_options(opts)
             self.models_loaded.emit()
-            self.log_message.emit("MediaPipe Hands ready")
+            self.log_message.emit("MediaPipe Hands ready (VIDEO mode)")
         except Exception as e:
             self.error.emit(f"Failed to load MediaPipe Hands: {e}")
             return
@@ -1008,8 +1216,12 @@ class MediaPipeHandsDetectionWorker(QThread):
             if self.cameras is not None and len(self._last_hands_per_port) >= 2:
                 self._triangulate_hands()
 
-        if self._mp_hands is not None:
-            self._mp_hands.close()
+        for det in self._mp_hands_per_port.values():
+            try:
+                det.close()
+            except Exception:
+                pass
+        self._mp_hands_per_port.clear()
 
     def _detect_and_draw(self, port: int, frame_bgr: "np.ndarray") -> "np.ndarray":
         """Run MediaPipe Hands on a single frame and draw landmarks."""
@@ -1017,9 +1229,26 @@ class MediaPipeHandsDetectionWorker(QThread):
         import numpy as np
         import mediapipe as mp
 
+        # Lazy-create one VIDEO-mode detector per port (each maintains its
+        # own tracker state).
+        detector = self._mp_hands_per_port.get(port)
+        if detector is None:
+            if self._mp_options is None:
+                # run() failed to initialize options
+                return frame_bgr
+            detector = mp.tasks.vision.HandLandmarker.create_from_options(self._mp_options)
+            self._mp_hands_per_port[port] = detector
+            self._port_ts_ms[port] = 0
+
+        # Per-port monotonically increasing timestamp (ms). MediaPipe rejects
+        # non-increasing timestamps, so use a counter rather than wall time
+        # (works even if multiple frames arrive within the same millisecond).
+        self._port_ts_ms[port] = self._port_ts_ms[port] + 1
+        ts_ms = self._port_ts_ms[port]
+
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        results = self._mp_hands.detect(mp_image)
+        results = detector.detect_for_video(mp_image, ts_ms)
 
         if not results.hand_landmarks:
             # Don't clear — let stale data persist so triangulation can
@@ -1316,6 +1545,7 @@ class CudaStreamDetectionWorker(QThread):
         vitpose_onnx: str,
         engine_cache: str,
         max_persons: int = 2,
+        person_confidence: float = 0.50,
     ):
         super().__init__()
         self._cameras = cameras
@@ -1324,6 +1554,11 @@ class CudaStreamDetectionWorker(QThread):
         self._vitpose_onnx = vitpose_onnx
         self._engine_cache = engine_cache
         self._max_persons = max_persons
+        self._person_confidence = float(person_confidence)
+        # Stable track ids (parallel to the persons list emitted on
+        # keypoints_3d_ready). Populated from PT_StreamPerson.person_id which
+        # the C tracker assigns on its own.
+        self.last_person_ids: list[int] = []
         self._pipeline = None
         self._sync_index = 0
         self.running = True
@@ -1358,6 +1593,7 @@ class CudaStreamDetectionWorker(QThread):
                 vitpose_onnx_path=self._vitpose_onnx,
                 engine_cache_dir=self._engine_cache,
                 max_persons=self._max_persons,
+                person_confidence=self._person_confidence,
             )
             self.log_message.emit("CUDA pipeline ready")
         except Exception as e:
@@ -1407,11 +1643,18 @@ class CudaStreamDetectionWorker(QThread):
                     vis = self._draw_reprojected(port, frame, result)
                     self.detection_ready.emit(port, vis)
 
-                # Emit 3D keypoints
+                # Emit 3D keypoints. The C tracker's stable id is exposed
+                # via last_person_ids so downstream consumers can correlate
+                # without changing the existing signal contract.
                 if result.num_persons > 0:
+                    self.last_person_ids = [
+                        int(p.person_id) for p in result.persons
+                    ]
                     self.keypoints_3d_ready.emit([
                         p.keypoints_3d for p in result.persons
                     ])
+                else:
+                    self.last_person_ids = []
 
             except Exception as e:
                 import traceback

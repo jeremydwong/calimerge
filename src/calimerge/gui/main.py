@@ -8,6 +8,7 @@ accessible via Tools → Calibration menu.
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 from PySide6.QtWidgets import (
     QApplication,
@@ -48,9 +49,21 @@ class MainWindow(QMainWindow):
 
         file_menu = menubar.addMenu("File")
         workdir_action = QAction("Workout Directory...", self)
-        workdir_action.setToolTip("Set the directory for recordings, calibrations, and databases")
+        workdir_action.setToolTip("Set the directory for recordings and per-project calibration files")
         workdir_action.triggered.connect(self._browse_workout_dir)
         file_menu.addAction(workdir_action)
+
+        datadir_action = QAction("App Data Directory...", self)
+        datadir_action.setToolTip("Set where Calimerge caches model files, databases, and app settings")
+        datadir_action.triggered.connect(self._browse_data_dir)
+        file_menu.addAction(datadir_action)
+
+        file_menu.addSeparator()
+
+        add_person_action = QAction("Add Person...", self)
+        add_person_action.setToolTip("Create a new user and assign them to a workout program")
+        add_person_action.triggered.connect(self._add_person)
+        file_menu.addAction(add_person_action)
 
         tools_menu = menubar.addMenu("Tools")
         cal_action = QAction("Calibration...", self)
@@ -100,6 +113,64 @@ class MainWindow(QMainWindow):
 
         # Refresh calibration status on workout page
         self.workout_page._check_calibration()
+
+    def _browse_data_dir(self):
+        """Let the user choose the app data directory (models, DBs, settings)."""
+        from ..config import data_dir, set_data_dir
+
+        current = str(data_dir())
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select App Data Directory", current)
+        if not folder:
+            return
+
+        try:
+            set_data_dir(Path(folder))
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Could not set data directory: {e}")
+            return
+
+        QMessageBox.information(
+            self,
+            "App Data Directory Updated",
+            f"Calimerge will use this directory on next launch:\n\n{folder}\n\n"
+            "Move your existing model files and databases there manually if you want "
+            "to keep them. Restart the app to pick up the change.",
+        )
+        self._show_status(f"App data directory set to: {folder} (restart required)")
+
+    def _add_person(self):
+        """Open the Add Person dialog to create a user + assign a program."""
+        from .add_person_dialog import AddPersonDialog
+
+        dlg = AddPersonDialog(parent=self)
+        if dlg.exec() != AddPersonDialog.DialogCode.Accepted:
+            return
+        if dlg.created_user is None:
+            return
+
+        username = dlg.created_user["username"]
+        # Refresh the workout page's user dropdown so the new person is
+        # immediately selectable without needing a restart.
+        try:
+            self.workout_page._refresh_user_list()
+            for i in range(self.workout_page.user_combo.count()):
+                if self.workout_page.user_combo.itemText(i) == username:
+                    self.workout_page.user_combo.setCurrentIndex(i)
+                    break
+        except Exception:
+            pass
+
+        prog_msg = ""
+        if dlg.selected_program_id is not None:
+            try:
+                from ..config import get_program
+                prog = get_program(dlg.selected_program_id)
+                if prog:
+                    prog_msg = f" — program: {prog['display_name']}"
+            except Exception:
+                pass
+        self._show_status(f"Added person: {username}{prog_msg}")
 
     def _open_calibration(self):
         """Open the calibration tools dialog."""

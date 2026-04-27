@@ -268,6 +268,8 @@ class CudaStreamPipeline:
         engine_cache_dir: str = "",
         max_persons: int = 2,
         use_fp16_yolo: bool = True,
+        person_confidence: float = 0.50,
+        keypoint_confidence: float = 0.10,
         log_callback=None,
     ):
         lib = _load_lib()
@@ -280,8 +282,8 @@ class CudaStreamPipeline:
         config.frame_width = frame_width
         config.frame_height = frame_height
         config.max_persons = max_persons
-        config.person_confidence = 0.1
-        config.keypoint_confidence = 0.1
+        config.person_confidence = float(person_confidence)
+        config.keypoint_confidence = float(keypoint_confidence)
         config.epipolar_threshold = 10.0
         config.max_track_distance = 0.15
         config.track_patience = 30

@@ -207,7 +207,8 @@ class CamerasTab(QWidget):
         self._last_annotated: dict[int, "np.ndarray"] = {}  # port -> last annotated frame
         self.opened_cameras: list = []
         self.opened_ports: list[int] = []
-        self.base_output_path = Path("recordings")
+        from ...config import default_recordings_dir
+        self.base_output_path = default_recordings_dir()
         self.output_path: Path | None = None
         self._is_recording = False
         # Per-serial camera preferences loaded from project settings
@@ -597,7 +598,7 @@ class CamerasTab(QWidget):
 
             # Nickname (editable)
             nickname_edit = QLineEdit()
-            nickname_edit.setPlaceholderText("A")
+            nickname_edit.setPlaceholderText("")
             saved_nick = prev.get("nickname", "")
             prev_nick = saved_nick if saved_nick else cam_state.nickname
             nickname_edit.setText(prev_nick)

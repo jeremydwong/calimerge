@@ -48,7 +48,8 @@ class RecordTab(QWidget):
         self.recording_worker: RecordingWorker | None = None
         self.opened_cameras: list = []
         self.output_path: Path | None = None
-        self.base_output_path = Path("recordings")
+        from ...config import default_recordings_dir
+        self.base_output_path = default_recordings_dir()
 
         self._init_ui()
         self._connect_signals()

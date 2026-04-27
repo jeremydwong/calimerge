@@ -67,25 +67,32 @@ class ExerciseRow(QFrame):
         layout.setContentsMargins(8, 6, 8, 6)
         layout.setSpacing(10)
 
-        # Name + target
-        name_col = QVBoxLayout()
-        name_col.setSpacing(0)
+        # Name + target on a single row (rather than stacked) — cramped
+        # widths weren't surfacing the second line readably anyway.
         name_label = QLabel(exercise["display_name"])
         name_label.setStyleSheet("font-size: 12px; font-weight: bold;")
-        name_col.addWidget(name_label)
+        layout.addWidget(name_label, stretch=1)
 
-        if exercise["target_reps"] is not None:
-            target_str = f"{exercise['target_reps']} reps × {sets_per_day} sets"
-        elif exercise["target_duration_seconds"] is not None:
-            target_str = (
-                f"{int(exercise['target_duration_seconds'])}s × {sets_per_day} sets"
-            )
-        else:
-            target_str = f"{sets_per_day} sets"
-        target_label = QLabel(target_str)
-        target_label.setStyleSheet("font-size: 9px; color: #aaa;")
-        name_col.addWidget(target_label)
-        layout.addLayout(name_col, stretch=1)
+        # Suppress the rep string for assessment-shape rows (sets=1, reps=1)
+        # — reads as awkward boilerplate ("1 reps × 1 sets"). Keep it for
+        # rep-based programs where it actually communicates a target.
+        is_assessment_shape = (
+            sets_per_day == 1
+            and exercise.get("target_reps") in (1, None)
+            and exercise.get("target_duration_seconds") is None
+        )
+        if not is_assessment_shape:
+            if exercise["target_reps"] is not None:
+                target_str = f"{exercise['target_reps']} reps × {sets_per_day} sets"
+            elif exercise["target_duration_seconds"] is not None:
+                target_str = (
+                    f"{int(exercise['target_duration_seconds'])}s × {sets_per_day} sets"
+                )
+            else:
+                target_str = f"{sets_per_day} sets"
+            target_label = QLabel(target_str)
+            target_label.setStyleSheet("font-size: 10px; color: #aaa;")
+            layout.addWidget(target_label)
 
         # Today's progress + weekly tail
         total_sets_week = sets_per_day * exercise["days_per_week"]

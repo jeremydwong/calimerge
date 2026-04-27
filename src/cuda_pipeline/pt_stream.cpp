@@ -677,6 +677,43 @@ extern "C" int pt_stream_process_frame(PT_Stream *s,
 
     s->stats.tracking_ms += (stream_time_seconds() - t_track) * 1000.0;
 
+    /* ================================================================
+     * Multi-person debug: emit one fixed-width line per emitted person.
+     * Format keeps every column at a constant width so the user can scan
+     * a streaming log and see at a glance which track has stale data.
+     *   sync=NNNNNNNN  p#=N  id=NNNN  nv=N  com=( X.XX, Y.YY, Z.ZZ)  comV=N  ndets=NN
+     * COM is in meters with two decimals; "ndets" reports input detection
+     * counts per camera so missed detections are visible at a glance.
+     * ================================================================ */
+    {
+        char det_buf[64];
+        int n_written = 0;
+        det_buf[0] = '\0';
+        for (int c = 0; c < s->constants.num_cameras && n_written < (int)sizeof(det_buf) - 4; c++) {
+            n_written += snprintf(det_buf + n_written, sizeof(det_buf) - (size_t)n_written,
+                                  "%s%d", c == 0 ? "" : ",", det_counts_per_cam[c]);
+        }
+
+        if (out_result->num_persons == 0) {
+            stream_log(s,
+                "sync=%08llu  persons=0                                                 ndets=[%s]",
+                (unsigned long long)out_result->sync_index, det_buf);
+        } else {
+            for (int p = 0; p < out_result->num_persons; p++) {
+                const PT_StreamPerson *person = &out_result->persons[p];
+                stream_log(s,
+                    "sync=%08llu  p#=%d  id=%04d  nv=%d  com=(%6.2f,%6.2f,%6.2f)  comV=%d  ndets=[%s]",
+                    (unsigned long long)out_result->sync_index,
+                    p,
+                    person->person_id,
+                    person->num_views,
+                    person->com_3d[0], person->com_3d[1], person->com_3d[2],
+                    person->com_valid,
+                    det_buf);
+            }
+        }
+    }
+
     /* Total timing */
     double frame_time = (stream_time_seconds() - t_frame_start) * 1000.0;
     out_result->processing_time_ms = frame_time;

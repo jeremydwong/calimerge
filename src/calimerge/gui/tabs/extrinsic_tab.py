@@ -596,10 +596,25 @@ class ExtrinsicTab(QWidget):
             calibration_file = output_dir / "calibration.toml"
 
             try:
-                from ...config import save_calibration_to_toml
+                from ...config import save_calibration_to_toml, save_extrinsic_session
                 save_calibration_to_toml(cameras, calibration_file)
                 saved_path = calibration_file
                 self.results_text.append(f"\nSaved extrinsic calibration to:\n  {calibration_file}")
+
+                # Also persist into the machine-level extrinsics.db so live
+                # detection can pick up the latest calibration without globbing
+                # session subfolders.
+                try:
+                    session_id = save_extrinsic_session(
+                        cameras,
+                        rmse=float(error) if error is not None else None,
+                        notes=f"From {calibration_file}",
+                    )
+                    self.results_text.append(
+                        f"  (extrinsics.db session_id={session_id})"
+                    )
+                except Exception as db_e:
+                    self.results_text.append(f"  (extrinsics.db write failed: {db_e})")
             except Exception as e:
                 self.results_text.append(f"\nFailed to save calibration: {e}")
 

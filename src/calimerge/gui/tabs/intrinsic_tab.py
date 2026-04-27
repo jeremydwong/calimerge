@@ -239,11 +239,6 @@ class IntrinsicTab(QWidget):
         self.results_label.setWordWrap(True)
         results_layout.addWidget(self.results_label)
 
-        self.save_button = QPushButton("Save to Database")
-        self.save_button.setEnabled(False)
-        self.save_button.clicked.connect(self._save_intrinsics)
-        results_layout.addWidget(self.save_button)
-
         left_layout.addWidget(results_group)
 
         splitter.addWidget(left_panel)
@@ -308,7 +303,7 @@ class IntrinsicTab(QWidget):
             self._load_intrinsics_from_db()
 
     def _load_intrinsics_from_db(self):
-        """Load intrinsics from ~/.calimerge/intrinsics.db for all enabled cameras."""
+        """Load intrinsics from the app intrinsics DB for all enabled cameras."""
         cameras = self.state_manager.state.cameras
         if not cameras:
             return
@@ -671,12 +666,9 @@ class IntrinsicTab(QWidget):
                 f"  cy: {intrinsics.matrix[1, 2]:.2f}\n\n"
                 f"Distortion:\n{dist_lines}"
             )
-            # Only allow saving if not scaled (scaled intrinsics are derived, not original)
-            self.save_button.setEnabled(not intrinsics.is_scaled)
             self.load_video_button.setText("Load New Video...")
         else:
             self.results_label.setText("Not calibrated")
-            self.save_button.setEnabled(False)
             self.load_video_button.setText("Load Video...")
 
     # ── Video loading ──
@@ -916,7 +908,7 @@ class IntrinsicTab(QWidget):
             save_intrinsics(intrinsics, db_path)
             self._log(
                 f"Port {port} ({serial[-8:]}) calibrated (error: {intrinsics.error:.4f}), "
-                f"saved to ~/.calimerge/intrinsics.db"
+                f"saved to {db_path}"
             )
         except Exception as e:
             self._log(
@@ -963,27 +955,6 @@ class IntrinsicTab(QWidget):
         """Clean up worker."""
         if port in self.calibration_workers:
             del self.calibration_workers[port]
-
-    def _save_intrinsics(self):
-        """Save intrinsics to database."""
-        serial = self._get_selected_serial()
-        if serial is None:
-            return
-
-        cal_state = self.state_manager.state.calibration
-        if serial not in cal_state.intrinsics:
-            return
-
-        intrinsics = cal_state.intrinsics[serial]
-
-        try:
-            from ...config import save_intrinsics, get_default_intrinsics_db
-
-            db_path = get_default_intrinsics_db()
-            save_intrinsics(intrinsics, db_path)
-            self._log(f"Saved intrinsics for {serial} to ~/.calimerge/intrinsics.db")
-        except Exception as e:
-            self._log(f"Failed to save: {e}")
 
     # ── Helpers ──
 

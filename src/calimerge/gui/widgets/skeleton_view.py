@@ -19,12 +19,15 @@ view Z + Y-shear maps to screen Y (inverted for Y-up display).
 
 from __future__ import annotations
 
+import time
+from collections import deque
+
 import numpy as np
-
-from PySide6.QtWidgets import QWidget, QSizePolicy
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QPainter, QColor, QPen, QFont
+from PySide6.QtGui import QColor, QFont, QPainter, QPen
+from PySide6.QtWidgets import QSizePolicy, QWidget
 
+from calimerge.tracking.footstep_detector import FootPlacement, FootstepDetector
 
 # SynthPose 52-keypoint skeleton connections.
 # Convention: r_ = right side body, l_ = left side body.
@@ -97,6 +100,64 @@ _DEFAULT_TRANSFORM = np.array([
 ], dtype=float)
 
 
+# ── Footstep overlay constants ─────────────────────────────────────────
+# How many recent placements to keep per foot.
+_FOOTSTEP_HISTORY = 10
+# Body keypoint indices (SynthPose-52) for the ankle joints.
+_LEFT_ANKLE_IDX = 15
+_RIGHT_ANKLE_IDX = 16
+# Footstep marker styling. Match the body's left/right palette so the dots
+# read as "this is where the left foot landed".
+_LEFT_FOOT_COLOR = QColor(80, 160, 255)    # blue  — left
+_RIGHT_FOOT_COLOR = QColor(255, 80, 80)    # red   — right
+# Squares are larger than the old discs but transparent enough to overlay
+# without obscuring the floor grid behind them.
+_FOOTSTEP_MAX_ALPHA = 140
+_FOOTSTEP_MIN_ALPHA = 25
+# Half-side of the square in screen pixels (so total side = 2*this).
+_FOOTSTEP_HALF_PX = 9
+
+
+# ── Body laterality (SynthPose-52) ─────────────────────────────────────
+# Each body keypoint is classified as Left ("L"), Right ("R"), or Center
+# ("C"). Used to colour the skeleton so the right side draws red and the
+# left side blue regardless of which person is in frame.
+_BODY_SIDE_LEFT = "L"
+_BODY_SIDE_RIGHT = "R"
+_BODY_SIDE_CENTER = "C"
+
+
+def _build_laterality_table() -> dict[int, str]:
+    """Classify each SynthPose-52 index by its anatomical side.
+
+    Driven off the marker name string: "L_*" / "l_*" → left, "R_*" / "r_*"
+    → right, otherwise center (spine, head midline, sternum). This is built
+    once at import time so paintEvent stays cheap.
+    """
+    from ...tracking.markers import SYNTHPOSE_MARKERS
+    out: dict[int, str] = {}
+    for idx, name in SYNTHPOSE_MARKERS.items():
+        # Names use a mix of "L_Hip" and "l_5meta" — both forms classify
+        # left, the cap-R / lowercase-r forms classify right, anything else
+        # is center.
+        if name.startswith(("L_", "l_")):
+            out[idx] = _BODY_SIDE_LEFT
+        elif name.startswith(("R_", "r_")):
+            out[idx] = _BODY_SIDE_RIGHT
+        else:
+            out[idx] = _BODY_SIDE_CENTER
+    return out
+
+
+_LATERALITY = _build_laterality_table()
+
+# Body colours per side. Keep the names distinct from the foot constants
+# so the drawing code reads explicitly even though they happen to match.
+_BODY_LEFT_COLOR = QColor(80, 160, 255)    # blue
+_BODY_RIGHT_COLOR = QColor(255, 80, 80)    # red
+_BODY_CENTER_COLOR = QColor(180, 180, 180) # gray
+
+
 class SkeletonViewWidget(QWidget):
     """Displays a 3D skeleton with an oblique three-quarter projection."""
 
@@ -117,6 +178,16 @@ class SkeletonViewWidget(QWidget):
         self._view_transform: np.ndarray = _DEFAULT_TRANSFORM.copy()
         # True once "Set Origin at L_Ankle" has been applied → static view + floor grid.
         self._has_origin: bool = False
+
+        # Footstep overlay state — only meaningful once has_origin=True (so
+        # ankle z is in body-up coordinates and the floor is at z=0).
+        self._left_detector = FootstepDetector()
+        self._right_detector = FootstepDetector()
+        self._left_steps: deque[FootPlacement] = deque(maxlen=_FOOTSTEP_HISTORY)
+        self._right_steps: deque[FootPlacement] = deque(maxlen=_FOOTSTEP_HISTORY)
+        # Wall-clock anchor — the detector wants strictly increasing timestamps;
+        # we use perf_counter so it survives clock changes.
+        self._t0 = time.perf_counter()
 
     # ── Public API ──
 
@@ -161,6 +232,10 @@ class SkeletonViewWidget(QWidget):
         self._persons = new_persons
         self._persons_age = new_ages
         self._message = ""
+        # Update footstep history (in body coords). Skipped when origin
+        # has not been zeroed because z=0 is not a meaningful floor yet.
+        if self._has_origin:
+            self._update_footsteps_from_persons(new_persons)
         self.update()
 
     def set_view_transform(self, mat: np.ndarray, has_origin: bool = False) -> None:
@@ -172,8 +247,13 @@ class SkeletonViewWidget(QWidget):
             has_origin: True when a floor origin has been zeroed.
                         Switches to static centre + enables floor grid.
         """
+        prev_has_origin = self._has_origin
         self._view_transform = np.array(mat, dtype=float)
         self._has_origin = has_origin
+        # Re-zeroing or losing the origin should drop stale footsteps —
+        # they're tied to the previous body frame and would be misplaced.
+        if has_origin != prev_has_origin or has_origin:
+            self.clear_footsteps()
         self.update()
 
     def set_message(self, msg: str) -> None:
@@ -188,6 +268,15 @@ class SkeletonViewWidget(QWidget):
         self._message = "No detection"
         self._has_origin = False
         self._view_transform = _DEFAULT_TRANSFORM.copy()
+        self.clear_footsteps()
+        self.update()
+
+    def clear_footsteps(self) -> None:
+        """Drop both feet's placement history and reset detector state."""
+        self._left_detector.reset()
+        self._right_detector.reset()
+        self._left_steps.clear()
+        self._right_steps.clear()
         self.update()
 
     def get_keypoints(self) -> list:
@@ -196,7 +285,80 @@ class SkeletonViewWidget(QWidget):
             return list(self._persons[0])
         return []
 
+    # ── Footstep detection ──
+
+    def _world_to_body(self, kp_world) -> tuple[float, float, float] | None:
+        """Apply the current 4x4 world→view transform; returns body coords."""
+        if kp_world is None:
+            return None
+        try:
+            pt = np.asarray(kp_world, dtype=float).reshape(3)
+        except Exception:
+            return None
+        if not np.all(np.isfinite(pt)):
+            return None
+        v = (self._view_transform @ np.append(pt, 1.0))[:3]
+        return float(v[0]), float(v[1]), float(v[2])
+
+    def _update_footsteps_from_persons(self, persons: list) -> None:
+        """Run footstep detection on person 0's ankles in body coords.
+
+        Only runs when has_origin=True. Newly emitted placements are
+        appended to the rolling history deques.
+        """
+        if not persons:
+            return
+        person0 = persons[0]
+        n = len(person0)
+        l_world = person0[_LEFT_ANKLE_IDX] if n > _LEFT_ANKLE_IDX else None
+        r_world = person0[_RIGHT_ANKLE_IDX] if n > _RIGHT_ANKLE_IDX else None
+
+        t = time.perf_counter() - self._t0
+
+        l_body = self._world_to_body(l_world)
+        if l_body is not None:
+            ev = self._left_detector.update(t, l_body[0], l_body[1], l_body[2])
+            if ev is not None:
+                self._left_steps.append(ev)
+
+        r_body = self._world_to_body(r_world)
+        if r_body is not None:
+            ev = self._right_detector.update(t, r_body[0], r_body[1], r_body[2])
+            if ev is not None:
+                self._right_steps.append(ev)
+
     # ── Painting ──
+
+    def _draw_footsteps(self, painter: QPainter, to_screen) -> None:
+        """Render each foot's placement history as a fading-alpha disc.
+
+        Placements are stored in body coords (post view-transform); we
+        force them onto the floor plane (z=0) at render time so they
+        appear pinned to the floor regardless of vertical noise in the
+        original landing.
+        """
+        def draw_history(history, base_color: QColor) -> None:
+            n = len(history)
+            if n == 0:
+                return
+            # Index 0 = oldest, n-1 = newest. Newest gets full alpha.
+            for i, step in enumerate(history):
+                age_frac = (n - 1 - i) / max(1, n - 1)  # 0=newest, 1=oldest
+                alpha = int(_FOOTSTEP_MAX_ALPHA - age_frac *
+                            (_FOOTSTEP_MAX_ALPHA - _FOOTSTEP_MIN_ALPHA))
+                fill = QColor(base_color.red(), base_color.green(),
+                              base_color.blue(), alpha)
+                outline = QColor(20, 20, 20, alpha)
+                # Pin to floor (z=0): the marker represents where the foot
+                # touched down on the floor plane.
+                sx, sy = to_screen(step.x, step.y, 0.0)
+                painter.setBrush(fill)
+                painter.setPen(QPen(outline, 1))
+                h = _FOOTSTEP_HALF_PX
+                painter.drawRect(sx - h, sy - h, 2 * h, 2 * h)
+
+        draw_history(self._left_steps, _LEFT_FOOT_COLOR)
+        draw_history(self._right_steps, _RIGHT_FOOT_COLOR)
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -307,6 +469,11 @@ class SkeletonViewWidget(QWidget):
             painter.setPen(QPen(QColor(60, 160, 60), 2))   # green = Y (forward)
             painter.drawLine(ax0, ay0, ay_1, ay_2)
 
+            # ── Footstep history ──
+            # Drawn just above the floor grid so step markers sit on the
+            # floor, beneath the skeleton. Newest = full alpha, oldest = faint.
+            self._draw_footsteps(painter, to_screen)
+
         # ── Skeletons — one per person, each in a distinct colour ──
         def alpha_for_age(age: int) -> int:
             """Linearly fade from 255 (fresh) to ~60 (max held age)."""
@@ -317,8 +484,32 @@ class SkeletonViewWidget(QWidget):
             frac = min(1.0, age / max_age)
             return int(255 - frac * (255 - 60))
 
+        # Map keypoint index -> body-side colour. Persons all share the same
+        # left=blue / right=red palette so the side reads at a glance; if you
+        # need to disambiguate two persons, do it spatially (they're 3D-
+        # separated already) rather than by overall hue.
+        def color_for_kp(k_idx: int) -> QColor:
+            side = _LATERALITY.get(k_idx, _BODY_SIDE_CENTER)
+            if side == _BODY_SIDE_LEFT:
+                return _BODY_LEFT_COLOR
+            if side == _BODY_SIDE_RIGHT:
+                return _BODY_RIGHT_COLOR
+            return _BODY_CENTER_COLOR
+
+        def color_for_limb(i: int, j: int) -> QColor:
+            si = _LATERALITY.get(i, _BODY_SIDE_CENTER)
+            sj = _LATERALITY.get(j, _BODY_SIDE_CENTER)
+            # Both endpoints same side → that side's colour.
+            if si == sj:
+                return color_for_kp(i)
+            # Limb crossing midline (e.g. shoulder-to-shoulder, hip-to-hip):
+            # use the centre tone so it doesn't read as belonging to one side.
+            if _BODY_SIDE_CENTER in (si, sj):
+                # Connecting a side to centre — colour by the side endpoint.
+                return color_for_kp(i if si != _BODY_SIDE_CENTER else j)
+            return _BODY_CENTER_COLOR
+
         for person_idx, view_pts in enumerate(all_view_pts):
-            base_color = _PERSON_COLORS[person_idx % len(_PERSON_COLORS)]
             n = len(view_pts)
             ages = self._persons_age[person_idx] if person_idx < len(self._persons_age) else []
 
@@ -333,21 +524,24 @@ class SkeletonViewWidget(QWidget):
                     continue
                 limb_age = max(age_of(i), age_of(j))
                 a = alpha_for_age(limb_age)
-                limb_color = QColor(base_color.red(), base_color.green(), base_color.blue(), a)
+                base = color_for_limb(i, j)
+                limb_color = QColor(base.red(), base.green(), base.blue(), a)
                 painter.setPen(QPen(limb_color, 2))
                 painter.drawLine(*to_screen(*view_pts[i]), *to_screen(*view_pts[j]))
 
-            # Keypoints — dim each by its own age
+            # Keypoints — dim each by its own age. Radius is 3 px (was 4),
+            # i.e. 75% of the previous size — quieter dots that crowd less.
             for k_idx, vp in enumerate(view_pts):
                 if vp is None:
                     continue
                 a = alpha_for_age(age_of(k_idx))
-                dot_color = QColor(base_color.red(), base_color.green(), base_color.blue(), a)
+                base = color_for_kp(k_idx)
+                dot_color = QColor(base.red(), base.green(), base.blue(), a)
                 outline_color = QColor(30, 30, 30, a)
                 painter.setBrush(dot_color)
                 painter.setPen(QPen(outline_color, 1))
                 sp = to_screen(*vp)
-                painter.drawEllipse(sp[0] - 4, sp[1] - 4, 8, 8)
+                painter.drawEllipse(sp[0] - 3, sp[1] - 3, 6, 6)
 
         # ── Title: person 0's L_Ankle ──
         p0_view = all_view_pts[0] if all_view_pts else []

@@ -49,17 +49,35 @@ def _get_detector(max_hands: int = 2, min_confidence: float = 0.5):
     from mediapipe.tasks import python as mp_python
     from mediapipe.tasks.python import vision as mp_vision
 
-    # Download the hand landmarker model if needed
-    model_path = Path(__file__).parent / "hand_landmarker.task"
+    from ..config import mediapipe_dir
+
+    # Cache the hand landmarker model under the app data directory
+    cache_dir = mediapipe_dir()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    model_path = cache_dir / "hand_landmarker.task"
+
+    # Migrate the old in-tree copy if present (one-shot move)
+    legacy_path = Path(__file__).parent / "hand_landmarker.task"
+    if not model_path.exists() and legacy_path.exists():
+        try:
+            legacy_path.replace(model_path)
+            print(f"[hand_detector] Migrated hand_landmarker.task → {model_path}")
+        except Exception as e:
+            print(f"[hand_detector] Could not migrate {legacy_path}: {e}")
+
     if not model_path.exists():
         import urllib.request
         url = (
             "https://storage.googleapis.com/mediapipe-models/"
             "hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
         )
-        print(f"[hand_detector] Downloading hand_landmarker.task...")
+        print(f"[DOWNLOAD] hand_landmarker.task not cached at {model_path} -- "
+              f"downloading from {url}", flush=True)
         urllib.request.urlretrieve(url, str(model_path))
-        print(f"[hand_detector] Downloaded to {model_path}")
+        print(f"[DOWNLOAD] hand_landmarker.task saved to {model_path}", flush=True)
+    else:
+        print(f"[CACHE HIT] hand_landmarker.task loaded from {model_path} "
+              f"(no download)", flush=True)
 
     options = mp_vision.HandLandmarkerOptions(
         base_options=mp_python.BaseOptions(

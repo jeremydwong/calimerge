@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QDoubleSpinBox,
     QSpinBox,
+    QSlider,
 )
 from PySide6.QtCore import Signal, Qt, QTimer
 from PySide6.QtGui import QFont
@@ -54,6 +55,12 @@ class WorkoutPage(QWidget):
         self._calibration_available = False
         self._calibration_path: Path | None = None
         self._calibrated_cameras: dict | None = None
+        self._calibration_session_id: int | None = None
+        self._calibration_session_created_at: str | None = None
+        # Zero-origin transform set by "Zero L-Ankle" button; persisted into
+        # workouts.db at recording end (None until the user presses the btn).
+        self._zero_origin_rotation: np.ndarray | None = None
+        self._zero_origin_translation: np.ndarray | None = None
 
         # Camera state
         self.enumerate_worker: CameraEnumerateWorker | None = None
@@ -152,6 +159,28 @@ class WorkoutPage(QWidget):
         self.detect_backend_combo.setFixedWidth(130)
         self.detect_backend_combo.currentIndexChanged.connect(self._on_model_changed)
         user_layout.addWidget(self.detect_backend_combo)
+
+        # Person-detection confidence threshold slider. YOLO at low thresholds
+        # spuriously fires on chairs/furniture; raising filters those out.
+        # Restart of detection is required to take effect (handled below).
+        user_layout.addSpacing(10)
+        user_layout.addWidget(QLabel("Conf:"))
+        self.conf_slider = QSlider(Qt.Orientation.Horizontal)
+        self.conf_slider.setMinimum(10)        # 0.10
+        self.conf_slider.setMaximum(95)        # 0.95
+        self.conf_slider.setSingleStep(5)
+        self.conf_slider.setPageStep(10)
+        self.conf_slider.setValue(50)          # default 0.50
+        self.conf_slider.setFixedWidth(120)
+        self.conf_slider.setToolTip(
+            "Person-detection confidence threshold (YOLO).\n"
+            "Higher = fewer false positives (chairs/furniture)."
+        )
+        user_layout.addWidget(self.conf_slider)
+        self.conf_value_label = QLabel("0.50")
+        self.conf_value_label.setStyleSheet("color: #888; min-width: 32px;")
+        user_layout.addWidget(self.conf_value_label)
+        self.conf_slider.valueChanged.connect(self._on_confidence_changed)
 
         user_layout.addStretch()
 
@@ -324,6 +353,27 @@ class WorkoutPage(QWidget):
         self.progress_btn = QPushButton("Progress Graph")
         self.progress_btn.clicked.connect(self._on_view_progress)
         btn_layout.addWidget(self.progress_btn)
+
+        # CSV export controls
+        self.generate_csv_checkbox = QCheckBox("Generate CSV after save")
+        self.generate_csv_checkbox.setChecked(True)
+        self.generate_csv_checkbox.setToolTip(
+            "Checked: write keypoints_3d.csv synchronously after each "
+            "recording. Unchecked: queue the job and process later via "
+            "'Process Pending'."
+        )
+        self.generate_csv_checkbox.toggled.connect(self._on_csv_toggle_changed)
+        btn_layout.addWidget(self.generate_csv_checkbox)
+
+        self.process_pending_btn = QPushButton("Process Pending CSVs")
+        self.process_pending_btn.setToolTip(
+            "Drain the queue of recorded sessions waiting for CSV export."
+        )
+        self.process_pending_btn.clicked.connect(self._on_process_pending_csvs)
+        btn_layout.addWidget(self.process_pending_btn)
+
+        # Initialise checkbox + label from app_settings
+        self._init_csv_export_state()
 
         left_layout.addWidget(btn_panel)
         bottom_splitter.addWidget(left_pane)
@@ -768,10 +818,10 @@ class WorkoutPage(QWidget):
                                metric_name: str) -> list[tuple]:
         """Load (datetime, metric_value) pairs for the given exercise + metric."""
         from datetime import datetime
-        from ..config import DEFAULT_WORKOUTS_DB
+        from ..config import workouts_db_path
         import sqlite3
         try:
-            conn = sqlite3.connect(str(DEFAULT_WORKOUTS_DB))
+            conn = sqlite3.connect(str(workouts_db_path()))
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 "SELECT s.created_at, r.metric_value "
@@ -1467,6 +1517,12 @@ class WorkoutPage(QWidget):
         from ..config import load_all_nicknames
         nicknames = load_all_nicknames()
 
+        # Seed per-serial preferences so saved resolutions/exposure flow into
+        # CameraState (and through to intrinsic lookup) on first login.
+        def _initial_res(serial: str):
+            raw = self._serial_prefs.get(serial, {}).get("resolution")
+            return tuple(raw) if raw else None
+
         cal_serial_to_port: dict[str, int] = {}
         if self._calibrated_cameras:
             for port, cal_cam in self._calibrated_cameras.items():
@@ -1481,6 +1537,7 @@ class WorkoutPage(QWidget):
                 nickname = nicknames.get(cam.serial_number, "")
                 camera_states[port] = CameraState(
                     info=cam, enabled=True, is_open=False, nickname=nickname,
+                    selected_resolution=_initial_res(cam.serial_number),
                 )
                 matched += 1
             else:
@@ -1491,6 +1548,7 @@ class WorkoutPage(QWidget):
                 nickname = nicknames.get(cam.serial_number, "")
                 camera_states[port] = CameraState(
                     info=cam, enabled=True, is_open=False, nickname=nickname,
+                    selected_resolution=_initial_res(cam.serial_number),
                 )
             matched = len(cameras)
 
@@ -1668,6 +1726,36 @@ class WorkoutPage(QWidget):
             from PySide6.QtCore import QTimer
             QTimer.singleShot(200, self._start_detection)
 
+    def _on_confidence_changed(self, value: int):
+        """Slider tick (10–95) → confidence (0.10–0.95). Update label and live worker.
+
+        For PyTorch the worker honors `confidence_threshold` on the next frame
+        (no restart needed). For CUDA the threshold is fixed at pipeline init,
+        so we restart detection so the new value takes effect.
+        """
+        conf = value / 100.0
+        if hasattr(self, "conf_value_label"):
+            self.conf_value_label.setText(f"{conf:.2f}")
+        worker = self.detection_worker
+        if worker is None:
+            return
+        # PyTorch worker reads this attr each frame.
+        if isinstance(worker, PoseDetectionWorker):
+            try:
+                worker.confidence_threshold = conf
+            except Exception:
+                pass
+            return
+        # CUDA worker bakes the threshold into the C config at create time —
+        # restart so the new value takes effect.
+        if isinstance(worker, CudaStreamDetectionWorker):
+            from PySide6.QtCore import QTimer
+            self._stop_detection()
+            QTimer.singleShot(200, self._start_detection)
+
+    def _current_person_confidence(self) -> float:
+        return self.conf_slider.value() / 100.0 if hasattr(self, "conf_slider") else 0.50
+
     def _start_detection(self):
         if self.detection_worker is not None:
             return
@@ -1684,14 +1772,57 @@ class WorkoutPage(QWidget):
 
         backend = self.detect_backend_combo.currentData() or "pytorch"
 
-        if backend == "cuda" and cameras is not None and self._calibration_path is not None:
+        if backend == "cuda" and cameras is not None and self._calibration_available:
             self._start_cuda_detection(cameras)
         else:
             self._start_pytorch_detection(cameras)
 
+    def _normalize_calibrated_cameras(self, cameras):
+        """Scale every camera's intrinsics to match the live recording resolution.
+
+        Calibration on disk may store each camera's intrinsics at a different
+        resolution (one cross-AR scaled, another an exact DB match). The 2D
+        detections coming in are always at the live frame resolution, so any
+        camera whose K matrix was calibrated at a different size produces a
+        miscalibrated fundamental matrix → cross-camera matching mis-pairs
+        people → triangulation produces 3D garbage even though 2D detections
+        are correct.
+        """
+        if cameras is None:
+            return None
+
+        from ..types import CalibratedCamera, scale_intrinsics
+        import dataclasses
+
+        target_res = None
+        live_cams = self.state_manager.state.cameras
+        for port in sorted(cameras.keys()):
+            cam_state = live_cams.get(port)
+            if cam_state is not None:
+                res = cam_state.selected_resolution or (
+                    cam_state.info.width, cam_state.info.height
+                )
+                if res and res[0] > 0 and res[1] > 0:
+                    target_res = (int(res[0]), int(res[1]))
+                    break
+        if target_res is None:
+            first_port = sorted(cameras.keys())[0]
+            target_res = tuple(cameras[first_port].intrinsics.resolution)
+
+        normalized: dict = {}
+        for port, cc in cameras.items():
+            if tuple(cc.intrinsics.resolution) == target_res:
+                normalized[port] = cc
+            else:
+                scaled = scale_intrinsics(cc.intrinsics, target_res)
+                normalized[port] = dataclasses.replace(cc, intrinsics=scaled)
+        return normalized
+
     def _start_pytorch_detection(self, cameras):
         """Start the Python-based detection worker (YOLO + VitPose via PyTorch)."""
+        cameras = self._normalize_calibrated_cameras(cameras)
         self.detection_worker = PoseDetectionWorker(device_name="auto", cameras=cameras)
+        self.detection_worker.confidence_threshold = self._current_person_confidence()
         self.detection_worker.detection_ready.connect(self._on_detection_ready)
         self.detection_worker.error.connect(self._on_detection_error)
         self.detection_worker.finished.connect(self._on_detection_finished)
@@ -1703,23 +1834,44 @@ class WorkoutPage(QWidget):
     def _start_cuda_detection(self, cameras):
         """Start the CUDA TensorRT streaming detection worker."""
         from .workers import CudaStreamDetectionWorker
-        from ..config import load_app_settings, write_cuda_calibration_toml
+        from ..config import (
+            engine_cache_dir,
+            models_dir,
+            write_cuda_calibration_toml,
+        )
         import tempfile
+
+        # Normalize every camera's intrinsics to the live recording resolution
+        # before handing off — see _normalize_calibrated_cameras for details.
+        cameras = self._normalize_calibrated_cameras(cameras)
 
         # Write a CUDA-compatible calibration TOML (C parser needs intrinsics inline)
         cuda_cal_path = Path(tempfile.gettempdir()) / "calimerge_cuda_calibration.toml"
         write_cuda_calibration_toml(cameras, cuda_cal_path)
 
-        # Find ONNX model paths
-        app = load_app_settings()
-        project_folder = app.get("last_project_folder", "")
-        repo_root = str(Path(__file__).resolve().parent.parent.parent.parent)
+        # Resolve ONNX model paths under the app data dir, with a one-shot
+        # fallback to the legacy <repo>/models/onnx/ location so long-time
+        # users don't immediately break on the migration.
+        onnx_dir = models_dir() / "onnx"
+        legacy_onnx_dir = Path(__file__).resolve().parent.parent.parent.parent / "models" / "onnx"
 
-        yolo_onnx = str(Path(repo_root) / "models" / "onnx" / "yolo_v10s.onnx")
-        vitpose_onnx = str(Path(repo_root) / "models" / "onnx" / "vitpose_synthpose.onnx")
-        engine_cache = str(Path(project_folder) / "engine_cache") if project_folder else ""
-        if engine_cache:
-            Path(engine_cache).mkdir(parents=True, exist_ok=True)
+        def _resolve_onnx(filename: str) -> str:
+            primary = onnx_dir / filename
+            if primary.exists():
+                return str(primary)
+            legacy = legacy_onnx_dir / filename
+            if legacy.exists():
+                return str(legacy)
+            return str(primary)  # let the C side surface a clear missing-file error
+
+        yolo_onnx = _resolve_onnx("yolo_v10s.onnx")
+        vitpose_onnx = _resolve_onnx("vitpose_synthpose.onnx")
+
+        # Engine cache is shared across recording sessions — engines depend on
+        # (model, GPU, TRT version, precision), not the project folder.
+        cache = engine_cache_dir()
+        cache.mkdir(parents=True, exist_ok=True)
+        engine_cache = str(cache)
 
         self.detection_worker = CudaStreamDetectionWorker(
             cameras=cameras,
@@ -1728,6 +1880,7 @@ class WorkoutPage(QWidget):
             vitpose_onnx=vitpose_onnx,
             engine_cache=engine_cache,
             max_persons=2,
+            person_confidence=self._current_person_confidence(),
         )
         self.detection_worker.log_message.connect(
             lambda msg: self.status_message.emit(msg)
@@ -1944,6 +2097,12 @@ class WorkoutPage(QWidget):
         self.skeleton_view.set_view_transform(T, has_origin=True)
         self._save_view_transform(T, has_origin=True)
         self._save_body_transform(R, origin_pt)
+
+        # Stash for the next workout-save so the per-session row in workouts.db
+        # captures the zero-origin transform that was active during recording.
+        self._zero_origin_rotation = R.copy()
+        self._zero_origin_translation = (-R @ origin_pt).copy()
+
         self.zero_origin_button.setEnabled(True)
 
     # ── View transform persistence ──
@@ -2020,20 +2179,45 @@ class WorkoutPage(QWidget):
         self._calibration_available = False
         self._calibration_path = None
         self._calibrated_cameras = None
+        self._calibration_session_id = None
+        self._calibration_session_created_at = None
 
         try:
-            from ..config import load_app_settings, load_calibration_from_toml
-            app = load_app_settings()
-            folder = app.get("last_project_folder")
-            if folder:
-                folder = Path(folder)
-                cal_files = sorted(folder.glob("*/calibration.toml"))
-                if cal_files:
-                    result = load_calibration_from_toml(cal_files[-1])
-                    if result is not None:
-                        self._calibration_available = True
-                        self._calibration_path = cal_files[-1]
-                        self._calibrated_cameras = result
+            from ..config import (
+                load_app_settings,
+                load_latest_extrinsic_session,
+                list_extrinsic_sessions,
+                import_calibration_toml_into_db,
+            )
+
+            # One-shot migration: if the extrinsics DB is empty but a recent
+            # session-folder calibration.toml exists, import the newest one
+            # so the user has something to start with after the schema change.
+            if not list_extrinsic_sessions():
+                app = load_app_settings()
+                folder = app.get("last_project_folder")
+                if folder:
+                    folder = Path(folder)
+                    cal_files = sorted(folder.glob("*/calibration.toml"))
+                    if cal_files:
+                        try:
+                            import_calibration_toml_into_db(
+                                cal_files[-1],
+                                notes=f"Migrated from {cal_files[-1]}",
+                            )
+                        except Exception:
+                            # Migration failures should not block live load —
+                            # the session-folder TOMLs are still on disk.
+                            pass
+
+            latest = load_latest_extrinsic_session()
+            if latest is not None:
+                session_id, created_at, cameras = latest
+                if cameras:
+                    self._calibration_available = True
+                    self._calibration_session_id = session_id
+                    self._calibration_session_created_at = created_at
+                    self._calibrated_cameras = cameras
         except Exception:
             pass
 
@@ -2045,7 +2229,15 @@ class WorkoutPage(QWidget):
             n_cams = len(self._calibrated_cameras) if self._calibrated_cameras else 0
             date_part = ""
             time_part = ""
-            if self._calibration_path:
+            # Prefer the DB-recorded created_at; fall back to parsing the
+            # session-folder name for legacy paths.
+            ts = getattr(self, "_calibration_session_created_at", None)
+            if ts:
+                # SQLite returns "YYYY-MM-DD HH:MM:SS"
+                if len(ts) >= 19 and ts[10] == " ":
+                    date_part = ts[:10]
+                    time_part = ts[11:19]
+            elif self._calibration_path:
                 folder_name = self._calibration_path.parent.name
                 if len(folder_name) >= 15 and "_" in folder_name:
                     d, t = folder_name.split("_", 1)
@@ -2140,6 +2332,9 @@ class WorkoutPage(QWidget):
         self._is_recording = True
         self._recording_keypoints = []
         self._recording_start_time = time.perf_counter()
+        # Drop footstep history from the previous session so the overlay
+        # reflects only the current recording.
+        self.skeleton_view.clear_footsteps()
         self.record_btn.setText("Stop Recording")
         self.record_btn.setEnabled(True)
         self.status_message.emit(f"Recording {workout_type} for {duration}s...")
@@ -2228,6 +2423,10 @@ class WorkoutPage(QWidget):
                 config_blob=config_blob,
                 program_exercise_id=program_ex_id,
                 set_number=set_number,
+                extrinsic_session_id=self._calibration_session_id,
+                extrinsic_calibrated_at=self._calibration_session_created_at,
+                zero_origin_rotation=self._zero_origin_rotation,
+                zero_origin_translation=self._zero_origin_translation,
             )
             sync_count = stats.get("sync_count", 0)
             self.status_message.emit(
@@ -2241,6 +2440,12 @@ class WorkoutPage(QWidget):
         self._update_record_button_label()
         self._refresh_longterm_graph()
 
+        # CSV export of 3D keypoints (immediate or queued)
+        try:
+            self._handle_csv_export(session_id)
+        except Exception as e:
+            self.status_message.emit(f"CSV export setup failed: {e}")
+
         # Run analysis on collected keypoints
         self._run_workout_analysis(session_id)
 
@@ -2252,6 +2457,246 @@ class WorkoutPage(QWidget):
         self.status_message.emit(f"Recording error: {error}")
         if self.preview_worker:
             self.preview_worker.resume()
+
+    # ── CSV export of 3D keypoints ──
+
+    def _init_csv_export_state(self):
+        """Restore the immediate/queued toggle and refresh the pending count."""
+        try:
+            from ..config import load_app_settings
+            settings = load_app_settings()
+            immediate = bool(settings.get("csv_export_immediate", True))
+            self.generate_csv_checkbox.blockSignals(True)
+            self.generate_csv_checkbox.setChecked(immediate)
+            self.generate_csv_checkbox.blockSignals(False)
+        except Exception:
+            pass
+        self._refresh_pending_csv_label()
+
+    def _on_csv_toggle_changed(self, checked: bool):
+        try:
+            from ..config import load_app_settings, save_app_settings
+            settings = load_app_settings()
+            settings["csv_export_immediate"] = bool(checked)
+            save_app_settings(settings)
+        except Exception as e:
+            self.status_message.emit(f"Failed to save CSV preference: {e}")
+        self._refresh_pending_csv_label()
+
+    def _refresh_pending_csv_label(self):
+        try:
+            from ..config import load_app_settings
+            jobs = load_app_settings().get("pending_csv_jobs", []) or []
+        except Exception:
+            jobs = []
+        n = len(jobs)
+        if n == 0:
+            self.process_pending_btn.setText("Process Pending CSVs")
+            self.process_pending_btn.setEnabled(False)
+        else:
+            self.process_pending_btn.setText(f"Process Pending CSVs ({n})")
+            self.process_pending_btn.setEnabled(True)
+
+    def _detection_model_label(self) -> tuple[str | None, str | None]:
+        """Return (backend, model_name) for meta.json provenance."""
+        backend = None
+        model_name = None
+        try:
+            backend = self.detect_backend_combo.currentData()
+        except Exception:
+            backend = None
+        try:
+            base = self.detect_model_combo.currentData()
+        except Exception:
+            base = None
+        if base == "vitpose":
+            model_name = "vitpose_synthpose"
+        elif base == "mediapipe_hands":
+            model_name = "mediapipe_hands"
+        else:
+            model_name = base
+        return backend, model_name
+
+    def _handle_csv_export(self, session_id: int | None):
+        """Either run the export worker now, or queue the job."""
+        if not self._recording_keypoints:
+            return
+
+        from ..config import load_app_settings, save_app_settings
+        from ..keypoint_export import (
+            write_raw_buffer, make_job_descriptor, RAW_FILENAME,
+        )
+
+        session_dir = self._current_session_dir
+        if session_dir is None:
+            return
+
+        backend, model_name = self._detection_model_label()
+        # Always persist the raw buffer alongside the videos. This lets a
+        # queued job survive a process restart, AND gives the immediate
+        # path a recovery point if the worker crashes.
+        try:
+            write_raw_buffer(session_dir / RAW_FILENAME, self._recording_keypoints)
+        except Exception as e:
+            self.status_message.emit(f"Failed to dump raw keypoints: {e}")
+
+        settings = load_app_settings()
+        immediate = bool(settings.get("csv_export_immediate", True))
+
+        cal_path = str(self._calibration_path) if self._calibration_path else None
+
+        if immediate:
+            self._spawn_csv_worker(
+                session_dir=session_dir,
+                buffer=list(self._recording_keypoints),
+                session_id=session_id,
+                model_backend=backend,
+                model_name=model_name,
+                calibration_path=cal_path,
+            )
+        else:
+            job = make_job_descriptor(
+                session_dir=session_dir,
+                session_id=session_id,
+                model_backend=backend,
+                model_name=model_name,
+                calibration_path=cal_path,
+            )
+            jobs = list(settings.get("pending_csv_jobs", []) or [])
+            jobs.append(job)
+            settings["pending_csv_jobs"] = jobs
+            try:
+                save_app_settings(settings)
+            except Exception as e:
+                self.status_message.emit(f"Failed to enqueue CSV job: {e}")
+                return
+            self.status_message.emit(
+                f"CSV queued for {Path(session_dir).name} "
+                f"({len(jobs)} pending)"
+            )
+            self._refresh_pending_csv_label()
+
+    def _spawn_csv_worker(
+        self,
+        *,
+        session_dir: Path,
+        buffer: list[dict] | None,
+        session_id: int | None,
+        model_backend: str | None,
+        model_name: str | None,
+        calibration_path: str | None,
+        on_done=None,
+    ):
+        from .csv_export_worker import CsvExportWorker
+        from ..config import DEFAULT_INTRINSICS_DB
+        from ..keypoint_export import RAW_FILENAME
+
+        worker = CsvExportWorker(
+            session_dir=session_dir,
+            recording_keypoints=buffer,
+            calibrated_cameras=self._calibrated_cameras,
+            model_backend=model_backend,
+            model_name=model_name,
+            num_keypoints=52,
+            session_id=session_id,
+            intrinsics_db_path=DEFAULT_INTRINSICS_DB,
+            raw_buffer_path=Path(session_dir) / RAW_FILENAME,
+            extra_meta={"calibration_path": calibration_path},
+        )
+        # Track active workers so they aren't garbage-collected mid-run.
+        if not hasattr(self, "_csv_workers"):
+            self._csv_workers: list = []
+        self._csv_workers.append(worker)
+
+        def _ok(info: dict):
+            self.status_message.emit(
+                f"CSV saved: {Path(info['csv_path']).name} "
+                f"({info.get('rows', 0)} rows)"
+            )
+            if on_done is not None:
+                on_done(True, info)
+            self._cleanup_csv_worker(worker)
+
+        def _fail(session_dir_str: str, msg: str):
+            first = msg.splitlines()[0] if msg else "<unknown>"
+            self.status_message.emit(
+                f"CSV export failed for {Path(session_dir_str).name}: {first}"
+            )
+            if on_done is not None:
+                on_done(False, {"session_dir": session_dir_str, "error": msg})
+            self._cleanup_csv_worker(worker)
+
+        def _progress(msg: str):
+            self.status_message.emit(msg)
+
+        worker.finished_ok.connect(_ok)
+        worker.failed.connect(_fail)
+        worker.progress.connect(_progress)
+        worker.start()
+
+    def _cleanup_csv_worker(self, worker):
+        try:
+            if hasattr(self, "_csv_workers") and worker in self._csv_workers:
+                self._csv_workers.remove(worker)
+        except Exception:
+            pass
+
+    def _on_process_pending_csvs(self):
+        """Drain the queue. Each job runs sequentially via the worker."""
+        from ..config import load_app_settings, save_app_settings
+        from ..keypoint_export import iter_jobs
+
+        settings = load_app_settings()
+        jobs = list(settings.get("pending_csv_jobs", []) or [])
+        runnable = list(iter_jobs(jobs))
+        if not runnable:
+            # Even if there were stale entries (sessions deleted), purge them.
+            settings["pending_csv_jobs"] = []
+            save_app_settings(settings)
+            self.status_message.emit("No pending CSV jobs.")
+            self._refresh_pending_csv_label()
+            return
+
+        # Pop the first runnable job, run it, then chain into the next.
+        self._drain_csv_queue(runnable)
+
+    def _drain_csv_queue(self, queue: list[dict]):
+        if not queue:
+            self.status_message.emit("Pending CSVs processed.")
+            self._refresh_pending_csv_label()
+            return
+        job = queue[0]
+        rest = queue[1:]
+        sd = Path(job["session_dir"])
+
+        def _after(success: bool, info: dict):
+            # Remove the persisted entry whether it succeeded or not (a
+            # failure shouldn't trap the user in an infinite retry loop).
+            self._remove_persisted_job(job)
+            self._refresh_pending_csv_label()
+            self._drain_csv_queue(rest)
+
+        self._spawn_csv_worker(
+            session_dir=sd,
+            buffer=None,  # force the worker to load from raw_buffer_path
+            session_id=job.get("session_id"),
+            model_backend=job.get("model_backend"),
+            model_name=job.get("model_name"),
+            calibration_path=job.get("calibration_path"),
+            on_done=_after,
+        )
+
+    def _remove_persisted_job(self, job: dict):
+        try:
+            from ..config import load_app_settings, save_app_settings
+            settings = load_app_settings()
+            jobs = list(settings.get("pending_csv_jobs", []) or [])
+            target_dir = job.get("session_dir")
+            jobs = [j for j in jobs if j.get("session_dir") != target_dir]
+            settings["pending_csv_jobs"] = jobs
+            save_app_settings(settings)
+        except Exception:
+            pass
 
     # ── Session history ──
 
@@ -2399,8 +2844,8 @@ class WorkoutPage(QWidget):
         from PySide6.QtWidgets import QMessageBox
         try:
             import sqlite3
-            from ..config import DEFAULT_WORKOUTS_DB
-            conn = sqlite3.connect(str(DEFAULT_WORKOUTS_DB))
+            from ..config import workouts_db_path
+            conn = sqlite3.connect(str(workouts_db_path()))
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 "SELECT metric_name, metric_value, metadata FROM session_results "
@@ -2787,7 +3232,7 @@ class WorkoutPage(QWidget):
             lines.append(f"Repetitions: {results['rep_count']}")
         if "total_time_seconds" in results:
             lines.append(f"Total time: {results['total_time_seconds']:.1f} s")
-        if "per_rep_times" in results:
+        if "per_rep_times" in results and results["per_rep_times"]:
             avg = sum(results["per_rep_times"]) / len(results["per_rep_times"])
             lines.append(f"Avg rep time: {avg:.2f} s")
         if "avg_range_deg" in results:

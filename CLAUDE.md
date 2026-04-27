@@ -2,6 +2,48 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Data integrity (scientific codebase)
+
+Calimerge is a scientific codebase. Recorded keypoints, intrinsics, extrinsics, and any other measurement-derived signal are **raw data** and must be preserved unmodified end-to-end. Filtering, smoothing, interpolation, outlier rejection, debouncing, exponential moving averages, etc. are **lossy and non-invertible** — once applied to the data on disk, the original is gone.
+
+Hard rules:
+
+1. **Never** apply filters/smoothers/interpolators to keypoints, COMs, or any other measurement before they hit disk (CSV, npz, database). The CSV exporter (`<session_dir>/keypoints_3d.csv` and `keypoints_3d.raw.npz`) writes whatever the detector emitted, NaNs and all, with no post-processing.
+2. Filtering is permitted **only** for downstream visualization or derived/event-detection signals, AND must live in *parallel* variables, not by overwriting the raw stream. For example: the foot-placement detector may smooth ankle z to debounce footstep events, but the smoothed z must be a separate state variable used only inside the detector — the raw 3D keypoints emitted upstream/recorded to CSV remain untouched.
+3. New helpers that take a "filter" argument must default it off, and any filtered output must be clearly named (`*_smoothed`, `*_filtered`, `*_for_viz`) so it can never be mistaken for raw measurement.
+4. If you need a filtered version of a signal for analysis later, derive it at analysis time from the raw saved data — that path is reproducible and the user retains the option to choose a different filter.
+
+When in doubt: store raw, derive on read. If you find yourself about to write `kps[i] = smooth(kps[i])`, stop and add a separate `kps_smoothed` field instead.
+
+## File Organization
+
+Calimerge separates *code* (in the repo) from *runtime data* (outside the repo) deliberately. There are three roots, each with a distinct purpose:
+
+| Root | What lives there | Default location | Configurable via |
+|---|---|---|---|
+| **Repo** | Source code, native build scripts, test fixtures | `c:\Git\calimerge` (Windows), wherever cloned (macOS) | git remote |
+| **App data dir** | Machine-level cache + per-camera state | Win: `%LOCALAPPDATA%\Calimerge`<br>macOS: `~/Library/Application Support/Calimerge`<br>Linux: `~/.local/share/calimerge` | env `CALIMERGE_DATA_DIR`, redirect file `<default>/data_dir.txt`, or **File → App Data Directory…** |
+| **Workout dir** | User-visible recordings + per-project settings | `~/Documents/Calimerge/` | **File → Workout Directory…**, persists in `<data_dir>/app_settings.json` |
+
+**App data dir contents** (regenerable cache + machine-level state):
+- `models/yolo/yolov10s.pt` — auto-downloaded
+- `models/vitpose/` — auto-downloaded HuggingFace snapshot
+- `models/mediapipe/hand_landmarker.task` — auto-downloaded
+- `intrinsics.db` — per-camera lens calibrations, keyed by `(serial, resolution)`. Survives workout-dir changes.
+- `engine_cache/` — TensorRT engines, shared across recording sessions (engines depend on model+GPU+TRT version, not the session)
+- `app_settings.json` — `last_project_folder`, etc.
+- `data_dir.txt` — optional one-line redirect file pointing to a different data dir
+
+**Workout dir contents** (user data — back this up):
+- `<timestamp>/port_N.mp4` + `frame_time_history.csv` + `camera_mapping.csv` — recording sessions
+- `<timestamp>/calibration.toml` — extrinsic calibration for that session
+- `settings.json` — per-project camera prefs (resolution, exposure, enabled), charuco config, codec, fps
+- `workouts.db` — sessions, users, programs, results. Lives here (not data dir) because rows reference paths inside this tree.
+
+**What's NOT in the repo:** model files, databases, recordings, calibration TOMLs, app/project settings. The repo is code-only.
+
+**Legacy:** before the data-dir refactor, everything lived under `~/.calimerge/` and `<repo>/models/`. `~/.calimerge` is no longer read; users migrate manually. Don't add code that reads from there.
+
 ## Development Platforms
 
 This project is developed on **both Windows and macOS**. Platform-specific instructions are noted below.
@@ -42,10 +84,13 @@ VIRTUAL_ENV= ~/.local/bin/uv run pytest ...
 | | macOS | Windows |
 |---|---|---|
 | Python binary | `python3` | `python` |
-| Native build | `cd src/native && ./build_macos.sh release` | `cd src/native && cmd //c build_win32.bat release` |
+| Native build | `bash build.sh release` | `bash build.sh release` |
+| Run GUI (build + launch) | `bash run_mac.sh` | `bash run_win.sh` |
 | Camera backend | AVFoundation (`calimerge_macos.mm`) | Media Foundation (`calimerge_win32.cpp`) |
 | Exposure API | AVCaptureDevice exposureDuration | IAMVideoProcAmp (log2 seconds) |
 | Shell | zsh/bash | Git Bash (use Unix syntax, not Windows) |
+
+`build.sh` dispatches to `src/native/build_macos.sh` or `src/native/build_win32.bat` based on `uname -s`. `run_mac.sh` / `run_win.sh` rebuild the native library when source is newer than the built artifact, run `uv sync`, then launch `calimerge`. **Prefer these over invoking the platform-specific scripts directly** — they catch the most common bug (stale native lib after a header/struct change).
 
 ## Repository Overview
 
@@ -63,10 +108,14 @@ The active unified package is in `src/calimerge/` and uses **uv** (not Poetry).
 # Setup (first time)
 ~/.local/bin/uv sync
 
-# Build native camera library (macOS)
-cd src/native && ./build_macos.sh release && cd ../..
+# Build native camera library (cross-platform dispatcher)
+bash build.sh release
 
-# Run the GUI
+# Run the GUI (rebuilds native lib if stale, then launches)
+bash run_mac.sh        # macOS
+bash run_win.sh        # Windows (Git Bash)
+
+# Or launch directly without the auto-rebuild wrapper:
 ~/.local/bin/uv run calimerge gui
 
 # Run other tools
@@ -100,9 +149,26 @@ eval "$('/c/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/Common7/
 
 Build the native Windows DLL:
 ```bash
-cd src/native && cmd //c build_win32.bat release && cd ../..
+bash build.sh release                   # preferred — cross-platform dispatcher
+# or, equivalently:
+cd src/native && ./build_win32.bat release && cd ../..
 # Output: build/native/calimerge.dll
 ```
+
+#### Running `.bat` files from Git Bash (read this — common papercut)
+
+From Git Bash, ALWAYS invoke `.bat` files using one of these forms:
+
+```bash
+./build_win32.bat release                  # Git Bash dispatches to cmd
+cmd //c "call build_win32.bat release"     # explicit cmd, using `call`
+```
+
+DO NOT use `cmd //c build_win32.bat release` (no `./`, no `call`). It fails
+with "is not recognized as an internal or external command" because
+`cmd /c <name>` searches `PATH`, not the current directory, for the script.
+This is the single most common build failure on Windows; if you see that
+error, you almost certainly forgot the `./` prefix or the `call`.
 
 File search utility: **Everything** (voidtools) is installed with the `es.exe` CLI at:
 ```
@@ -126,10 +192,10 @@ cd src/native
 cmd //c "cl test_usb_serials.cpp /EHsc /link mf.lib mfplat.lib mfuuid.lib ole32.lib setupapi.lib"
 ```
 
-Note: `cmd //c build_win32.bat` sets up the MSVC environment automatically.
-For one-off files, either run from a VS Developer Command Prompt, or use the bat:
+Note: `./build_win32.bat` sets up the MSVC environment automatically.
+For one-off files, either run from a VS Developer Command Prompt, or chain through the bat:
 ```bash
-cmd //c "build_win32.bat release && cl test_usb_serials.cpp /EHsc /link mf.lib mfplat.lib mfuuid.lib ole32.lib setupapi.lib"
+cmd //c "call build_win32.bat release && cl test_usb_serials.cpp /EHsc /link mf.lib mfplat.lib mfuuid.lib ole32.lib setupapi.lib"
 ```
 
 ### CUDA Pipeline Profiling (Windows)

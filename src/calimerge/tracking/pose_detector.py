@@ -3,7 +3,7 @@ Person detection and pose estimation.
 
 Uses YOLO v10s for person detection and VitPose-Base (SynthPose) for
 52-keypoint pose estimation. Models are auto-downloaded from HuggingFace
-and saved to the models/ directory at the project root.
+and cached under the app data directory (see calimerge.config.models_dir).
 
 Adapted from posetrack/pose_detector.py.
 """
@@ -17,17 +17,13 @@ import numpy as np
 import torch
 from PIL import Image
 
+from ..config import yolo_dir, vitpose_dir
+
 
 # Model identifiers
 YOLO_FILENAME = "yolov10s.pt"
 YOLO_DOWNLOAD_URL = "https://github.com/THU-MIG/yolov10/releases/download/v1.1/yolov10s.pt"
 VITPOSE_MODEL_ID = "stanfordmimi/synthpose-vitpose-base-hf"  # 52 SynthPose keypoints
-
-# Model directories: project_root/models/
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
-MODELS_DIR = _PROJECT_ROOT / "models"
-YOLO_DIR = MODELS_DIR / "yolo"
-VITPOSE_DIR = MODELS_DIR / "vitpose"
 
 
 def setup_device(device_name: str = "auto") -> str:
@@ -72,40 +68,56 @@ def load_models(
     from transformers import AutoProcessor, VitPoseForPoseEstimation
 
     # --- Person Detection: YOLO v10s ---
-    YOLO_DIR.mkdir(parents=True, exist_ok=True)
-    model_path = YOLO_DIR / YOLO_FILENAME
+    yolo_d = yolo_dir()
+    yolo_d.mkdir(parents=True, exist_ok=True)
+    model_path = yolo_d / YOLO_FILENAME
 
     if model_path.exists():
-        log(f"Loading YOLO from: {model_path}")
+        msg = f"[CACHE HIT] YOLO loaded from {model_path} (no download)"
+        print(msg, flush=True)
+        log(msg)
     else:
-        log(f"Downloading YOLO from: {YOLO_DOWNLOAD_URL}")
+        msg = (f"[DOWNLOAD] YOLO not cached at {model_path} -- "
+               f"downloading from {YOLO_DOWNLOAD_URL}")
+        print(msg, flush=True)
+        log(msg)
         import urllib.request
         urllib.request.urlretrieve(YOLO_DOWNLOAD_URL, str(model_path))
-        log(f"YOLO model saved to: {model_path}")
+        done = f"[DOWNLOAD] YOLO saved to {model_path}"
+        print(done, flush=True)
+        log(done)
 
     person_model = YOLO(str(model_path))
     person_model.to(device)
 
     # --- Pose Estimation: VitPose-Base (SynthPose) ---
-    config_file = VITPOSE_DIR / "config.json"
-    preprocessor_file = VITPOSE_DIR / "preprocessor_config.json"
+    vitpose_d = vitpose_dir()
+    config_file = vitpose_d / "config.json"
+    preprocessor_file = vitpose_d / "preprocessor_config.json"
 
     if config_file.exists() and preprocessor_file.exists():
-        log(f"Loading VitPose from local: {VITPOSE_DIR}")
+        msg = f"[CACHE HIT] VitPose loaded from {vitpose_d} (no download)"
+        print(msg, flush=True)
+        log(msg)
         pose_processor = AutoProcessor.from_pretrained(
-            str(VITPOSE_DIR), local_files_only=True
+            str(vitpose_d), local_files_only=True
         )
         pose_model = VitPoseForPoseEstimation.from_pretrained(
-            str(VITPOSE_DIR), local_files_only=True
+            str(vitpose_d), local_files_only=True
         )
     else:
-        log(f"Downloading VitPose from HuggingFace: {VITPOSE_MODEL_ID}")
+        msg = (f"[DOWNLOAD] VitPose not cached at {vitpose_d} -- "
+               f"downloading {VITPOSE_MODEL_ID} from HuggingFace")
+        print(msg, flush=True)
+        log(msg)
         pose_processor = AutoProcessor.from_pretrained(VITPOSE_MODEL_ID)
         pose_model = VitPoseForPoseEstimation.from_pretrained(VITPOSE_MODEL_ID)
-        VITPOSE_DIR.mkdir(parents=True, exist_ok=True)
-        pose_processor.save_pretrained(str(VITPOSE_DIR))
-        pose_model.save_pretrained(str(VITPOSE_DIR))
-        log(f"VitPose saved to: {VITPOSE_DIR}")
+        vitpose_d.mkdir(parents=True, exist_ok=True)
+        pose_processor.save_pretrained(str(vitpose_d))
+        pose_model.save_pretrained(str(vitpose_d))
+        done = f"[DOWNLOAD] VitPose saved to {vitpose_d}"
+        print(done, flush=True)
+        log(done)
 
     # Move to device and set eval mode
     if device != "cpu":

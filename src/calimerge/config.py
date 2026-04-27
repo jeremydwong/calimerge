@@ -10,7 +10,9 @@ Pure functions operating on dataclasses.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -24,6 +26,155 @@ from .types import (
     CharucoConfig,
     ProjectConfig,
 )
+
+
+# ============================================================================
+# App Data Directory (models, DBs, app_settings)
+# ============================================================================
+#
+# Platform-standard location for everything the app caches at runtime:
+#   Windows: %LOCALAPPDATA%\Calimerge          (e.g. C:\Users\X\AppData\Local\Calimerge)
+#   macOS:   ~/Library/Application Support/Calimerge
+#   Linux:   $XDG_DATA_HOME/calimerge  or  ~/.local/share/calimerge
+#
+# Resolution order for the actual data dir used at runtime:
+#   1. CALIMERGE_DATA_DIR environment variable (absolute path)
+#   2. Redirect file at <platform-default>/data_dir.txt (one line, absolute path)
+#   3. <platform-default>
+#
+# The redirect file is what the GUI's File → App Data Directory writes to.
+# Putting it at the platform-default location avoids a chicken-and-egg lookup.
+# ============================================================================
+
+_LEGACY_DOTDIR = Path.home() / ".calimerge"
+
+
+def _platform_default_data_dir() -> Path:
+    """Return the platform-standard application data directory."""
+    if sys.platform == "win32":
+        local = os.environ.get("LOCALAPPDATA")
+        if local:
+            return Path(local) / "Calimerge"
+        return Path.home() / "AppData" / "Local" / "Calimerge"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "Calimerge"
+    # Linux / other Unix
+    xdg = os.environ.get("XDG_DATA_HOME")
+    if xdg:
+        return Path(xdg) / "calimerge"
+    return Path.home() / ".local" / "share" / "calimerge"
+
+
+def _redirect_file_path() -> Path:
+    return _platform_default_data_dir() / "data_dir.txt"
+
+
+def data_dir() -> Path:
+    """Resolve the active app data directory (env > redirect file > platform default)."""
+    env = os.environ.get("CALIMERGE_DATA_DIR")
+    if env:
+        p = Path(env).expanduser()
+        if p.is_absolute():
+            return p
+
+    redirect = _redirect_file_path()
+    if redirect.exists():
+        try:
+            text = redirect.read_text(encoding="utf-8").strip()
+            if text:
+                p = Path(text).expanduser()
+                if p.is_absolute():
+                    return p
+        except Exception:
+            pass
+
+    return _platform_default_data_dir()
+
+
+def set_data_dir(new_dir: Path) -> None:
+    """
+    Persist a user-chosen data directory.
+
+    Writes the absolute path into a redirect file at the platform-default
+    location so that subsequent calls to data_dir() resolve to new_dir.
+    """
+    new_dir = Path(new_dir).expanduser().resolve()
+    new_dir.mkdir(parents=True, exist_ok=True)
+    redirect = _redirect_file_path()
+    redirect.parent.mkdir(parents=True, exist_ok=True)
+    redirect.write_text(str(new_dir), encoding="utf-8")
+
+
+def models_dir() -> Path:
+    """Directory holding cached ML model files."""
+    return data_dir() / "models"
+
+
+def yolo_dir() -> Path:
+    return models_dir() / "yolo"
+
+
+def vitpose_dir() -> Path:
+    return models_dir() / "vitpose"
+
+
+def mediapipe_dir() -> Path:
+    return models_dir() / "mediapipe"
+
+
+def intrinsics_db_path() -> Path:
+    return data_dir() / "intrinsics.db"
+
+
+def extrinsics_db_path() -> Path:
+    """SQLite DB of every extrinsic calibration session, machine-level."""
+    return data_dir() / "extrinsics.db"
+
+
+def workouts_db_path() -> Path:
+    """
+    workouts.db lives alongside the recordings it references — switching
+    workout directories switches database. Falls back to <data_dir>/workouts.db
+    when no project folder is set yet (fresh install).
+    """
+    try:
+        folder = load_app_settings().get("last_project_folder")
+        if folder:
+            p = Path(folder)
+            if p.is_dir():
+                return p / "workouts.db"
+    except Exception:
+        pass
+    return data_dir() / "workouts.db"
+
+
+def app_settings_path() -> Path:
+    return data_dir() / "app_settings.json"
+
+
+def legacy_dotdir() -> Path:
+    """Old ~/.calimerge location, kept for migration messaging."""
+    return _LEGACY_DOTDIR
+
+
+def default_recordings_dir() -> Path:
+    """
+    Default base directory for recording sessions when the user has not
+    chosen one via File → Workout Directory.
+
+    Recordings are large and user-visible, so they live under Documents
+    rather than the app data dir.
+    """
+    return Path.home() / "Documents" / "Calimerge"
+
+
+def engine_cache_dir() -> Path:
+    """TensorRT engine cache — shared across recording sessions.
+
+    Engines depend on (model, GPU, TRT version, precision), not the session,
+    so they live under the app data dir and are reused.
+    """
+    return data_dir() / "engine_cache"
 
 
 # ============================================================================
@@ -188,21 +339,20 @@ def create_default_project_config(
 # SQLite Intrinsics Database
 # ============================================================================
 
-DEFAULT_INTRINSICS_DB = Path.home() / ".calimerge" / "intrinsics.db"
-
-
 def get_default_intrinsics_db() -> Path:
     """Get the default intrinsics database path."""
-    return DEFAULT_INTRINSICS_DB
+    return intrinsics_db_path()
 
 
-def init_intrinsics_db(db_path: Path = DEFAULT_INTRINSICS_DB) -> None:
+def init_intrinsics_db(db_path: Path | None = None) -> None:
     """
     Initialize the intrinsics database if it doesn't exist.
 
     Args:
-        db_path: Path to SQLite database file
+        db_path: Path to SQLite database file (defaults to <data_dir>/intrinsics.db)
     """
+    if db_path is None:
+        db_path = intrinsics_db_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     conn = sqlite3.connect(db_path)
@@ -231,7 +381,7 @@ def init_intrinsics_db(db_path: Path = DEFAULT_INTRINSICS_DB) -> None:
 
 def save_intrinsics(
     intrinsics: CameraIntrinsics,
-    db_path: Path = DEFAULT_INTRINSICS_DB,
+    db_path: Path | None = None,
 ) -> None:
     """
     Save camera intrinsics to database.
@@ -242,6 +392,8 @@ def save_intrinsics(
         intrinsics: CameraIntrinsics dataclass
         db_path: Path to SQLite database file
     """
+    if db_path is None:
+        db_path = intrinsics_db_path()
     init_intrinsics_db(db_path)
 
     conn = sqlite3.connect(db_path)
@@ -268,7 +420,7 @@ def save_intrinsics(
 def load_intrinsics(
     serial_number: str,
     resolution: tuple[int, int],
-    db_path: Path = DEFAULT_INTRINSICS_DB,
+    db_path: Path | None = None,
     allow_scaling: bool = True,
 ) -> CameraIntrinsics | None:
     """
@@ -287,6 +439,8 @@ def load_intrinsics(
     Returns:
         CameraIntrinsics if found (possibly scaled), None otherwise
     """
+    if db_path is None:
+        db_path = intrinsics_db_path()
     if not db_path.exists():
         return None
 
@@ -359,7 +513,7 @@ def load_intrinsics(
 
 
 def list_intrinsics(
-    db_path: Path = DEFAULT_INTRINSICS_DB,
+    db_path: Path | None = None,
 ) -> list[tuple[str, int, int, float]]:
     """
     List all stored intrinsics.
@@ -370,6 +524,8 @@ def list_intrinsics(
     Returns:
         List of (serial_number, width, height, error) tuples
     """
+    if db_path is None:
+        db_path = intrinsics_db_path()
     if not db_path.exists():
         return []
 
@@ -389,7 +545,7 @@ def list_intrinsics(
 def check_intrinsics_availability(
     serial_number: str,
     target_resolution: tuple[int, int],
-    db_path: Path = DEFAULT_INTRINSICS_DB,
+    db_path: Path | None = None,
 ) -> tuple[str, tuple[int, int] | None]:
     """
     Check what intrinsics are available for a camera.
@@ -406,6 +562,8 @@ def check_intrinsics_availability(
         - ("mismatch", None) if intrinsics exist but wrong aspect ratio
         - ("none", None) if no intrinsics for this camera
     """
+    if db_path is None:
+        db_path = intrinsics_db_path()
     if not db_path.exists():
         return ("none", None)
 
@@ -445,7 +603,7 @@ def check_intrinsics_availability(
 def delete_intrinsics(
     serial_number: str,
     resolution: tuple[int, int] | None = None,
-    db_path: Path = DEFAULT_INTRINSICS_DB,
+    db_path: Path | None = None,
 ) -> int:
     """
     Delete intrinsics from database.
@@ -458,6 +616,8 @@ def delete_intrinsics(
     Returns:
         Number of rows deleted
     """
+    if db_path is None:
+        db_path = intrinsics_db_path()
     if not db_path.exists():
         return 0
 
@@ -495,9 +655,11 @@ def delete_intrinsics(
 def save_nickname(
     serial_number: str,
     nickname: str,
-    db_path: Path = DEFAULT_INTRINSICS_DB,
+    db_path: Path | None = None,
 ) -> None:
     """Save a camera nickname to the database."""
+    if db_path is None:
+        db_path = intrinsics_db_path()
     init_intrinsics_db(db_path)
 
     conn = sqlite3.connect(db_path)
@@ -516,9 +678,11 @@ def save_nickname(
 
 
 def load_all_nicknames(
-    db_path: Path = DEFAULT_INTRINSICS_DB,
+    db_path: Path | None = None,
 ) -> dict[str, str]:
     """Load all nicknames from the database. Returns {serial_number: nickname}."""
+    if db_path is None:
+        db_path = intrinsics_db_path()
     if not db_path.exists():
         return {}
 
@@ -534,7 +698,261 @@ def load_all_nicknames(
 
 
 # ============================================================================
-# Extrinsics Storage (per-project TOML)
+# Extrinsics Database  (<data_dir>/extrinsics.db)
+# ============================================================================
+#
+# Every extrinsic calibration session is recorded here. Live detection reads
+# the most recent row at startup. Per-session TOML files in workout subdirs
+# remain as historical record but are no longer the source of truth.
+
+
+def init_extrinsics_db(db_path: Path | None = None) -> None:
+    """Create the extrinsics database tables if they don't already exist."""
+    if db_path is None:
+        db_path = extrinsics_db_path()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS extrinsic_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            rmse REAL,
+            notes TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS extrinsic_cameras (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id INTEGER NOT NULL REFERENCES extrinsic_sessions(id) ON DELETE CASCADE,
+            port INTEGER NOT NULL,
+            serial_number TEXT NOT NULL,
+            nickname TEXT,
+            rotation BLOB NOT NULL,           -- 9 doubles, row-major 3x3
+            translation BLOB NOT NULL,        -- 3 doubles
+            intrinsics_width INTEGER NOT NULL,
+            intrinsics_height INTEGER NOT NULL,
+            intrinsics_error REAL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_extr_cam_session ON extrinsic_cameras(session_id)"
+    )
+    conn.commit()
+    conn.close()
+
+
+def save_extrinsic_session(
+    cameras: dict[int, CalibratedCamera],
+    rmse: float | None = None,
+    notes: str | None = None,
+    nicknames: dict[str, str] | None = None,
+    db_path: Path | None = None,
+) -> int:
+    """Persist a multi-camera extrinsic calibration. Returns the new session id."""
+    if db_path is None:
+        db_path = extrinsics_db_path()
+    init_extrinsics_db(db_path)
+
+    if nicknames is None:
+        try:
+            nicknames = load_all_nicknames()
+        except Exception:
+            nicknames = {}
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cur = conn.execute(
+            "INSERT INTO extrinsic_sessions (rmse, notes) VALUES (?, ?)",
+            (rmse, notes),
+        )
+        session_id = int(cur.lastrowid)
+
+        for port in sorted(cameras.keys()):
+            cc = cameras[port]
+            rot = np.asarray(cc.extrinsics.rotation, dtype=np.float64).flatten()
+            trans = np.asarray(cc.extrinsics.translation, dtype=np.float64).flatten()
+            w, h = cc.intrinsics.resolution
+            conn.execute(
+                """
+                INSERT INTO extrinsic_cameras
+                  (session_id, port, serial_number, nickname,
+                   rotation, translation,
+                   intrinsics_width, intrinsics_height, intrinsics_error)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    int(port),
+                    cc.serial_number,
+                    nicknames.get(cc.serial_number),
+                    rot.tobytes(),
+                    trans.tobytes(),
+                    int(w),
+                    int(h),
+                    float(cc.intrinsics.error),
+                ),
+            )
+        conn.commit()
+        return session_id
+    finally:
+        conn.close()
+
+
+def list_extrinsic_sessions(db_path: Path | None = None) -> list[dict]:
+    """List all extrinsic sessions with metadata, newest first."""
+    if db_path is None:
+        db_path = extrinsics_db_path()
+    if not db_path.exists():
+        return []
+
+    init_extrinsics_db(db_path)
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            """
+            SELECT s.id, s.created_at, s.rmse, s.notes,
+                   COUNT(c.id) AS num_cameras
+            FROM extrinsic_sessions s
+            LEFT JOIN extrinsic_cameras c ON c.session_id = s.id
+            GROUP BY s.id
+            ORDER BY s.created_at DESC, s.id DESC
+            """
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def load_extrinsic_session(
+    session_id: int,
+    db_path: Path | None = None,
+    intrinsics_db: Path | None = None,
+) -> tuple[str, dict[int, CalibratedCamera]] | None:
+    """Load one specific extrinsic session by id.
+
+    Returns (created_at_iso, cameras_dict). Each CalibratedCamera has its
+    intrinsics joined in from intrinsics.db at the resolution the extrinsic
+    calibration session used. Cameras whose intrinsics no longer exist in
+    intrinsics.db are silently dropped (with a warning printed).
+    """
+    if db_path is None:
+        db_path = extrinsics_db_path()
+    if not db_path.exists():
+        return None
+
+    init_extrinsics_db(db_path)
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        sess = conn.execute(
+            "SELECT id, created_at FROM extrinsic_sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        if sess is None:
+            return None
+        cam_rows = conn.execute(
+            "SELECT * FROM extrinsic_cameras WHERE session_id = ? ORDER BY port",
+            (session_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    cameras: dict[int, CalibratedCamera] = {}
+    for r in cam_rows:
+        rotation = np.frombuffer(r["rotation"], dtype=np.float64).reshape(3, 3).copy()
+        translation = np.frombuffer(r["translation"], dtype=np.float64).copy()
+        target_res = (int(r["intrinsics_width"]), int(r["intrinsics_height"]))
+        intrinsics = load_intrinsics(
+            r["serial_number"], target_res, db_path=intrinsics_db,
+        )
+        if intrinsics is None:
+            # No exact / same-AR match. Fall back to cross-AR scaling from
+            # the lowest-error stored entry (matches load_calibration_from_toml).
+            from .types import scale_intrinsics
+            stored = list_intrinsics(intrinsics_db)
+            same_serial = [
+                (w, h, err) for sn, w, h, err in stored
+                if sn == r["serial_number"]
+            ]
+            if same_serial:
+                best_w, best_h, _ = min(same_serial, key=lambda x: x[2])
+                src = load_intrinsics(
+                    r["serial_number"], (best_w, best_h),
+                    db_path=intrinsics_db, allow_scaling=False,
+                )
+                if src is not None:
+                    intrinsics = scale_intrinsics(src, target_res)
+        if intrinsics is None:
+            # Intrinsics for this camera no longer exist anywhere — drop it.
+            continue
+        cameras[int(r["port"])] = CalibratedCamera(
+            serial_number=r["serial_number"],
+            port=int(r["port"]),
+            intrinsics=intrinsics,
+            extrinsics=CameraExtrinsics(rotation=rotation, translation=translation),
+        )
+
+    return str(sess["created_at"]), cameras
+
+
+def load_latest_extrinsic_session(
+    db_path: Path | None = None,
+    intrinsics_db: Path | None = None,
+) -> tuple[int, str, dict[int, CalibratedCamera]] | None:
+    """Return (session_id, created_at_iso, cameras_dict) for the newest session."""
+    if db_path is None:
+        db_path = extrinsics_db_path()
+    if not db_path.exists():
+        return None
+
+    init_extrinsics_db(db_path)
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT id, created_at FROM extrinsic_sessions "
+            "ORDER BY created_at DESC, id DESC LIMIT 1"
+        ).fetchone()
+    finally:
+        conn.close()
+
+    if row is None:
+        return None
+
+    loaded = load_extrinsic_session(int(row["id"]), db_path=db_path,
+                                    intrinsics_db=intrinsics_db)
+    if loaded is None:
+        return None
+    created_at, cameras = loaded
+    return int(row["id"]), created_at, cameras
+
+
+def import_calibration_toml_into_db(
+    toml_path: Path,
+    rmse: float | None = None,
+    notes: str | None = None,
+    db_path: Path | None = None,
+    intrinsics_db: Path | None = None,
+) -> int | None:
+    """One-shot migration helper: read an old calibration.toml and insert it
+    as a new extrinsic_sessions row. Returns the new session id (or None if
+    the toml has no usable cameras)."""
+    cameras = load_calibration_from_toml(toml_path, db_path=intrinsics_db)
+    if not cameras:
+        return None
+    if notes is None:
+        notes = f"Imported from {toml_path}"
+    return save_extrinsic_session(cameras, rmse=rmse, notes=notes, db_path=db_path)
+
+
+# ============================================================================
+# Extrinsics Storage (per-session TOML — historical record)
 # ============================================================================
 
 
@@ -577,7 +995,7 @@ def save_calibration_to_toml(
 
 def load_calibration_from_toml(
     path: Path,
-    db_path: Path = DEFAULT_INTRINSICS_DB,
+    db_path: Path | None = None,
 ) -> dict[int, CalibratedCamera] | None:
     """
     Load calibrated cameras from a TOML file.
@@ -593,6 +1011,8 @@ def load_calibration_from_toml(
     """
     import cv2
 
+    if db_path is None:
+        db_path = intrinsics_db_path()
     if not path.exists():
         return None
 
@@ -604,10 +1024,22 @@ def load_calibration_from_toml(
         serial = cam_data["serial_number"]
         resolution = tuple(cam_data["intrinsics_resolution"])
 
-        # Load intrinsics from database
+        # Load intrinsics from database. load_intrinsics handles exact match
+        # and same-aspect-ratio scaling; if it returns None, fall back to
+        # cross-AR scaling from the lowest-error stored entry for this serial.
         intrinsics = load_intrinsics(serial, resolution, db_path)
         if intrinsics is None:
-            # Can't load without intrinsics
+            from .types import scale_intrinsics
+            stored = list_intrinsics(db_path)
+            same_serial = [(w, h, err) for sn, w, h, err in stored if sn == serial]
+            if same_serial:
+                best_w, best_h, _ = min(same_serial, key=lambda x: x[2])
+                source = load_intrinsics(serial, (best_w, best_h), db_path,
+                                         allow_scaling=False)
+                if source is not None:
+                    intrinsics = scale_intrinsics(source, resolution)
+        if intrinsics is None:
+            # Truly no intrinsics for this serial — drop the camera
             continue
 
         # Convert Rodrigues back to rotation matrix
@@ -627,32 +1059,49 @@ def load_calibration_from_toml(
 
 
 # ============================================================================
-# App Settings  (~/.calimerge/app_settings.json)
+# App Settings  (<data_dir>/app_settings.json)
 # ============================================================================
-
-_APP_SETTINGS_PATH = Path.home() / ".calimerge" / "app_settings.json"
 
 _APP_SETTINGS_DEFAULTS: dict = {
     "last_project_folder": None,
+    # Toggle for the workout page: True = generate CSV synchronously after
+    # recording, False = enqueue and process later via "Process Pending".
+    "csv_export_immediate": True,
+    # Each entry is a job descriptor produced by
+    # ``keypoint_export.make_job_descriptor`` (session_dir, session_id, ...).
+    # Persisted here so unprocessed sessions survive a restart.
+    "pending_csv_jobs": [],
 }
+
+
+def _app_settings_defaults_copy() -> dict:
+    return {k: (list(v) if isinstance(v, list) else v)
+            for k, v in _APP_SETTINGS_DEFAULTS.items()}
 
 
 def load_app_settings() -> dict:
     """Load application-level settings (persists across projects)."""
-    if not _APP_SETTINGS_PATH.exists():
-        return dict(_APP_SETTINGS_DEFAULTS)
+    path = app_settings_path()
+    if not path.exists():
+        return _app_settings_defaults_copy()
     try:
-        with open(_APP_SETTINGS_PATH, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return {**_APP_SETTINGS_DEFAULTS, **data}
+        merged = _app_settings_defaults_copy()
+        merged.update(data)
+        # Ensure list types stay lists even if the file was hand-edited.
+        if not isinstance(merged.get("pending_csv_jobs"), list):
+            merged["pending_csv_jobs"] = []
+        return merged
     except Exception:
-        return dict(_APP_SETTINGS_DEFAULTS)
+        return _app_settings_defaults_copy()
 
 
 def save_app_settings(settings: dict) -> None:
     """Save application-level settings."""
-    _APP_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(_APP_SETTINGS_PATH, "w", encoding="utf-8") as f:
+    path = app_settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(settings, f, indent=2)
 
 
@@ -724,14 +1173,14 @@ def _deep_merge(base: dict, override: dict) -> None:
 
 
 # ============================================================================
-# Workouts Database  (~/.calimerge/workouts.db)
+# Workouts Database  (<data_dir>/workouts.db)
 # ============================================================================
 
-DEFAULT_WORKOUTS_DB = Path.home() / ".calimerge" / "workouts.db"
 
-
-def init_workouts_db(db_path: Path = DEFAULT_WORKOUTS_DB) -> None:
+def init_workouts_db(db_path: Path | None = None) -> None:
     """Create workouts database and tables if they don't exist."""
+    if db_path is None:
+        db_path = workouts_db_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
     conn.execute("""
@@ -770,6 +1219,17 @@ def init_workouts_db(db_path: Path = DEFAULT_WORKOUTS_DB) -> None:
         conn.execute("ALTER TABLE sessions ADD COLUMN set_number INTEGER")
     if "model_version" not in session_cols:
         conn.execute("ALTER TABLE sessions ADD COLUMN model_version TEXT")
+    # Extrinsic provenance: which extrinsics.db row was active at recording.
+    if "extrinsic_session_id" not in session_cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN extrinsic_session_id INTEGER")
+    if "extrinsic_calibrated_at" not in session_cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN extrinsic_calibrated_at TEXT")
+    # Zero-origin transform applied via the live UI (e.g. "Zero L-Ankle").
+    # Stored as raw doubles (9 for the 3x3 rotation, 3 for the translation).
+    if "zero_origin_rotation" not in session_cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN zero_origin_rotation BLOB")
+    if "zero_origin_translation" not in session_cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN zero_origin_translation BLOB")
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS session_results (
@@ -802,9 +1262,19 @@ def init_workouts_db(db_path: Path = DEFAULT_WORKOUTS_DB) -> None:
             days_per_week INTEGER NOT NULL,
             suggested_days TEXT,
             break_seconds INTEGER DEFAULT 60,
-            order_index INTEGER DEFAULT 0
+            order_index INTEGER DEFAULT 0,
+            description TEXT
         )
     """)
+    # Migration: add description column for programs (e.g. FGA) where each
+    # task has its own instructions. Existing rows retain NULL.
+    pe_cols = [
+        row[1] for row in conn.execute(
+            "PRAGMA table_info(program_exercises)"
+        ).fetchall()
+    ]
+    if "description" not in pe_cols:
+        conn.execute("ALTER TABLE program_exercises ADD COLUMN description TEXT")
 
     conn.commit()
     conn.close()
@@ -813,10 +1283,12 @@ def init_workouts_db(db_path: Path = DEFAULT_WORKOUTS_DB) -> None:
     _seed_default_programs(db_path)
 
 
-def _seed_default_programs(db_path: Path = DEFAULT_WORKOUTS_DB) -> None:
+def _seed_default_programs(db_path: Path | None = None) -> None:
     """Insert the default Vivifrail and Calisthenics programs if they don't exist."""
     from .programs import DEFAULT_PROGRAMS
 
+    if db_path is None:
+        db_path = workouts_db_path()
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
 
@@ -838,8 +1310,8 @@ def _seed_default_programs(db_path: Path = DEFAULT_WORKOUTS_DB) -> None:
                 "INSERT INTO program_exercises "
                 "(program_id, workout_type, display_name, sets_per_day, "
                 " target_reps, target_duration_seconds, days_per_week, "
-                " suggested_days, break_seconds, order_index) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " suggested_days, break_seconds, order_index, description) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     program_id,
                     ex["workout_type"],
@@ -851,6 +1323,7 @@ def _seed_default_programs(db_path: Path = DEFAULT_WORKOUTS_DB) -> None:
                     ex.get("suggested_days"),
                     int(ex.get("break_seconds", 60)),
                     int(ex.get("order_index", 0)),
+                    ex.get("description"),
                 ),
             )
 
@@ -981,7 +1454,9 @@ def unpack_session_config(blob: bytes) -> dict[int, dict]:
     return result
 
 
-def _workouts_conn(db_path: Path = DEFAULT_WORKOUTS_DB) -> sqlite3.Connection:
+def _workouts_conn(db_path: Path | None = None) -> sqlite3.Connection:
+    if db_path is None:
+        db_path = workouts_db_path()
     init_workouts_db(db_path)
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
@@ -989,7 +1464,7 @@ def _workouts_conn(db_path: Path = DEFAULT_WORKOUTS_DB) -> sqlite3.Connection:
 
 
 def create_user(username: str, mass_kg: float | None = None,
-                db_path: Path = DEFAULT_WORKOUTS_DB) -> dict:
+                db_path: Path | None = None) -> dict:
     conn = _workouts_conn(db_path)
     conn.execute("INSERT INTO users (username, mass_kg) VALUES (?, ?)",
                  (username, mass_kg))
@@ -1000,7 +1475,7 @@ def create_user(username: str, mass_kg: float | None = None,
     return dict(row)
 
 
-def get_user(username: str, db_path: Path = DEFAULT_WORKOUTS_DB) -> dict | None:
+def get_user(username: str, db_path: Path | None = None) -> dict | None:
     conn = _workouts_conn(db_path)
     row = conn.execute("SELECT * FROM users WHERE username = ?",
                        (username,)).fetchone()
@@ -1008,7 +1483,7 @@ def get_user(username: str, db_path: Path = DEFAULT_WORKOUTS_DB) -> dict | None:
     return dict(row) if row else None
 
 
-def list_users(db_path: Path = DEFAULT_WORKOUTS_DB) -> list[dict]:
+def list_users(db_path: Path | None = None) -> list[dict]:
     conn = _workouts_conn(db_path)
     rows = conn.execute("SELECT * FROM users ORDER BY username").fetchall()
     conn.close()
@@ -1016,7 +1491,7 @@ def list_users(db_path: Path = DEFAULT_WORKOUTS_DB) -> list[dict]:
 
 
 def update_user_mass(user_id: int, mass_kg: float,
-                     db_path: Path = DEFAULT_WORKOUTS_DB) -> None:
+                     db_path: Path | None = None) -> None:
     conn = _workouts_conn(db_path)
     conn.execute("UPDATE users SET mass_kg = ? WHERE id = ?", (mass_kg, user_id))
     conn.commit()
@@ -1030,15 +1505,41 @@ def create_session(user_id: int, workout_type: str,
                    config_blob: bytes | None = None,
                    program_exercise_id: int | None = None,
                    set_number: int | None = None,
-                   db_path: Path = DEFAULT_WORKOUTS_DB) -> int:
+                   extrinsic_session_id: int | None = None,
+                   extrinsic_calibrated_at: str | None = None,
+                   zero_origin_rotation: np.ndarray | None = None,
+                   zero_origin_translation: np.ndarray | None = None,
+                   db_path: Path | None = None) -> int:
+    """Insert a new workout session row.
+
+    extrinsic_session_id / extrinsic_calibrated_at: provenance pointing back
+    into extrinsics.db so the calibration that produced this recording can
+    be reconstructed later.
+
+    zero_origin_rotation / zero_origin_translation: optional 3x3 + (3,)
+    transform captured by the live UI (e.g. when the user pressed
+    "Zero L-Ankle"). Stored as raw float64 bytes.
+    """
     conn = _workouts_conn(db_path)
+
+    rot_bytes = None
+    trans_bytes = None
+    if zero_origin_rotation is not None:
+        rot_bytes = np.asarray(zero_origin_rotation, dtype=np.float64).flatten().tobytes()
+    if zero_origin_translation is not None:
+        trans_bytes = np.asarray(zero_origin_translation, dtype=np.float64).flatten().tobytes()
+
     cur = conn.execute(
         "INSERT INTO sessions (user_id, workout_type, duration_seconds, "
         "recording_path, calibration_path, config_blob, "
-        "program_exercise_id, set_number) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "program_exercise_id, set_number, "
+        "extrinsic_session_id, extrinsic_calibrated_at, "
+        "zero_origin_rotation, zero_origin_translation) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (user_id, workout_type, duration_seconds, recording_path, calibration_path,
-         config_blob, program_exercise_id, set_number))
+         config_blob, program_exercise_id, set_number,
+         extrinsic_session_id, extrinsic_calibrated_at,
+         rot_bytes, trans_bytes))
     conn.commit()
     session_id = cur.lastrowid
     conn.close()
@@ -1046,7 +1547,7 @@ def create_session(user_id: int, workout_type: str,
 
 
 def get_session_config(session_id: int,
-                       db_path: Path = DEFAULT_WORKOUTS_DB) -> dict[int, dict] | None:
+                       db_path: Path | None = None) -> dict[int, dict] | None:
     """Load and unpack the config blob for a session."""
     conn = _workouts_conn(db_path)
     row = conn.execute(
@@ -1062,7 +1563,7 @@ def get_session_config(session_id: int,
 
 
 def get_sessions_for_user(user_id: int,
-                          db_path: Path = DEFAULT_WORKOUTS_DB) -> list[dict]:
+                          db_path: Path | None = None) -> list[dict]:
     conn = _workouts_conn(db_path)
     rows = conn.execute(
         "SELECT * FROM sessions WHERE user_id = ? ORDER BY created_at DESC",
@@ -1073,7 +1574,7 @@ def get_sessions_for_user(user_id: int,
 
 def save_session_result(session_id: int, metric_name: str, metric_value: float,
                         metadata: str | None = None,
-                        db_path: Path = DEFAULT_WORKOUTS_DB) -> None:
+                        db_path: Path | None = None) -> None:
     conn = _workouts_conn(db_path)
     conn.execute(
         "INSERT INTO session_results (session_id, metric_name, metric_value, metadata) "
@@ -1121,7 +1622,7 @@ def write_cuda_calibration_toml(cameras: dict, output_path: Path) -> None:
 
 
 def delete_session_results(session_id: int,
-                           db_path: Path = DEFAULT_WORKOUTS_DB) -> None:
+                           db_path: Path | None = None) -> None:
     """Remove all stored metrics for a session. Used before re-analysis."""
     conn = _workouts_conn(db_path)
     conn.execute("DELETE FROM session_results WHERE session_id = ?", (session_id,))
@@ -1131,7 +1632,7 @@ def delete_session_results(session_id: int,
 
 # ─── Program CRUD ───
 
-def list_programs(db_path: Path = DEFAULT_WORKOUTS_DB) -> list[dict]:
+def list_programs(db_path: Path | None = None) -> list[dict]:
     """Return all known program templates."""
     conn = _workouts_conn(db_path)
     rows = conn.execute("SELECT * FROM programs ORDER BY id").fetchall()
@@ -1139,7 +1640,7 @@ def list_programs(db_path: Path = DEFAULT_WORKOUTS_DB) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def get_program(program_id: int, db_path: Path = DEFAULT_WORKOUTS_DB) -> dict | None:
+def get_program(program_id: int, db_path: Path | None = None) -> dict | None:
     conn = _workouts_conn(db_path)
     row = conn.execute("SELECT * FROM programs WHERE id = ?", (program_id,)).fetchone()
     conn.close()
@@ -1147,7 +1648,7 @@ def get_program(program_id: int, db_path: Path = DEFAULT_WORKOUTS_DB) -> dict | 
 
 
 def get_program_exercises(program_id: int,
-                          db_path: Path = DEFAULT_WORKOUTS_DB) -> list[dict]:
+                          db_path: Path | None = None) -> list[dict]:
     """Return all exercises in a program, ordered by order_index."""
     conn = _workouts_conn(db_path)
     rows = conn.execute(
@@ -1160,7 +1661,7 @@ def get_program_exercises(program_id: int,
 
 
 def set_user_program(user_id: int, program_id: int | None,
-                     db_path: Path = DEFAULT_WORKOUTS_DB) -> None:
+                     db_path: Path | None = None) -> None:
     """Assign a program to a user. Updates program_started_at on change."""
     from datetime import datetime
     conn = _workouts_conn(db_path)
@@ -1173,7 +1674,7 @@ def set_user_program(user_id: int, program_id: int | None,
     conn.close()
 
 
-def get_user_by_id(user_id: int, db_path: Path = DEFAULT_WORKOUTS_DB) -> dict | None:
+def get_user_by_id(user_id: int, db_path: Path | None = None) -> dict | None:
     conn = _workouts_conn(db_path)
     row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
     conn.close()
@@ -1181,7 +1682,7 @@ def get_user_by_id(user_id: int, db_path: Path = DEFAULT_WORKOUTS_DB) -> dict | 
 
 
 def count_sets_since(user_id: int, program_exercise_id: int, since: str,
-                     db_path: Path = DEFAULT_WORKOUTS_DB) -> int:
+                     db_path: Path | None = None) -> int:
     """Count sessions for a given (user, program_exercise) since an ISO timestamp.
 
     `since` is a string accepted by SQLite's comparison (ISO-formatted datetime).

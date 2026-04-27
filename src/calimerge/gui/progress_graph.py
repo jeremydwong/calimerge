@@ -184,9 +184,9 @@ class ProgressGraphDialog(QDialog):
     def _load_exercise_points(self, program_exercise_id: int,
                                metric_name: str) -> list[tuple[datetime, float]]:
         """Return [(session_created_at, metric_value), ...] for this exercise."""
-        from ..config import DEFAULT_WORKOUTS_DB
+        from ..config import workouts_db_path
         import sqlite3
-        conn = sqlite3.connect(str(DEFAULT_WORKOUTS_DB))
+        conn = sqlite3.connect(str(workouts_db_path()))
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             "SELECT s.created_at, r.metric_value "
