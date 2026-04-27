@@ -182,6 +182,21 @@ class WorkoutPage(QWidget):
         user_layout.addWidget(self.conf_value_label)
         self.conf_slider.valueChanged.connect(self._on_confidence_changed)
 
+        # Live-plot kill switch. Camera grid + 3D skeleton paint events on
+        # every emit are fps-expensive; turning them off lets the detection
+        # worker run flat-out at the commanded rate while still buffering
+        # for the CSV / npz dump. Toggling back on resumes drawing on the
+        # next emitted frame -- no re-init needed.
+        user_layout.addSpacing(10)
+        self.live_plot_checkbox = QCheckBox("Live plot")
+        self.live_plot_checkbox.setChecked(True)
+        self.live_plot_checkbox.setToolTip(
+            "Draw 2D pose overlay + 3D skeleton each frame.\n"
+            "Uncheck during workouts to free CPU/GPU for detection -- the\n"
+            "raw keypoints still buffer and write to disk."
+        )
+        user_layout.addWidget(self.live_plot_checkbox)
+
         user_layout.addStretch()
 
         layout.addWidget(user_group)
@@ -1756,6 +1771,15 @@ class WorkoutPage(QWidget):
     def _current_person_confidence(self) -> float:
         return self.conf_slider.value() / 100.0 if hasattr(self, "conf_slider") else 0.50
 
+    def _live_plot_enabled(self) -> bool:
+        """Single source of truth for the Live-plot kill switch.
+
+        Defaults to True if the checkbox isn't built yet (early signal arrivals
+        during startup) so we don't accidentally suppress paints while wiring.
+        """
+        return getattr(self, "live_plot_checkbox", None) is None or \
+            self.live_plot_checkbox.isChecked()
+
     def _start_detection(self):
         if self.detection_worker is not None:
             return
@@ -1920,7 +1944,12 @@ class WorkoutPage(QWidget):
         self.zero_origin_button.setEnabled(False)
 
     def _on_detection_ready(self, port: int, annotated_frame):
+        # Always cache the latest annotated frame — recording / re-render
+        # paths read it off this dict, independent of whether the live grid
+        # is currently being repainted.
         self._last_annotated[port] = annotated_frame.copy()
+        if not self._live_plot_enabled():
+            return
         self.camera_grid.update_frame(port, annotated_frame)
 
     def _on_detection_finished(self):
@@ -1946,7 +1975,11 @@ class WorkoutPage(QWidget):
             ]
             clean_persons.append(clean)
 
-        self.skeleton_view.update_keypoints(clean_persons)
+        # The 3D paint event is the most expensive thing we do per emit;
+        # skip it when live plotting is off so detection can hit the
+        # commanded fps. The recording buffer still fills further down.
+        if self._live_plot_enabled():
+            self.skeleton_view.update_keypoints(clean_persons)
         has_kps = any(any(k is not None for k in p) for p in clean_persons)
         self.rotate_to_human_button.setEnabled(has_kps)
         self.zero_origin_button.setEnabled(has_kps)
