@@ -47,30 +47,38 @@ class ExerciseRow(QFrame):
         sets_per_day = exercise["sets_per_day"]
         completed_today = sets_done_today >= sets_per_day
 
-        # Dull red until today's quota is met, then green
+        # Calmer dusty-red while incomplete, fresh green when today's quota
+        # is met. The previous reds (#3a1e1e bg / #8B3A3A border) read as
+        # alarm; these are muted enough to live next to ten stacked rows
+        # without making the panel feel angry.
         if completed_today:
             bg_color = "#1e3a1e"
             border_color = "#4CAF50"
             status_color = "#4CAF50"
         else:
-            bg_color = "#3a1e1e"
-            border_color = "#8B3A3A"
+            bg_color = "#2f2426"   # muted dark, slight rose tint
+            border_color = "#8a5d5d"  # dusty rose
             status_color = "#FFC107"
 
+        # Tight padding — earlier 4px CSS pad + 6px layout margins burned
+        # ~20 px per row, which made a 10-task FGA plan unreadable except
+        # at fullscreen. Drop to 1 px each for a near-flat row stack.
         self.setStyleSheet(
             f"QFrame {{ background: {bg_color}; "
-            f"border: 1px solid {border_color}; border-radius: 4px; padding: 4px; }}"
+            f"border: 1px solid {border_color}; border-radius: 3px; padding: 1px; }}"
             f"QFrame:hover {{ border: 1px solid #4CAF50; }}"
         )
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setContentsMargins(6, 1, 6, 1)
         layout.setSpacing(10)
 
         # Name + target on a single row (rather than stacked) — cramped
-        # widths weren't surfacing the second line readably anyway.
+        # widths weren't surfacing the second line readably anyway. Regular
+        # weight (was bold); the row already has its own border and bg
+        # contrast, so additional weight just made the panel shouty.
         name_label = QLabel(exercise["display_name"])
-        name_label.setStyleSheet("font-size: 12px; font-weight: bold;")
+        name_label.setStyleSheet("font-size: 12px;")
         layout.addWidget(name_label, stretch=1)
 
         # Suppress the rep string for assessment-shape rows (sets=1, reps=1)
@@ -94,12 +102,13 @@ class ExerciseRow(QFrame):
             target_label.setStyleSheet("font-size: 10px; color: #aaa;")
             layout.addWidget(target_label)
 
-        # Today's progress + weekly tail
+        # Today's progress + weekly tail. Regular weight to match the name
+        # — colour is doing the highlighting.
         total_sets_week = sets_per_day * exercise["days_per_week"]
         status_text = f"{sets_done_today}/{sets_per_day} today"
         status_label = QLabel(status_text)
         status_label.setStyleSheet(
-            f"color: {status_color}; font-weight: bold; font-size: 11px;"
+            f"color: {status_color}; font-size: 11px;"
         )
         layout.addWidget(status_label)
 
@@ -150,7 +159,7 @@ class TodaysPlanWidget(QGroupBox):
 
         self.rows_container = QWidget()
         self.rows_layout = QVBoxLayout(self.rows_container)
-        self.rows_layout.setSpacing(4)
+        self.rows_layout.setSpacing(1)   # was 4 — tighter inter-row stack
         self.rows_layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.rows_container)
 

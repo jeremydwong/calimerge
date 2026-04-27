@@ -97,3 +97,34 @@ def test_row_uses_horizontal_layout_top_level(qtbot):
         assert not isinstance(item.layout(), QVBoxLayout), (
             "name+reps should not be stacked vertically"
         )
+
+
+def test_row_padding_is_tight(qtbot):
+    """Ten stacked FGA rows have to fit without forcing fullscreen — the
+    previous CSS padding=4px + layout margins (8,6,8,6) summed to ~20 px of
+    chrome per row. Lock that vertical padding stays small."""
+    from calimerge.gui.todays_plan import ExerciseRow
+
+    row = ExerciseRow(_ex("Push-ups", sets_per_day=3, target_reps=8),
+                      sets_done_week=0, sets_done_today=0, is_today=True)
+    qtbot.addWidget(row)
+    margins = row.layout().contentsMargins()
+    assert margins.top() <= 2, f"top margin {margins.top()} too big"
+    assert margins.bottom() <= 2, f"bottom margin {margins.bottom()} too big"
+
+
+def test_row_text_is_not_bold(qtbot):
+    """User asked for regular-weight text in the row body. The TODAY pill
+    is allowed to remain bold because it reads as a badge."""
+    from PySide6.QtWidgets import QLabel
+    from calimerge.gui.todays_plan import ExerciseRow
+
+    row = ExerciseRow(_ex("Push-ups", sets_per_day=3, target_reps=8),
+                      sets_done_week=0, sets_done_today=0, is_today=True)
+    qtbot.addWidget(row)
+    for lbl in row.findChildren(QLabel):
+        if lbl.text() == "TODAY":
+            continue   # badge is allowed to stay bold
+        assert "bold" not in lbl.styleSheet().lower(), (
+            f"label {lbl.text()!r} still bold: {lbl.styleSheet()}"
+        )
