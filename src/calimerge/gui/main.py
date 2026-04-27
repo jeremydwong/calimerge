@@ -278,18 +278,30 @@ def main():
     # degrade gracefully on machines that don't have it. Explicit
     # `setFont(QFont("monospace", ...))` calls in widgets that show
     # code/log/numeric output remain unaffected — those are intentional.
+    # Explicit Normal weight: Qt's platform style on Windows can pick up a
+    # bolder Segoe UI variant that reads as 'fat' if we don't pin this.
     _ui_font = QFont()
     _ui_font.setFamilies([
         "Gill Sans",        # macOS / Windows (if installed)
-        "Gill Sans MT",     # Windows (Office bundled)
+        "Gill Sans MT",     # Windows (Office bundled — lighter weight)
         "Gill Sans Std",    # Adobe-installed variant
-        "Gill Sans Nova",   # Microsoft 365 variant
         "Helvetica Neue",   # macOS fallback
         "Helvetica",        # macOS fallback
         "Segoe UI",         # Windows fallback
         "Arial",            # universal sans fallback
+        # NOTE: 'Gill Sans Nova' deliberately omitted — its default weight
+        # ships heavier than classic Gill Sans and renders 'thick' against
+        # the rest of the UI. If you have it and prefer it, add it here.
     ])
+    _ui_font.setWeight(QFont.Weight.Normal)
+    _ui_font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
     app.setFont(_ui_font)
+
+    # Print the actually-resolved family so the user can verify whether
+    # Gill Sans was found or if Qt fell through to Segoe UI / Arial.
+    from PySide6.QtGui import QFontInfo
+    actual = QFontInfo(_ui_font).family()
+    print(f"[ui-font] requested Gill Sans, resolved to: {actual!r}", flush=True)
 
     window = MainWindow()
     window.show()

@@ -117,6 +117,7 @@ class RecordingWorker(QThread):
         duration: float,
         fps: int,
         codec: str = "h264",
+        retain_frames: bool = False,
     ):
         super().__init__()
         self.cameras = cameras
@@ -126,6 +127,16 @@ class RecordingWorker(QThread):
         self.fps = fps
         self.codec = codec
         self.running = True
+
+        # When set, the worker also keeps a per-port list of the synced
+        # frames it captured so post-processing can re-run pose tracking
+        # without re-decoding the saved MP4. Each entry is the raw BGR
+        # ndarray from the C-side capture_synced; sync_index = list index
+        # (None for ports that dropped a frame at that sync). Memory cost
+        # is roughly  W * H * 3 * fps * duration * num_cameras  bytes, so
+        # only enable for short workouts.
+        self.retain_frames = retain_frames
+        self.captured_frames: dict[int, list] = {p: [] for p in ports}
 
     def run(self):
         try:
@@ -188,6 +199,11 @@ class RecordingWorker(QThread):
 
                     write_frame(writers[port], frame.pixels)
                     frame_counts[port] += 1
+
+                    if self.retain_frames:
+                        # Reference, not copy — capture_synced already gave
+                        # us a fresh ndarray detached from the C ring buffer.
+                        self.captured_frames[port].append(frame.pixels)
 
                     # Emit for preview/FPS tracking
                     self.frame_captured.emit(port, frame.pixels)
@@ -1744,3 +1760,176 @@ class CudaStreamDetectionWorker(QThread):
         if self._pipeline is not None:
             self._pipeline.close()
             self._pipeline = None
+
+
+class OfflineProcessingWorker(QThread):
+    """Run the CUDA batch pipeline on a recorded session, then convert its
+    per-person CSV outputs into the unified keypoints_3d.csv + raw.npz that
+    the live path also produces.
+
+    Used when 'Pause live tracking during recording' is on AND 'Generate CSV
+    after save' is on: the live path can't fill the keypoint buffer, so we
+    re-run pose tracking offline against the saved videos.
+
+    Emits progress(step_name, fraction) so the UI can show a progress bar.
+    """
+
+    progress = Signal(str, float)
+    log_message = Signal(str)
+    finished_ok = Signal(object)   # Path to session dir
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        session_dir: "Path",
+        cameras: dict,
+        port_to_video: dict,
+        frame_time_csv: "Path",
+        batch_size: int = 8,
+    ):
+        super().__init__()
+        self._session_dir = session_dir
+        self._cameras = cameras
+        self._port_to_video = port_to_video
+        self._frame_time_csv = frame_time_csv
+        self._batch_size = int(batch_size)
+
+    def run(self):
+        try:
+            from pathlib import Path
+            import tempfile
+            from ..config import (
+                models_dir as _models_dir,
+                write_cuda_calibration_toml,
+            )
+            from ..tracking.cuda_binding import run_cuda_pipeline
+
+            self.log_message.emit('[offline] writing calibration TOML...')
+            cuda_cal = Path(tempfile.gettempdir()) / 'calimerge_offline_cal.toml'
+            write_cuda_calibration_toml(self._cameras, cuda_cal)
+
+            onnx_dir = _models_dir() / 'onnx'
+            yolo_onnx = onnx_dir / 'yolo_v10s.onnx'
+            vitpose_onnx = onnx_dir / 'vitpose_synthpose.onnx'
+
+            self.progress.emit('starting', 0.0)
+
+            def _on_prog(step: str, frac: float):
+                self.progress.emit(step, frac)
+
+            def _on_log(msg: str):
+                self.log_message.emit(f'[offline] {msg}')
+
+            run_cuda_pipeline(
+                video_paths=self._port_to_video,
+                calibration_toml=cuda_cal,
+                frame_time_csv=self._frame_time_csv,
+                output_path=self._session_dir,
+                yolo_onnx=yolo_onnx if yolo_onnx.exists() else None,
+                vitpose_onnx=vitpose_onnx if vitpose_onnx.exists() else None,
+                batch_size=self._batch_size,
+                progress_callback=_on_prog,
+                log_callback=_on_log,
+            )
+
+            # Convert per-person C-side CSVs into the unified format the live
+            # path uses, so notebooks and downstream readers see the same
+            # keypoints_3d.raw.npz / keypoints_3d.csv regardless of how the
+            # session was processed.
+            self.progress.emit('converting CSV', 0.95)
+            self._convert_outputs()
+
+            self.progress.emit('complete', 1.0)
+            self.finished_ok.emit(self._session_dir)
+        except Exception as e:
+            import traceback
+            self.failed.emit(f'{e}\n{traceback.format_exc()}')
+
+    def _convert_outputs(self) -> None:
+        """Read per-person C-side wide CSVs and produce keypoints_3d.raw.npz
+        + keypoints_3d.csv in the long format the live path writes."""
+        import numpy as np
+        from ..keypoint_export import write_raw_buffer
+
+        per_person = sorted(self._session_dir.glob('output_3d_poses_tracked_person*.csv'))
+        if not per_person:
+            self.log_message.emit('[offline] no per-person CSVs to convert')
+            return
+
+        # Build (sync_index, person_id) -> [(kp_idx, x, y, z), ...]
+        frames: dict[int, list[list["np.ndarray | None"]]] = {}
+        for csv_path in per_person:
+            try:
+                pid = int(csv_path.stem.rsplit('person', 1)[1])
+            except Exception:
+                pid = 0
+            with open(csv_path, 'r', newline='') as f:
+                import csv as _csv
+                reader = _csv.reader(f)
+                header = next(reader, None)
+                if header is None:
+                    continue
+                # Header: sync_index, person_id, K0_X, K0_Y, K0_Z, K1_X, ...
+                n_kps = (len(header) - 2) // 3
+                for row in reader:
+                    if len(row) < 2 + 3 * n_kps:
+                        continue
+                    try:
+                        sync = int(row[0])
+                    except ValueError:
+                        continue
+                    kps_for_person: list = []
+                    for k in range(n_kps):
+                        sx = row[2 + k * 3]
+                        sy = row[3 + k * 3]
+                        sz = row[4 + k * 3]
+                        if sx == '' or sy == '' or sz == '':
+                            kps_for_person.append(None)
+                        else:
+                            try:
+                                kps_for_person.append(np.array([float(sx), float(sy), float(sz)]))
+                            except ValueError:
+                                kps_for_person.append(None)
+                    frames.setdefault(sync, [None] * 1)  # type: ignore[arg-type]
+                    while len(frames[sync]) <= pid:
+                        frames[sync].append(None)
+                    frames[sync][pid] = kps_for_person
+
+        if not frames:
+            return
+
+        recording: list[dict] = []
+        sync_indices = sorted(frames.keys())
+        # Use sync_index / FPS estimate for time. If no frame_time_csv parsed,
+        # synthesize 30fps. Conservative — better than no time axis.
+        fps_est = 30.0
+        try:
+            with open(self._frame_time_csv, 'r', newline='') as ft:
+                import csv as _csv
+                ftr = _csv.reader(ft)
+                next(ftr, None)
+                rows = list(ftr)
+                if len(rows) > 1:
+                    times = [float(r[3]) for r in rows if len(r) > 3]
+                    if len(times) > 1:
+                        dt = (max(times) - min(times)) / max(1, (len(times) - 1))
+                        if dt > 0:
+                            fps_est = 1.0 / dt
+        except Exception:
+            pass
+
+        for sync in sync_indices:
+            persons = frames[sync]
+            # Drop None placeholders past the last real person.
+            while persons and persons[-1] is None:
+                persons.pop()
+            recording.append({
+                'time': sync / fps_est,
+                'persons': persons,
+                'primary_index': 0,
+            })
+
+        npz_path = self._session_dir / 'keypoints_3d.raw.npz'
+        write_raw_buffer(npz_path, recording)
+        self.log_message.emit(f'[offline] wrote {npz_path.name} ({len(recording)} frames)')
+

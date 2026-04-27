@@ -1115,6 +1115,10 @@ _PROJECT_SETTINGS_DEFAULTS: dict = {
     "fps": 30,
     "codec": "h264",
     "intrinsic_max_frames": 40,
+    # Sync indices per CUDA-batch invocation when re-processing recorded
+    # videos through run_cuda_pipeline. 8 is a safe default for 12 GB-class
+    # GPUs at 640x480; bump to 16 on RTX 4080+ to cut total wall time.
+    "pose_batch_size": 8,
     "cameras": {},
     "charuco_intrinsic": {
         "columns": 7,

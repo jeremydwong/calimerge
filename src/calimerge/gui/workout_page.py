@@ -451,6 +451,27 @@ class WorkoutPage(QWidget):
 
         layout.addWidget(main_splitter, stretch=1)
 
+        # Bottom progress strip — used by the offline post-processing path
+        # (run when 'Pause live tracking during recording' is on AND
+        # 'Generate CSV after save' is on). Hidden when idle.
+        from PySide6.QtWidgets import QProgressBar
+        offline_row = QHBoxLayout()
+        offline_row.setContentsMargins(6, 0, 6, 2)
+        self.offline_status_label = QLabel("")
+        self.offline_status_label.setStyleSheet("color: #aaa; font-size: 11px;")
+        self.offline_progress_bar = QProgressBar()
+        self.offline_progress_bar.setRange(0, 100)
+        self.offline_progress_bar.setValue(0)
+        self.offline_progress_bar.setTextVisible(True)
+        self.offline_progress_bar.setFixedHeight(14)
+        offline_row.addWidget(self.offline_status_label)
+        offline_row.addWidget(self.offline_progress_bar, stretch=1)
+        # Wrap in a container so we can hide both pieces in one toggle.
+        self.offline_progress_container = QWidget()
+        self.offline_progress_container.setLayout(offline_row)
+        self.offline_progress_container.setVisible(False)
+        layout.addWidget(self.offline_progress_container)
+
         # Start with manual fallback hidden — the Today's Plan widget
         # shows "log in and pick a program" empty state.
         self.manual_group.setVisible(False)
@@ -2479,6 +2500,95 @@ class WorkoutPage(QWidget):
         remaining = (total - current) / max(self._target_fps, 1)
         self.record_btn.setText(f"Stop ({remaining:.0f}s left)")
 
+    def _start_offline_processing(self):
+        """Kick off the CUDA batch pipeline against the just-recorded videos.
+
+        Used when the user paused live tracking during recording — the live
+        keypoint buffer is empty so we re-run pose tracking offline. Shows
+        progress in the bottom strip; on completion, writes
+        keypoints_3d.raw.npz and per-person CSVs to the session dir.
+        """
+        if self._current_session_dir is None or self._calibrated_cameras is None:
+            return
+        # Build port -> video path. Recording writes port_N.mp4 by convention.
+        session_dir = self._current_session_dir
+        port_to_video = {}
+        for port in self.opened_ports:
+            mp4 = session_dir / f"port_{port}.mp4"
+            if mp4.exists():
+                port_to_video[port] = mp4
+        if not port_to_video:
+            self.status_message.emit(
+                "Offline processing skipped: no port_*.mp4 files found"
+            )
+            return
+
+        frame_time_csv = session_dir / "frame_time_history.csv"
+        if not frame_time_csv.exists():
+            self.status_message.emit(
+                "Offline processing skipped: frame_time_history.csv missing"
+            )
+            return
+
+        cameras = self._normalize_calibrated_cameras(self._calibrated_cameras)
+
+        # Pull batch_size from project settings (added in this PR; default 8).
+        batch_size = 8
+        try:
+            from ..config import load_app_settings, load_project_settings
+            app = load_app_settings()
+            folder = app.get("last_project_folder")
+            if folder:
+                ps = load_project_settings(Path(folder))
+                batch_size = int(ps.get("pose_batch_size", 8))
+        except Exception:
+            pass
+
+        from .workers import OfflineProcessingWorker
+        self._offline_worker = OfflineProcessingWorker(
+            session_dir=session_dir,
+            cameras=cameras,
+            port_to_video=port_to_video,
+            frame_time_csv=frame_time_csv,
+            batch_size=batch_size,
+        )
+        self._offline_worker.progress.connect(self._on_offline_progress)
+        self._offline_worker.log_message.connect(self._on_offline_log)
+        self._offline_worker.finished_ok.connect(self._on_offline_finished)
+        self._offline_worker.failed.connect(self._on_offline_failed)
+
+        self.offline_progress_container.setVisible(True)
+        self.offline_progress_bar.setValue(0)
+        self.offline_status_label.setText("Offline processing: starting...")
+        self._offline_worker.start()
+
+    def _on_offline_progress(self, step: str, fraction: float):
+        pct = int(max(0.0, min(1.0, fraction)) * 100)
+        self.offline_progress_bar.setValue(pct)
+        self.offline_status_label.setText(f"Offline: {step}")
+
+    def _on_offline_log(self, msg: str):
+        self.status_message.emit(msg)
+
+    def _on_offline_finished(self, session_dir):
+        self.offline_progress_bar.setValue(100)
+        self.offline_status_label.setText(
+            f"Offline processing complete: {session_dir}"
+        )
+        # Auto-hide the progress strip after a short delay so it doesn't
+        # linger forever; status_bar message lives on.
+        QTimer.singleShot(4000, self._hide_offline_progress)
+        self._offline_worker = None
+
+    def _on_offline_failed(self, error: str):
+        self.offline_status_label.setText(f"Offline processing failed: {error[:200]}")
+        self.offline_progress_bar.setValue(0)
+        QTimer.singleShot(8000, self._hide_offline_progress)
+        self._offline_worker = None
+
+    def _hide_offline_progress(self):
+        self.offline_progress_container.setVisible(False)
+
     def _on_record_finished(self, stats: dict):
         self._is_recording = False
         self.recording_worker = None
@@ -2491,10 +2601,18 @@ class WorkoutPage(QWidget):
 
         # If detection was paused for the recording, bring it back so the
         # live skeleton view starts updating again.
-        if getattr(self, "_tracking_paused_for_recording", False):
+        was_paused = bool(getattr(self, "_tracking_paused_for_recording", False))
+        if was_paused:
             self._tracking_paused_for_recording = False
             if self.detect_checkbox.isChecked() and self.detection_worker is None:
                 self._start_detection()
+
+        # If tracking was paused during recording, the live keypoint buffer
+        # is empty (or near-empty). Kick off offline post-processing on the
+        # saved video files so the user still gets a CSV. Only fires when
+        # the user has 'Generate CSV after save' on.
+        if was_paused and self.generate_csv_checkbox.isChecked():
+            self._start_offline_processing()
 
         # Save 3D keypoints to binary file alongside the videos
         kps_file = None
