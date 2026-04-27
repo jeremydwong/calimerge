@@ -91,6 +91,18 @@ class WorkoutPage(QWidget):
         # Auto-chain flag: after login, automatically start preview + detection
         self._auto_start_pipeline: bool = False
 
+        # Coalescing buffers for the per-frame UI paints. Qt's queued signals
+        # for cross-thread emits (`detection_ready`, `keypoints_3d_ready`)
+        # pile up FIFO when the main thread is overloaded; processing that
+        # backlog ends up painting frames from minutes ago. We drop-old by
+        # stashing only the latest payload here and scheduling exactly one
+        # paint via QTimer.singleShot. Recording-buffer fills happen in the
+        # slot synchronously so no science data is lost.
+        self._pending_grid_frames: dict[int, "np.ndarray"] = {}
+        self._grid_paint_scheduled: bool = False
+        self._pending_persons_3d: list | None = None
+        self._kp3d_paint_scheduled: bool = False
+
         self._init_ui()
         self._load_camera_prefs()
         self._check_calibration()
@@ -182,20 +194,6 @@ class WorkoutPage(QWidget):
         user_layout.addWidget(self.conf_value_label)
         self.conf_slider.valueChanged.connect(self._on_confidence_changed)
 
-        # Live-plot kill switch. Camera grid + 3D skeleton paint events on
-        # every emit are fps-expensive; turning them off lets the detection
-        # worker run flat-out at the commanded rate while still buffering
-        # for the CSV / npz dump. Toggling back on resumes drawing on the
-        # next emitted frame -- no re-init needed.
-        user_layout.addSpacing(10)
-        self.live_plot_checkbox = QCheckBox("Live plot")
-        self.live_plot_checkbox.setChecked(True)
-        self.live_plot_checkbox.setToolTip(
-            "Draw 2D pose overlay + 3D skeleton each frame.\n"
-            "Uncheck during workouts to free CPU/GPU for detection -- the\n"
-            "raw keypoints still buffer and write to disk."
-        )
-        user_layout.addWidget(self.live_plot_checkbox)
 
         user_layout.addStretch()
 
@@ -378,7 +376,32 @@ class WorkoutPage(QWidget):
             "'Process Pending'."
         )
         self.generate_csv_checkbox.toggled.connect(self._on_csv_toggle_changed)
+        # Avoid Qt's platform default of bold-on-checked-text in the global
+        # stylesheet — keep the checkbox label at regular weight so it
+        # matches the surrounding Gill Sans body text.
+        self.generate_csv_checkbox.setStyleSheet("font-weight: normal;")
         btn_layout.addWidget(self.generate_csv_checkbox)
+
+        # Pause-live-tracking toggle: when checked, the detection worker
+        # is stopped for the duration of recording so video capture has the
+        # full frame budget. Detection resumes automatically once recording
+        # ends. Sits next to the CSV toggle since both are recording-time
+        # behavioural switches.
+        self.pause_tracking_during_record_checkbox = QCheckBox(
+            "Pause live tracking during recording"
+        )
+        self.pause_tracking_during_record_checkbox.setChecked(True)
+        self.pause_tracking_during_record_checkbox.setToolTip(
+            "Checked: stop live 2D/3D tracking while recording so the\n"
+            "cameras can hit the commanded fps. Tracking resumes\n"
+            "automatically when the recording finishes. Raw video is\n"
+            "always saved either way; you can re-process the videos\n"
+            "later via the CUDA batch pipeline."
+        )
+        self.pause_tracking_during_record_checkbox.setStyleSheet(
+            "font-weight: normal;"
+        )
+        btn_layout.addWidget(self.pause_tracking_during_record_checkbox)
 
         self.process_pending_btn = QPushButton("Process Pending CSVs")
         self.process_pending_btn.setToolTip(
@@ -1771,15 +1794,6 @@ class WorkoutPage(QWidget):
     def _current_person_confidence(self) -> float:
         return self.conf_slider.value() / 100.0 if hasattr(self, "conf_slider") else 0.50
 
-    def _live_plot_enabled(self) -> bool:
-        """Single source of truth for the Live-plot kill switch.
-
-        Defaults to True if the checkbox isn't built yet (early signal arrivals
-        during startup) so we don't accidentally suppress paints while wiring.
-        """
-        return getattr(self, "live_plot_checkbox", None) is None or \
-            self.live_plot_checkbox.isChecked()
-
     def _start_detection(self):
         if self.detection_worker is not None:
             return
@@ -1948,9 +1962,22 @@ class WorkoutPage(QWidget):
         # paths read it off this dict, independent of whether the live grid
         # is currently being repainted.
         self._last_annotated[port] = annotated_frame.copy()
-        if not self._live_plot_enabled():
-            return
-        self.camera_grid.update_frame(port, annotated_frame)
+        # Coalesce: stash the freshest frame per port and schedule a single
+        # paint. Multiple queued slot calls between paints collapse into one
+        # repaint of the latest, so a backlog of stale `detection_ready`
+        # signals can't replay minute-old footage when the UI thread is
+        # overloaded.
+        self._pending_grid_frames[port] = annotated_frame
+        if not self._grid_paint_scheduled:
+            self._grid_paint_scheduled = True
+            QTimer.singleShot(0, self._paint_pending_grid_frames)
+
+    def _paint_pending_grid_frames(self):
+        self._grid_paint_scheduled = False
+        latest = dict(self._pending_grid_frames)
+        self._pending_grid_frames.clear()
+        for port, frame in latest.items():
+            self.camera_grid.update_frame(port, frame)
 
     def _on_detection_finished(self):
         if self.detect_checkbox.isChecked():
@@ -1975,11 +2002,14 @@ class WorkoutPage(QWidget):
             ]
             clean_persons.append(clean)
 
-        # The 3D paint event is the most expensive thing we do per emit;
-        # skip it when live plotting is off so detection can hit the
-        # commanded fps. The recording buffer still fills further down.
-        if self._live_plot_enabled():
-            self.skeleton_view.update_keypoints(clean_persons)
+        # Coalesce queued emits (same drop-old story as the camera grid)
+        # so a backlog can't replay minute-old skeletons. Recording-buffer
+        # fills happen below, synchronously, so no science data is lost
+        # even when the paint is coalesced.
+        self._pending_persons_3d = clean_persons
+        if not self._kp3d_paint_scheduled:
+            self._kp3d_paint_scheduled = True
+            QTimer.singleShot(0, self._paint_pending_skeleton)
         has_kps = any(any(k is not None for k in p) for p in clean_persons)
         self.rotate_to_human_button.setEnabled(has_kps)
         self.zero_origin_button.setEnabled(has_kps)
@@ -1987,7 +2017,8 @@ class WorkoutPage(QWidget):
         # Track which person is primary (closest to calibrated origin)
         self._primary_person_index = primary_index
 
-        # Buffer keypoints during recording
+        # Buffer keypoints during recording (every emit, never coalesced —
+        # this is the science data and must not drop frames).
         if self._is_recording and clean_persons:
             t = time.perf_counter() - self._recording_start_time
             self._recording_keypoints.append({
@@ -1995,6 +2026,13 @@ class WorkoutPage(QWidget):
                 "persons": clean_persons,
                 "primary_index": primary_index,
             })
+
+    def _paint_pending_skeleton(self):
+        self._kp3d_paint_scheduled = False
+        persons = self._pending_persons_3d
+        self._pending_persons_3d = None
+        if persons is not None:
+            self.skeleton_view.update_keypoints(persons)
 
     # ── Rotate to Human ──
 
@@ -2372,9 +2410,22 @@ class WorkoutPage(QWidget):
         self.record_btn.setEnabled(True)
         self.status_message.emit(f"Recording {workout_type} for {duration}s...")
 
-        # Ensure detection is running for 3D keypoint collection
-        if self.detection_worker is None and self._calibrated_cameras is not None:
-            self._start_detection()
+        # Pause-live-tracking-during-recording option: if the user wants
+        # the cameras to have the full frame budget, stop the detection
+        # worker now and remember to restart it on _on_record_finished.
+        # We do NOT capture _recording_keypoints in this mode — the user
+        # has already opted in to "save videos, process later" by checking
+        # this box.
+        self._tracking_paused_for_recording = bool(
+            self.pause_tracking_during_record_checkbox.isChecked()
+        )
+        if self._tracking_paused_for_recording:
+            if self.detection_worker is not None:
+                self._stop_detection()
+        else:
+            # Ensure detection is running for 3D keypoint collection
+            if self.detection_worker is None and self._calibrated_cameras is not None:
+                self._start_detection()
 
         self.recording_worker = RecordingWorker(
             cameras=self.opened_cameras,
@@ -2410,6 +2461,13 @@ class WorkoutPage(QWidget):
         # Resume preview
         if self.preview_worker:
             self.preview_worker.resume()
+
+        # If detection was paused for the recording, bring it back so the
+        # live skeleton view starts updating again.
+        if getattr(self, "_tracking_paused_for_recording", False):
+            self._tracking_paused_for_recording = False
+            if self.detect_checkbox.isChecked() and self.detection_worker is None:
+                self._start_detection()
 
         # Save 3D keypoints to binary file alongside the videos
         kps_file = None
