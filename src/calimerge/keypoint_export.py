@@ -45,9 +45,16 @@ CSV_FIELDS = (
     "valid",
 )
 
+# Optional column appended when a frame_time_history.csv is supplied.
+# Holds the camera-side wall-clock arrival time (in seconds, relative to
+# recording start) for the *first* port observed in the history file at
+# the row's sync_index.  Empty when the port is missing for that index.
+CSV_FIELD_CAMERA_FRAME_TIME = "camera_frame_time_s"
+
 CSV_FILENAME = "keypoints_3d.csv"
 META_FILENAME = "keypoints_3d.meta.json"
 RAW_FILENAME = "keypoints_3d.raw.npz"
+FRAME_TIME_HISTORY_FILENAME = "frame_time_history.csv"
 
 
 # ----------------------------------------------------------------------------
@@ -80,6 +87,52 @@ def _safe_xyz(kp: Any) -> tuple[float, float, float]:
     return (float(arr[0]), float(arr[1]), float(arr[2]))
 
 
+def _parse_frame_time_history(
+    history_path: Path,
+) -> tuple[dict[tuple[int, int], float], list[int]]:
+    """
+    Parse ``frame_time_history.csv`` into:
+
+      * ``per_index_port`` -- dict ``{(sync_index, port): frame_time_s}``
+      * ``ports_in_order`` -- ports as first encountered in the file,
+        used as the canonical column order for the npz array.
+
+    The file header is::
+
+        sync_index, port, frame_index, frame_time
+
+    Lines beginning with ``#`` are skipped (the recording worker writes
+    a "# cameras: ..." commentary line at the top).
+    """
+    per_index_port: dict[tuple[int, int], float] = {}
+    ports_in_order: list[int] = []
+
+    if not history_path.exists():
+        return per_index_port, ports_in_order
+
+    seen_ports: set[int] = set()
+    try:
+        with open(history_path, "r", encoding="utf-8", newline="") as f:
+            # Strip leading commentary lines (those starting with '#').
+            data_lines = [ln for ln in f if not ln.lstrip().startswith("#")]
+        reader = csv.DictReader(data_lines)
+        for row in reader:
+            try:
+                sync_index = int(row["sync_index"])
+                port = int(row["port"])
+                frame_time = float(row["frame_time"])
+            except (KeyError, ValueError, TypeError):
+                continue
+            per_index_port[(sync_index, port)] = frame_time
+            if port not in seen_ports:
+                seen_ports.add(port)
+                ports_in_order.append(port)
+    except Exception:
+        return {}, []
+
+    return per_index_port, ports_in_order
+
+
 def _person_id_for(persons_packet: Any, person_index: int) -> int:
     """Best-effort track-id extraction. Falls back to person_index."""
     if isinstance(persons_packet, dict):
@@ -97,12 +150,37 @@ def _person_id_for(persons_packet: Any, person_index: int) -> int:
 # ----------------------------------------------------------------------------
 
 
-def write_raw_buffer(path: Path, recording_keypoints: list[dict]) -> None:
+def write_raw_buffer(
+    path: Path,
+    recording_keypoints: list[dict],
+    *,
+    frame_time_history_path: Path | None = None,
+) -> None:
     """
     Dump the in-memory recording buffer to an .npz file.
 
     Format mirrors what ``write_keypoints_csv`` consumes so a queued job
     can rehydrate after a restart without rerunning detection.
+
+    Parameters
+    ----------
+    path : Path
+        Output ``.npz`` location.
+    recording_keypoints : list[dict]
+        Buffered detection results.
+    frame_time_history_path : Path | None, optional
+        When provided and the file exists, an extra array
+        ``frame_times_per_port`` of shape ``(n_frames, n_cameras)`` is
+        included.  Cameras are columns in first-seen order in the file
+        (typically port 0, port 1, ...).  Cells default to NaN; a value
+        is only written when ``(sync_index, port)`` appears in the
+        history file (i.e. the camera did not drop that frame).
+        ``frame_time_ports`` is also stored, holding the port number
+        for each column as int32.
+
+        ``sync_index`` in the history file is used as the row index, so
+        the first ``n_frames`` rows of the history are mapped one-for-
+        one onto the buffer's frame ordering.
     """
     if not recording_keypoints:
         return
@@ -154,6 +232,23 @@ def write_raw_buffer(path: Path, recording_keypoints: list[dict]) -> None:
                     continue
                 keypoints[i, p_idx, k_idx, :] = arr[:3]
 
+    extra_arrays: dict[str, np.ndarray] = {}
+    if frame_time_history_path is not None:
+        per_index_port, ports_in_order = _parse_frame_time_history(
+            Path(frame_time_history_path)
+        )
+        if ports_in_order:
+            n_cams = len(ports_in_order)
+            ftpp = np.full((n_frames, n_cams), np.nan, dtype=np.float64)
+            for (sync_index, port), ft in per_index_port.items():
+                if 0 <= sync_index < n_frames and port in ports_in_order:
+                    col = ports_in_order.index(port)
+                    ftpp[sync_index, col] = ft
+            extra_arrays["frame_times_per_port"] = ftpp
+            extra_arrays["frame_time_ports"] = np.asarray(
+                ports_in_order, dtype=np.int32
+            )
+
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         path,
@@ -161,6 +256,7 @@ def write_raw_buffer(path: Path, recording_keypoints: list[dict]) -> None:
         keypoints_3d=keypoints,
         person_count=person_counts,
         primary_person_index=primary,
+        **extra_arrays,
     )
 
 
@@ -211,22 +307,63 @@ def write_keypoints_csv(
     csv_path: Path,
     recording_keypoints: list[dict],
     num_keypoints: int = 52,
+    *,
+    frame_time_history_path: Path | None = None,
 ) -> int:
     """
     Write the buffered keypoints to ``csv_path``.
 
     Returns the number of rows written (excluding header).
+
+    Parameters
+    ----------
+    csv_path : Path
+        Output CSV location.
+    recording_keypoints : list[dict]
+        Buffered detection results.
+    num_keypoints : int
+        Number of keypoints per person to write.
+    frame_time_history_path : Path | None, optional
+        When provided and the file exists, an extra column
+        ``camera_frame_time_s`` is appended to every row.  The value is
+        the camera's wall-clock frame-arrival time (seconds since
+        recording start) for the *first* port in the history file at
+        that ``sync_index``.  Port 0 is canonical for science use; if
+        port 0 is absent the first port encountered in the history is
+        used.  The cell is empty when no frame_time is available.
     """
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     rows_written = 0
 
+    # Optional frame_time lookup keyed by sync_index for the canonical port.
+    sync_to_camera_frame_time: dict[int, float] = {}
+    include_camera_frame_time = False
+    if frame_time_history_path is not None:
+        per_index_port, ports_in_order = _parse_frame_time_history(
+            Path(frame_time_history_path)
+        )
+        if ports_in_order:
+            include_camera_frame_time = True
+            canonical_port = 0 if 0 in ports_in_order else ports_in_order[0]
+            for (sync_index, port), ft in per_index_port.items():
+                if port == canonical_port:
+                    sync_to_camera_frame_time[sync_index] = ft
+
+    fields = list(CSV_FIELDS)
+    if include_camera_frame_time:
+        fields.append(CSV_FIELD_CAMERA_FRAME_TIME)
+
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(CSV_FIELDS)
+        writer.writerow(fields)
 
         for sync_index, frame in enumerate(recording_keypoints):
             t = float(frame.get("time", 0.0))
             persons = frame.get("persons") or []
+            cam_ft_str: str | None = None
+            if include_camera_frame_time:
+                ft = sync_to_camera_frame_time.get(sync_index)
+                cam_ft_str = "" if ft is None else f"{ft:.6f}"
             for person_index, person in enumerate(persons):
                 if person is None:
                     continue
@@ -239,19 +376,20 @@ def write_keypoints_csv(
                     kp = person[k_idx]
                     valid = 1 if _is_finite_xyz(kp) else 0
                     x, y, z = _safe_xyz(kp)
-                    writer.writerow(
-                        (
-                            f"{t:.6f}",
-                            sync_index,
-                            person_index,
-                            person_id,
-                            k_idx,
-                            "" if math.isnan(x) else f"{x:.6f}",
-                            "" if math.isnan(y) else f"{y:.6f}",
-                            "" if math.isnan(z) else f"{z:.6f}",
-                            valid,
-                        )
-                    )
+                    row: list[Any] = [
+                        f"{t:.6f}",
+                        sync_index,
+                        person_index,
+                        person_id,
+                        k_idx,
+                        "" if math.isnan(x) else f"{x:.6f}",
+                        "" if math.isnan(y) else f"{y:.6f}",
+                        "" if math.isnan(z) else f"{z:.6f}",
+                        valid,
+                    ]
+                    if include_camera_frame_time:
+                        row.append(cam_ft_str)
+                    writer.writerow(row)
                     rows_written += 1
 
     return rows_written
@@ -428,17 +566,33 @@ def export_session_csv(
     session_id: int | None = None,
     intrinsics_db_path: Path | None = None,
     extra_meta: dict | None = None,
+    frame_time_history_path: Path | None = None,
 ) -> tuple[Path, Path, int]:
     """
     Generate ``keypoints_3d.csv`` + ``keypoints_3d.meta.json`` in
     ``session_dir`` and return ``(csv_path, meta_path, num_rows)``.
+
+    If ``frame_time_history_path`` is None, the function looks for a
+    ``frame_time_history.csv`` next to the session and uses it
+    automatically.  Pass an explicit path (or a non-existent ``Path``)
+    to override that behaviour.
     """
     session_dir = Path(session_dir)
     session_dir.mkdir(parents=True, exist_ok=True)
     csv_path = session_dir / CSV_FILENAME
     meta_path = session_dir / META_FILENAME
 
-    rows = write_keypoints_csv(csv_path, recording_keypoints, num_keypoints)
+    if frame_time_history_path is None:
+        candidate = session_dir / FRAME_TIME_HISTORY_FILENAME
+        if candidate.exists():
+            frame_time_history_path = candidate
+
+    rows = write_keypoints_csv(
+        csv_path,
+        recording_keypoints,
+        num_keypoints,
+        frame_time_history_path=frame_time_history_path,
+    )
     meta = build_meta(
         session_dir,
         calibrated_cameras=calibrated_cameras,

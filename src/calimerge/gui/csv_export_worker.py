@@ -14,6 +14,7 @@ from pathlib import Path
 from PySide6.QtCore import QThread, Signal
 
 from ..keypoint_export import (
+    FRAME_TIME_HISTORY_FILENAME,
     export_session_csv,
     read_raw_buffer,
 )
@@ -47,6 +48,13 @@ class CsvExportWorker(QThread):
         self.session_dir = Path(session_dir)
         self._buffer = recording_keypoints
         self._raw_buffer_path = raw_buffer_path
+        # Pre-compute the conventional frame_time_history path so the
+        # worker can both surface it on the CSV/npz outputs *and* survive
+        # session_dir relocation.
+        history_candidate = self.session_dir / FRAME_TIME_HISTORY_FILENAME
+        self._frame_time_history_path: Path | None = (
+            history_candidate if history_candidate.exists() else None
+        )
         self._kwargs = dict(
             calibrated_cameras=calibrated_cameras,
             extrinsic_session_id=extrinsic_session_id,
@@ -57,6 +65,7 @@ class CsvExportWorker(QThread):
             session_id=session_id,
             intrinsics_db_path=intrinsics_db_path,
             extra_meta=extra_meta,
+            frame_time_history_path=self._frame_time_history_path,
         )
 
     def run(self):  # noqa: D401 -- Qt convention
