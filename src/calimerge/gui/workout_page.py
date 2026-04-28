@@ -2430,7 +2430,13 @@ class WorkoutPage(QWidget):
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         workout_type = self._selected_workout_type()
-        self._current_session_dir = workout_dir / f"{timestamp}_{workout_type}"
+        from ..session_naming import build_session_dir_name
+
+        self._current_session_dir = workout_dir / build_session_dir_name(
+            self._current_username,
+            timestamp,
+            workout_type,
+        )
         self._current_session_dir.mkdir(parents=True, exist_ok=True)
         self._current_workout_type = workout_type
 
@@ -2760,7 +2766,10 @@ class WorkoutPage(QWidget):
 
         from ..config import load_app_settings, save_app_settings
         from ..keypoint_export import (
-            write_raw_buffer, make_job_descriptor, RAW_FILENAME,
+            write_raw_buffer,
+            make_job_descriptor,
+            RAW_FILENAME,
+            FRAME_TIME_HISTORY_FILENAME,
         )
 
         session_dir = self._current_session_dir
@@ -2771,8 +2780,15 @@ class WorkoutPage(QWidget):
         # Always persist the raw buffer alongside the videos. This lets a
         # queued job survive a process restart, AND gives the immediate
         # path a recovery point if the worker crashes.
+        history_path = session_dir / FRAME_TIME_HISTORY_FILENAME
         try:
-            write_raw_buffer(session_dir / RAW_FILENAME, self._recording_keypoints)
+            write_raw_buffer(
+                session_dir / RAW_FILENAME,
+                self._recording_keypoints,
+                frame_time_history_path=(
+                    history_path if history_path.exists() else None
+                ),
+            )
         except Exception as e:
             self.status_message.emit(f"Failed to dump raw keypoints: {e}")
 
