@@ -26,12 +26,32 @@ import numpy as np
 DEFAULT_NUM_KEYPOINTS = 52
 
 
+def _orthonormalize_rotation(R: np.ndarray) -> np.ndarray:
+    """Project a near-rotation 3x3 matrix to the closest proper rotation.
+
+    Same Kabsch projection used by keypoint_export.write_raw_buffer so the
+    two npz files agree to floating-point precision when given the same
+    (R, t).
+    """
+    R = np.asarray(R, dtype=np.float64).reshape(3, 3)
+    U, _, Vt = np.linalg.svd(R)
+    R_ortho = U @ Vt
+    if np.linalg.det(R_ortho) < 0:
+        U[:, -1] *= -1
+        R_ortho = U @ Vt
+    return R_ortho
+
+
 def save_keypoints_3d(
     path: Path,
     frames: list[dict],
     num_keypoints: int = DEFAULT_NUM_KEYPOINTS,
     max_persons: int = 4,
     primary_person_index: int = 0,
+    view_rotation: np.ndarray | None = None,
+    view_translation: np.ndarray | None = None,
+    model_backend: str | None = None,
+    model_name: str | None = None,
 ) -> None:
     """
     Save a list of per-frame keypoint records to a .npz file.
@@ -46,13 +66,27 @@ def save_keypoints_3d(
             "persons": list   — list of persons; each person is a list of
                                  (x, y, z) tuples or np.ndarray(3,) or None
             "primary_index": int (optional) — per-frame primary person index
+        Persons here are in CAMERA frame — the live keypoint emitter
+        (PoseDetectionWorker / CudaStreamDetectionWorker) writes raw
+        triangulated points.
     num_keypoints : int
-        Number of keypoints per person (default 17 for COCO).
+        Number of keypoints per person (default 52 for SynthPose).
     max_persons : int
         Maximum persons to store per frame. Extras are dropped.
     primary_person_index : int
         Index of the person closest to the calibrated origin (the exercise
         subject).  Stored as a scalar in the npz for downstream analysis.
+    view_rotation, view_translation : np.ndarray | None, optional
+        Camera->view transform snapshotted at record-time. When provided,
+        every keypoint is mapped via ``p_view = R @ p_cam + t`` before
+        being saved, and the transform is recorded in the npz under
+        ``view_transform_R`` (3x3) and ``view_transform_t`` (3,) so a
+        consumer that wants camera coords can invert via
+        ``p_cam = R.T @ (p_view - t)``. R is re-orthonormalised via SVD
+        before being applied + saved. When omitted, keypoints are
+        written as-is and an identity transform is recorded — needed for
+        the test_output.ipynb notebook's ankle plot to match the live
+        body-frame readout.
     """
     n_frames = len(frames)
     if n_frames == 0:
@@ -65,6 +99,20 @@ def save_keypoints_3d(
     )
     person_counts = np.zeros(n_frames, dtype=np.int32)
     primary_indices = np.zeros(n_frames, dtype=np.int32)
+
+    # Resolve the view transform once. Default = identity so legacy
+    # callers that pass nothing get the old camera-frame behaviour.
+    if view_rotation is not None:
+        R_view = _orthonormalize_rotation(view_rotation).astype(np.float64)
+    else:
+        R_view = np.eye(3, dtype=np.float64)
+    if view_translation is not None:
+        t_view = np.asarray(view_translation, dtype=np.float64).reshape(3)
+    else:
+        t_view = np.zeros(3, dtype=np.float64)
+    apply_transform = not (
+        np.allclose(R_view, np.eye(3)) and np.allclose(t_view, 0.0)
+    )
 
     for i, frame in enumerate(frames):
         timestamps[i] = frame.get("time", 0.0)
@@ -83,10 +131,15 @@ def save_keypoints_3d(
                     continue
                 try:
                     arr = np.asarray(kp, dtype=np.float32)
-                    if arr.shape == (3,):
-                        keypoints[i, p_idx, k_idx, :] = arr
                 except Exception:
-                    pass
+                    continue
+                if arr.shape != (3,):
+                    continue
+                if apply_transform:
+                    pt = R_view @ arr.astype(np.float64) + t_view
+                    keypoints[i, p_idx, k_idx, :] = pt.astype(np.float32)
+                else:
+                    keypoints[i, p_idx, k_idx, :] = arr
 
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
@@ -95,6 +148,13 @@ def save_keypoints_3d(
         keypoints_3d=keypoints,
         person_count=person_counts,
         primary_person_index=np.array(primary_indices, dtype=np.int32),
+        view_transform_R=R_view.astype(np.float64),
+        view_transform_t=t_view.astype(np.float64),
+        # Detection provenance: which backend + model produced these
+        # keypoints. Stored as 0-d unicode arrays — empty string when
+        # the caller didn't pass it (legacy compatibility).
+        model_backend=np.array(model_backend or "", dtype="<U32"),
+        model_name=np.array(model_name or "", dtype="<U64"),
     )
 
 

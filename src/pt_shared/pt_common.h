@@ -84,6 +84,11 @@ extern "C" {
 #define PT_ERR_DECODE           -9
 #define PT_ERR_NOT_INITIALIZED  -10
 
+/* Alias used by the macOS / MPS pipeline sources before this name was
+ * unified. Same value as PT_ERR_INVALID_PARAM — kept as a #define rather
+ * than a separate code so existing CUDA-side error tables stay correct. */
+#define PT_ERR_INVALID_ARGS     PT_ERR_INVALID_PARAM
+
 /* ============================================================================
  * GPU Arena - CUDA only (guarded by PT_CUDA_PIPELINE)
  * ============================================================================ */

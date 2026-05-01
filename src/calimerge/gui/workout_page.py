@@ -103,8 +103,24 @@ class WorkoutPage(QWidget):
         self._pending_persons_3d: list | None = None
         self._kp3d_paint_scheduled: bool = False
 
+        # Per-port arrival timestamps for the current recording. Cleared at
+        # _on_record start, consumed in _on_record_finished to print
+        # avg/median fps + max delta to stdout and the status bar.
+        self._record_arrivals: dict[int, list[float]] = {}
+
+        # 3 s pre-roll countdown before recording actually starts; lets the
+        # operator walk into the capture volume. None when not counting.
+        self._record_countdown_timer: QTimer | None = None
+        self._record_countdown_remaining: int = 0
+
         self._init_ui()
         self._load_camera_prefs()
+        # Restore last-used detection model/backend/confidence BEFORE
+        # _load_view_transform — that function keys off
+        # _current_model_key(), so the model dropdown must be on the
+        # right entry first or the wrong preset gets applied to the
+        # skeleton view at startup.
+        self._restore_last_detect_state()
         self._check_calibration()
         self._load_view_transform()
 
@@ -162,12 +178,20 @@ class WorkoutPage(QWidget):
         self.detect_backend_combo = QComboBox()
         self.detect_backend_combo.addItem("PyTorch", "pytorch")
         try:
-            from ..tracking.cuda_stream_binding import is_available
-            if is_available():
+            from ..tracking.cuda_stream_binding import is_available as _cuda_available
+            if _cuda_available():
                 self.detect_backend_combo.addItem("Hardware (CUDA)", "cuda")
         except Exception:
             pass
-        self.detect_backend_combo.setToolTip("Backend: PyTorch or CUDA TensorRT")
+        try:
+            from ..tracking.mps_stream_binding import is_available as _mps_available
+            if _mps_available():
+                self.detect_backend_combo.addItem("Hardware (MPS)", "mps")
+        except Exception:
+            pass
+        self.detect_backend_combo.setToolTip(
+            "Backend: PyTorch, CUDA TensorRT, or Apple MPS / CoreML"
+        )
         self.detect_backend_combo.setFixedWidth(130)
         self.detect_backend_combo.currentIndexChanged.connect(self._on_model_changed)
         user_layout.addWidget(self.detect_backend_combo)
@@ -196,6 +220,22 @@ class WorkoutPage(QWidget):
 
 
         user_layout.addStretch()
+
+        # Live capture FPS graph. Lives on the far right of the user bar:
+        # last 5 s of values per camera, Y-axis pinned to recording_rate * 1.2
+        # so over-target/under-target deviations are obvious at a glance.
+        # buffer_size auto-resizes from set_target_fps() because we passed
+        # time_window_s=5.0.
+        from .tabs.cameras_tab import FpsGraphWidget
+        self.fps_graph = FpsGraphWidget(
+            buffer_size=int(self._target_fps * 5),
+            y_max_factor=1.2,
+            time_window_s=5.0,
+        )
+        self.fps_graph.setMinimumHeight(60)
+        self.fps_graph.setMaximumHeight(70)
+        self.fps_graph.setFixedWidth(240)
+        user_layout.addWidget(self.fps_graph)
 
         layout.addWidget(user_group)
 
@@ -1277,6 +1317,111 @@ class WorkoutPage(QWidget):
         except Exception:
             pass
 
+    def _reset_for_user_switch(self):
+        """Tear down workers + clear all per-session state in-memory.
+
+        Called from _on_login when switching to a different user, so the
+        new user gets a clean slate without restarting the application.
+        Specifically this fixes the "ghost frames" bug: the camera grid,
+        skeleton view, FPS graph, paint-coalescing buffers and analysis
+        result arrays all kept the previous user's data otherwise, and
+        you'd see stale annotated frames + skeleton until enough new
+        frames came in to overwrite them.
+
+        What is preserved (deliberately not user-scoped):
+          - per-model rotate/zero presets in view_transforms.db
+          - calibration (extrinsics, intrinsics)
+          - app settings (last_detect_*, csv_export_immediate, ...)
+          - detection model + backend selection in the dropdowns
+
+        What is cleared:
+          - active workers (recording, detection, preview) so the new
+            session starts fresh — also forces the cross-frame person
+            tracker in PoseDetectionWorker to forget previous track ids
+          - opened cameras (re-opened by the auto-start that follows)
+          - in-memory keypoint / FPS / arrival buffers
+          - the camera grid, skeleton view, FPS graph displays
+          - the analysis result arrays + plot UI
+        """
+        # 1. Stop active workers.
+        if getattr(self, "recording_worker", None) is not None:
+            try:
+                self.recording_worker.running = False
+                self.recording_worker.wait(2000)
+            except Exception:
+                pass
+            self.recording_worker = None
+        try:
+            self._stop_detection()
+        except Exception:
+            pass
+        if getattr(self, "preview_worker", None) is not None:
+            try:
+                self.preview_worker.stop()
+                self.preview_worker.wait(2000)
+            except Exception:
+                pass
+            self.preview_worker = None
+        try:
+            self._close_cameras()
+        except Exception:
+            pass
+
+        # 2. Clear per-session data buffers.
+        self._recording_keypoints = []
+        self._record_arrivals = {}
+        try:
+            self._last_annotated.clear()
+        except Exception:
+            self._last_annotated = {}
+        self._last_frame_time = {}
+        self._pending_grid_frames = {}
+        self._grid_paint_scheduled = False
+        self._pending_persons_3d = None
+        self._kp3d_paint_scheduled = False
+        self._is_recording = False
+        self._tracking_paused_for_recording = False
+        self._offline_csv_pending = False
+        self._primary_person_index = 0
+
+        # 3. Clear analysis result state — last_* arrays drive the plot
+        # widgets, so leaving them around shows the previous user's reps.
+        for attr in (
+            "_last_times", "_last_hip_z", "_last_hip_xy", "_last_head_xyz",
+            "_last_head_z", "_last_elbow_angles", "_last_shoulder_z",
+            "_last_knee_z",
+        ):
+            if hasattr(self, attr):
+                setattr(self, attr, None)
+        self._last_session_id = None
+
+        # 4. Clear the visible widgets.
+        try:
+            self.skeleton_view.clear()           # drops persons (keeps R, t)
+        except Exception:
+            pass
+        try:
+            self.skeleton_view.clear_footsteps()
+        except Exception:
+            pass
+        try:
+            self.camera_grid.clear_all()
+        except Exception:
+            pass
+        try:
+            self.fps_graph.clear_all()
+        except Exception:
+            pass
+        try:
+            # Repaint the (now empty) plot panel so stale lines disappear.
+            self._apply_plot_mode(self._selected_workout_type())
+        except Exception:
+            pass
+        try:
+            self.results_label.setText("No results yet.")
+        except Exception:
+            pass
+
     def _on_login(self):
         username = self.user_combo.currentText().strip()
         if not username:
@@ -1296,6 +1441,19 @@ class WorkoutPage(QWidget):
                         break
             else:
                 self.status_message.emit(f"Logged in as: {username}")
+
+            # Detect user change BEFORE we overwrite _current_user_id, so
+            # we can decide whether to reset session state. A first login
+            # (current_user_id is None) doesn't need a reset — there's
+            # nothing to reset. A re-login as the same user also doesn't
+            # need it (saves a worker reload). Switching to a different
+            # user does.
+            user_changed = (
+                self._current_user_id is not None
+                and self._current_user_id != user["id"]
+            )
+            if user_changed:
+                self._reset_for_user_switch()
 
             self._current_user_id = user["id"]
             self._current_username = user["username"]
@@ -1584,6 +1742,10 @@ class WorkoutPage(QWidget):
                     self._target_fps = int(fps)
         except Exception:
             pass
+        # Sync the FPS graph to the loaded recording rate. With time_window_s
+        # set, this also resizes the rolling buffer to ~5 s of samples.
+        if hasattr(self, "fps_graph"):
+            self.fps_graph.set_target_fps(self._target_fps)
 
     # ── Camera initialization ──
 
@@ -1602,6 +1764,12 @@ class WorkoutPage(QWidget):
     def _on_cameras_found(self, cameras: list):
         from ..config import load_all_nicknames
         nicknames = load_all_nicknames()
+
+        # Resolve calibration against the *exact* set of plugged-in cameras
+        # before building CameraStates — port mapping below depends on it.
+        self._resolve_calibration_for_serials(
+            {cam.serial_number for cam in cameras}
+        )
 
         # Seed per-serial preferences so saved resolutions/exposure flow into
         # CameraState (and through to intrinsic lookup) on first login.
@@ -1724,6 +1892,8 @@ class WorkoutPage(QWidget):
 
         self.camera_grid.set_cameras(camera_info)
         self._last_frame_time.clear()
+        self.fps_graph.set_cameras(camera_info)
+        self.fps_graph.set_target_fps(self._target_fps)
 
         self.preview_worker = CameraPreviewWorker(
             self.opened_cameras, self.opened_ports, fps=self._target_fps
@@ -1778,20 +1948,56 @@ class WorkoutPage(QWidget):
         else:
             self.camera_grid.update_frame(port, pixels)
 
+        # FPS graph update (cheap; Qt coalesces the repaint).
+        now = time.perf_counter()
+        prev = self._last_frame_time.get(port)
+        if prev is not None:
+            dt = now - prev
+            if dt > 0:
+                self.fps_graph.push_fps(port, 1.0 / dt)
+        self._last_frame_time[port] = now
+
     def _on_preview_error(self, error: str):
         self.status_message.emit(f"Preview error: {error}")
 
     # ── Live Detection ──
 
     def _on_detect_toggled(self, checked: bool):
+        # If the detection worker is already loaded, just pause/resume —
+        # tearing it down would force a multi-second YOLO + VitPose reload
+        # next time the user re-enables detection. Workers without
+        # pause/resume fall through to the start/stop path so the toggle
+        # always actually does something.
+        worker = self.detection_worker
+        if worker is not None and hasattr(worker, "pause") and hasattr(worker, "resume"):
+            if checked:
+                worker.resume()
+                self.status_message.emit("Detection resumed")
+            else:
+                worker.pause()
+                # Don't blank the skeleton view here — frozen-on-pause is
+                # often what the user wants. _stop_detection clears it on
+                # full teardown.
+                self.status_message.emit("Detection paused")
+            return
+
         if checked:
             self._start_detection()
         else:
             self._stop_detection()
 
+    def _current_model_key(self) -> str:
+        """Stable string id for the active detection model.
+
+        Used as the key under which view-transform presets are stored in
+        camera_rig.toml so each model can have its own saved
+        rotate-to-human + zero-origin without overwriting siblings.
+        """
+        return self.detect_model_combo.currentData() or "vitpose"
+
     def _zero_point_for_model(self) -> tuple[int, str]:
         """Return (keypoint_index, label) for the active model's zero origin."""
-        model = self.detect_model_combo.currentData() or "vitpose"
+        model = self._current_model_key()
         if model == "mediapipe_hands":
             return (4, "L_Thumb")  # MediaPipe hand landmark 4 = thumb tip
         return (15, "L_Ankle")    # SynthPose/COCO keypoint 15
@@ -1800,9 +2006,71 @@ class WorkoutPage(QWidget):
         _, label = self._zero_point_for_model()
         self.zero_origin_button.setText(f"Zero at {label}")
 
+    def _restore_last_detect_state(self):
+        """Pull last-used model/backend/confidence from app_settings into
+        the GUI so the user lands in the same configuration as last
+        session. Signals are blocked during the restore so we don't
+        synthetically fire _on_model_changed → _start_detection before
+        the rest of __init__ has finished running.
+        """
+        try:
+            from ..config import load_app_settings
+            settings = load_app_settings()
+        except Exception:
+            return
+
+        last_model = settings.get("last_detect_model", "vitpose")
+        last_backend = settings.get("last_detect_backend", "pytorch")
+        last_conf = float(settings.get("last_detect_confidence", 0.50))
+
+        for combo, key in (
+            (self.detect_model_combo, last_model),
+            (self.detect_backend_combo, last_backend),
+        ):
+            idx = combo.findData(key)
+            if idx >= 0:
+                combo.blockSignals(True)
+                combo.setCurrentIndex(idx)
+                combo.blockSignals(False)
+
+        # Slider value is an int 10..95.
+        slider_val = max(10, min(95, int(round(last_conf * 100))))
+        self.conf_slider.blockSignals(True)
+        self.conf_slider.setValue(slider_val)
+        self.conf_slider.blockSignals(False)
+        if hasattr(self, "conf_value_label"):
+            self.conf_value_label.setText(f"{slider_val / 100.0:.2f}")
+
+    def _persist_last_detect_state(self):
+        """Save the current model/backend/confidence to app_settings.
+
+        Called from _on_model_changed and _on_confidence_changed so the
+        next launch picks up where the user left off.
+        """
+        try:
+            from ..config import load_app_settings, save_app_settings
+            settings = load_app_settings()
+            settings["last_detect_model"] = (
+                self.detect_model_combo.currentData() or "vitpose"
+            )
+            settings["last_detect_backend"] = (
+                self.detect_backend_combo.currentData() or "pytorch"
+            )
+            settings["last_detect_confidence"] = (
+                self.conf_slider.value() / 100.0
+            )
+            save_app_settings(settings)
+        except Exception:
+            pass
+
     def _on_model_changed(self, _index: int = 0):
         """Restart detection when the model or backend dropdown changes."""
         self._update_zero_button_label()
+        self._persist_last_detect_state()
+        # Switch to whichever rotate/zero preset was last saved for this
+        # model (or reset to identity if none) so the user doesn't have
+        # to re-zero every time they flip between models.
+        self._load_view_transform()
         # Guard: don't restart during initial setup or if preview isn't running
         if not self.state_manager.state.is_previewing:
             return
@@ -1822,6 +2090,8 @@ class WorkoutPage(QWidget):
         conf = value / 100.0
         if hasattr(self, "conf_value_label"):
             self.conf_value_label.setText(f"{conf:.2f}")
+        # Persist the new confidence so it's restored next launch.
+        self._persist_last_detect_state()
         worker = self.detection_worker
         if worker is None:
             return
@@ -1832,9 +2102,10 @@ class WorkoutPage(QWidget):
             except Exception:
                 pass
             return
-        # CUDA worker bakes the threshold into the C config at create time —
-        # restart so the new value takes effect.
-        if isinstance(worker, CudaStreamDetectionWorker):
+        # CUDA / MPS workers bake the threshold into the C config at create
+        # time — restart so the new value takes effect.
+        from .workers import MpsStreamDetectionWorker
+        if isinstance(worker, (CudaStreamDetectionWorker, MpsStreamDetectionWorker)):
             from PySide6.QtCore import QTimer
             self._stop_detection()
             QTimer.singleShot(200, self._start_detection)
@@ -1860,6 +2131,8 @@ class WorkoutPage(QWidget):
 
         if backend == "cuda" and cameras is not None and self._calibration_available:
             self._start_cuda_detection(cameras)
+        elif backend == "mps" and cameras is not None and self._calibration_available:
+            self._start_mps_detection(cameras)
         else:
             self._start_pytorch_detection(cameras)
 
@@ -1978,6 +2251,65 @@ class WorkoutPage(QWidget):
         self.detection_worker.start()
         self.status_message.emit("Detection started (CUDA TensorRT)")
 
+    def _start_mps_detection(self, cameras):
+        """Start the MPS / CoreML streaming detection worker (macOS only)."""
+        from .workers import MpsStreamDetectionWorker
+        from ..config import (
+            models_dir,
+            write_cuda_calibration_toml,
+        )
+        import tempfile
+
+        # Normalise every camera's intrinsics to the live recording
+        # resolution before handing off.  Same rationale as CUDA path:
+        # mismatched K -> wrong fundamental matrix -> 3D garbage.
+        cameras = self._normalize_calibrated_cameras(cameras)
+
+        # The MPS pipeline reads the same calibration TOML format the
+        # CUDA pipeline does (pt_calibration.c is platform-independent
+        # under-the-hood), so we reuse write_cuda_calibration_toml.
+        mps_cal_path = Path(tempfile.gettempdir()) / "calimerge_mps_calibration.toml"
+        write_cuda_calibration_toml(cameras, mps_cal_path)
+
+        # Resolve CoreML model paths under the app data dir, falling back
+        # to <repo>/models/coreml/.  Matches the ONNX resolution policy
+        # for the CUDA path.
+        coreml_dir = models_dir() / "coreml"
+        legacy_coreml_dir = (
+            Path(__file__).resolve().parent.parent.parent.parent
+            / "models" / "coreml"
+        )
+
+        def _resolve_coreml(filename: str) -> str:
+            primary = coreml_dir / filename
+            if primary.exists():
+                return str(primary)
+            legacy = legacy_coreml_dir / filename
+            if legacy.exists():
+                return str(legacy)
+            return str(primary)  # let the .m side surface a clear missing-file error
+
+        yolo_model = _resolve_coreml("yolo_v10s.mlpackage")
+        vitpose_model = _resolve_coreml("vitpose_synthpose.mlpackage")
+
+        self.detection_worker = MpsStreamDetectionWorker(
+            cameras=cameras,
+            calibration_path=str(mps_cal_path),
+            yolo_model_path=yolo_model,
+            vitpose_model_path=vitpose_model,
+            max_persons=2,
+            person_confidence=self._current_person_confidence(),
+        )
+        self.detection_worker.log_message.connect(
+            lambda msg: self.status_message.emit(msg)
+        )
+        self.detection_worker.detection_ready.connect(self._on_detection_ready)
+        self.detection_worker.error.connect(self._on_detection_error)
+        self.detection_worker.finished.connect(self._on_detection_finished)
+        self.detection_worker.keypoints_3d_ready.connect(self._on_keypoints_3d)
+        self.detection_worker.start()
+        self.status_message.emit("Detection started (MPS / CoreML)")
+
     def _start_mediapipe_hands_detection(self):
         """Start the MediaPipe Hands detection worker."""
         from .workers import MediaPipeHandsDetectionWorker
@@ -1994,6 +2326,13 @@ class WorkoutPage(QWidget):
         self.status_message.emit("Detection started (MediaPipe Hands)")
 
     def _stop_detection(self):
+        # Mark this stop as intentional so _on_detection_finished (fired by
+        # the QThread.finished signal once the worker thread exits) doesn't
+        # uncheck the live-detection box. Without this flag, pausing
+        # detection for a recording uncheck the box, and _on_record_finished
+        # then sees `detect_checkbox.isChecked() == False` and never
+        # restarts detection after the trial ends.
+        self._detection_stopping_intentionally = True
         if self.detection_worker is not None:
             self.detection_worker.stop()
             if not self.detection_worker.wait(5000):
@@ -2028,6 +2367,13 @@ class WorkoutPage(QWidget):
             self.camera_grid.update_frame(port, frame)
 
     def _on_detection_finished(self):
+        # Intentional stop (e.g. pausing tracking for a recording, or model
+        # change): leave the checkbox alone so the caller can restart later.
+        if getattr(self, "_detection_stopping_intentionally", False):
+            self._detection_stopping_intentionally = False
+            return
+        # Otherwise the worker died unexpectedly — uncheck the box so the
+        # UI reflects reality.
         if self.detect_checkbox.isChecked():
             self.detect_checkbox.blockSignals(True)
             self.detect_checkbox.setChecked(False)
@@ -2102,7 +2448,82 @@ class WorkoutPage(QWidget):
             self.rotate_to_human_button.setText("Rotate to Human")
             self._compute_rotate_to_human()
 
+    def _compute_rotate_to_hand(self):
+        """Compute a hand-frame rotation transform.
+
+        Axes (per user spec):
+          Y = normalize(wrist - middle_tip)  (long axis of hand, toward wrist)
+          X = thumb axis, projected to be perpendicular to Y
+          Z = normalize(cross(X, Y))         (re-orthogonalised)
+
+        Stores rotation-only (no translation); the user re-zeros via
+        "Zero at L_Thumb" to set translation. R is orthonormal by
+        construction.
+
+        MediaPipe hand landmarks: 0=wrist, 1=thumb_CMC (base), 4=thumb_tip,
+        12=middle_tip.
+        """
+        kps = self.skeleton_view.get_keypoints()
+        if not kps or not any(k is not None for k in kps):
+            self.rotate_to_human_button.setEnabled(True)
+            return
+
+        def get_pt(idx):
+            if idx < len(kps) and kps[idx] is not None:
+                return np.array(kps[idx], dtype=float)
+            return None
+
+        wrist      = get_pt(0)
+        thumb_base = get_pt(1)
+        thumb_tip  = get_pt(4)
+        middle_tip = get_pt(12)
+
+        if wrist is None or middle_tip is None:
+            self.rotate_to_human_button.setEnabled(True)
+            return
+
+        Y = wrist - middle_tip
+        y_norm = np.linalg.norm(Y)
+        if y_norm < 1e-3:
+            self.rotate_to_human_button.setEnabled(True)
+            return
+        Y = Y / y_norm
+
+        if thumb_base is not None and thumb_tip is not None:
+            X_raw = thumb_tip - thumb_base
+        else:
+            X_raw = np.array([1.0, 0.0, 0.0])
+            if abs(np.dot(X_raw, Y)) > 0.9:
+                X_raw = np.array([0.0, 0.0, 1.0])
+
+        # Gram-Schmidt: drop the Y-component of X_raw.
+        X = X_raw - np.dot(X_raw, Y) * Y
+        x_norm = np.linalg.norm(X)
+        if x_norm < 1e-4:
+            self.rotate_to_human_button.setEnabled(True)
+            return
+        X = X / x_norm
+
+        Z = np.cross(X, Y)
+        Z = Z / np.linalg.norm(Z)
+
+        R = np.column_stack([X, Y, Z])
+        T = np.eye(4)
+        T[:3, :3] = R.T
+
+        self._view_rotation = T
+        self._view_has_origin = False
+        self.skeleton_view.set_view_transform(T, has_origin=False)
+        self._save_view_transform(T, has_origin=False)
+        self.rotate_to_human_button.setEnabled(True)
+
     def _compute_rotate_to_human(self):
+        # Hand model uses a different axis convention (Y = tip→wrist,
+        # X = thumb axis, Z = X×Y); body axes don't apply.
+        if self._current_model_key() == "mediapipe_hands":
+            self._compute_rotate_to_hand()
+            return
+
         kps = self.skeleton_view.get_keypoints()
         if not kps or not any(k is not None for k in kps):
             self.rotate_to_human_button.setEnabled(True)
@@ -2224,9 +2645,23 @@ class WorkoutPage(QWidget):
 
         self.zero_origin_button.setEnabled(True)
 
-    # ── View transform persistence ──
+    # ── View transform persistence (per-model preset DB) ──
+    #
+    # Storage is one row per model in a sqlite at
+    # <app_data>/models/view_transforms.db. Switching detection model
+    # automatically reloads the saved (R, t) for that model so the user
+    # only has to press Rotate-to-Human + Zero once per model.
+    #
+    # The skeleton view's transform `T` is a 4x4 with R in the upper 3x3
+    # and t in the last column. The persisted row stores R and t directly.
 
     def _get_camera_rig_path(self) -> Path | None:
+        """Legacy camera_rig.toml path.
+
+        Kept for the one-shot migration into the new view_transforms.db.
+        New writes go through save_view_transform — the TOML is no longer
+        updated.
+        """
         try:
             from ..config import load_app_settings
             app = load_app_settings()
@@ -2237,74 +2672,120 @@ class WorkoutPage(QWidget):
             pass
         return None
 
-    def _save_view_transform(self, T: np.ndarray, has_origin: bool = False):
-        try:
-            import rtoml
-            rig_path = self._get_camera_rig_path()
-            if rig_path is None:
-                return
-            data = {}
-            if rig_path.exists():
-                data = rtoml.load(rig_path)
-            data["live_view"] = {
-                "transform": T.flatten().tolist(),
-                "has_origin": has_origin,
-            }
-            with open(rig_path, "w") as f:
-                rtoml.dump(data, f)
-        except Exception:
-            pass
+    def _migrate_legacy_view_transform(self):
+        """One-shot: import camera_rig.toml's [live_view] into the new
+        view_transforms DB under model_key=vitpose, then forget the TOML.
 
-    def _save_body_transform(self, R: np.ndarray, origin: np.ndarray):
+        Idempotent — silently does nothing if the DB already has a row
+        for vitpose, or if no legacy file exists.
+        """
         try:
-            import rtoml
-            rig_path = self._get_camera_rig_path()
-            if rig_path is None:
+            from ..config import load_view_transform, save_view_transform
+            if load_view_transform("vitpose") is not None:
                 return
-            data = {}
-            if rig_path.exists():
-                data = rtoml.load(rig_path)
-            data["body_transform"] = {
-                "rotation": R.flatten().tolist(),
-                "origin_world": origin.tolist(),
-                "description": "World-to-body transform: R rotates world axes to body axes, origin is L_Ankle in world coords",
-            }
-            with open(rig_path, "w") as f:
-                rtoml.dump(data, f)
-        except Exception:
-            pass
-
-    def _load_view_transform(self):
-        try:
             import rtoml
             rig_path = self._get_camera_rig_path()
             if rig_path is None or not rig_path.exists():
                 return
             data = rtoml.load(rig_path)
             lv = data.get("live_view", {})
-            if "transform" in lv:
-                T = np.array(lv["transform"]).reshape(4, 4)
-                has_origin = bool(lv.get("has_origin", False))
-                if not has_origin:
-                    self._view_rotation = T
-                self._view_has_origin = has_origin
-                self.skeleton_view.set_view_transform(T, has_origin=has_origin)
+            if "transform" not in lv:
+                return
+            T = np.array(lv["transform"]).reshape(4, 4)
+            R = T[:3, :3]
+            t = T[:3, 3]
+            save_view_transform(
+                "vitpose", R, t, bool(lv.get("has_origin", False)),
+            )
+        except Exception:
+            pass
+
+    def _save_view_transform(self, T: np.ndarray, has_origin: bool = False):
+        """Persist the current transform under the active model key."""
+        try:
+            from ..config import save_view_transform
+            R = T[:3, :3]
+            t = T[:3, 3]
+            save_view_transform(
+                self._current_model_key(), R, t, has_origin,
+            )
+        except Exception:
+            pass
+
+    def _save_body_transform(self, R: np.ndarray, origin: np.ndarray):
+        """No-op kept as a stub for callers.
+
+        The body-frame transform used by `_run_workout_analysis` is now
+        derived from the same per-model preset row written by
+        `_save_view_transform` — there's no separate "body_transform"
+        anymore.
+        """
+        return
+
+    def _load_view_transform(self, model_key: str | None = None):
+        """Apply the saved (R, t) for `model_key` to the live skeleton view.
+
+        Falls back to identity (rotate-only with no transform) when no
+        preset exists for that model — the user has to press Rotate /
+        Zero once for any model they haven't trained yet.
+        """
+        if model_key is None:
+            model_key = self._current_model_key()
+        # Lazy migration so existing setups don't lose their preset.
+        self._migrate_legacy_view_transform()
+        try:
+            from ..config import load_view_transform
+            loaded = load_view_transform(model_key)
+        except Exception:
+            loaded = None
+
+        T = np.eye(4)
+        has_origin = False
+        if loaded is not None:
+            R, t, has_origin = loaded
+            T[:3, :3] = R
+            T[:3, 3] = t
+            if not has_origin:
+                self._view_rotation = T
+            else:
+                # Restore the rotation-only matrix too so a subsequent
+                # zero-press has the right base rotation to compose with.
+                self._view_rotation = np.eye(4)
+                self._view_rotation[:3, :3] = R
+                # Carry forward zero info so the next session_save records
+                # the active zero, not a stale one from a previous model.
+                self._zero_origin_rotation = R.copy()
+                self._zero_origin_translation = t.copy()
+        else:
+            self._view_rotation = np.eye(4)
+            self._zero_origin_rotation = None
+            self._zero_origin_translation = None
+
+        self._view_has_origin = has_origin
+        try:
+            self.skeleton_view.set_view_transform(T, has_origin=has_origin)
         except Exception:
             pass
 
     # ── Calibration ──
 
     def _check_calibration(self):
+        """Run the legacy TOML→DB migration and clear current calibration state.
+
+        The actual extrinsic-session lookup is deferred to _resolve_calibration_for_serials,
+        which runs once we know which cameras are physically plugged in (the
+        match is by exact serial set).
+        """
         self._calibration_available = False
         self._calibration_path = None
         self._calibrated_cameras = None
         self._calibration_session_id = None
         self._calibration_session_created_at = None
+        self._calibration_serials_unmatched: set[str] | None = None
 
         try:
             from ..config import (
                 load_app_settings,
-                load_latest_extrinsic_session,
                 list_extrinsic_sessions,
                 import_calibration_toml_into_db,
             )
@@ -2328,15 +2809,100 @@ class WorkoutPage(QWidget):
                             # Migration failures should not block live load —
                             # the session-folder TOMLs are still on disk.
                             pass
+        except Exception:
+            pass
 
+        self._update_cal_status()
+        self._update_record_enabled()
+
+        # Optimistic pre-login preview: if any extrinsic exists in the DB,
+        # show its date instead of "No extrinsic — use Tools → Calibration".
+        # The real binding (which session, which plugged-in cameras) is
+        # resolved on login by _resolve_calibration_for_serials and will
+        # overwrite this label.
+        try:
+            from ..config import load_latest_extrinsic_session
             latest = load_latest_extrinsic_session()
             if latest is not None:
-                session_id, created_at, cameras = latest
-                if cameras:
-                    self._calibration_available = True
-                    self._calibration_session_id = session_id
-                    self._calibration_session_created_at = created_at
-                    self._calibrated_cameras = cameras
+                _, created_at, cameras = latest
+                n = len(cameras) if cameras else 0
+                date_part = ""
+                time_part = ""
+                if created_at and len(created_at) >= 19 and created_at[10] == " ":
+                    date_part = created_at[:10]
+                    time_part = created_at[11:19]
+                if hasattr(self, "user_cal_status"):
+                    if date_part:
+                        text = (
+                            f"Last extrinsic: {date_part} {time_part}  "
+                            f"({n} cameras) — log in to bind"
+                        )
+                    else:
+                        text = f"Last extrinsic ({n} cameras) — log in to bind"
+                    self.user_cal_status.setText(text)
+                    self.user_cal_status.setStyleSheet(
+                        "color: #888; font-size: 11px;"
+                    )
+        except Exception:
+            pass
+
+    def _resolve_calibration_for_serials(self, serials):
+        """Look up an extrinsic session for the plugged-in cameras.
+
+        Matching strategy:
+        1. Exact match — newest session whose camera-serial set equals
+           `serials` exactly. Preferred when the user plugs in exactly the
+           cameras they last calibrated.
+        2. Subset fallback — newest session whose calibrated serials are
+           ALL present among the plugged-in cameras. Lets the operator plug
+           in extra (uncalibrated) cameras and still recover the most
+           recent extrinsic for the calibrated subset. The plugged-in
+           cameras outside the calibrated set are dropped from the
+           recording set by `_on_cameras_found` (they aren't in
+           `cal_serial_to_port`).
+        """
+        self._calibration_available = False
+        self._calibration_path = None
+        self._calibrated_cameras = None
+        self._calibration_session_id = None
+        self._calibration_session_created_at = None
+        self._calibration_serials_unmatched = None
+
+        target = {str(s) for s in serials if s}
+        if not target:
+            self._update_cal_status()
+            self._update_record_enabled()
+            return
+
+        match = None
+        try:
+            from ..config import (
+                find_extrinsic_session_by_serials,
+                list_extrinsic_sessions,
+                load_extrinsic_session,
+            )
+            match = find_extrinsic_session_by_serials(target)
+            if match is None:
+                # Subset fallback: walk sessions newest-first and pick the
+                # first whose serials are all present in `target`.
+                for sess in list_extrinsic_sessions():
+                    loaded = load_extrinsic_session(int(sess["id"]))
+                    if loaded is None:
+                        continue
+                    created_at, cameras = loaded
+                    sess_serials = {c.serial_number for c in cameras.values()}
+                    if sess_serials and sess_serials.issubset(target):
+                        match = (int(sess["id"]), created_at, cameras)
+                        break
+
+            if match is not None:
+                session_id, created_at, cameras = match
+                self._calibration_available = True
+                self._calibration_session_id = session_id
+                self._calibration_session_created_at = created_at
+                self._calibrated_cameras = cameras
+            else:
+                self._calibration_serials_unmatched = target
         except Exception:
             pass
 
@@ -2388,11 +2954,22 @@ class WorkoutPage(QWidget):
         else:
             if hasattr(self, "user_cal_status"):
                 self.user_cal_status.setText("No extrinsic \u2014 use Tools → Calibration")
+                if hasattr(self, "_calibration_serials_unmatched") and self._calibration_serials_unmatched:
+                    n = len(self._calibration_serials_unmatched)
+                    self.user_cal_status.setText(
+                        f"No extrinsic for this {n}-camera set"
+                    )
                 self.user_cal_status.setStyleSheet(
                     "color: #FF5252; font-size: 11px; font-weight: bold;"
                 )
             if hasattr(self, "cal_status"):
-                self.cal_status.setText("No extrinsic")
+                unmatched = getattr(self, "_calibration_serials_unmatched", None)
+                if unmatched:
+                    self.cal_status.setText(
+                        f"No extrinsic for this {len(unmatched)}-camera set"
+                    )
+                else:
+                    self.cal_status.setText("No extrinsic")
                 self.cal_status.setStyleSheet("color: #FF5252; font-weight: bold;")
 
     def _update_record_enabled(self):
@@ -2421,6 +2998,52 @@ class WorkoutPage(QWidget):
                 self.recording_worker.running = False
             return
 
+        # Cancel an in-progress countdown if the user clicks again.
+        if getattr(self, "_record_countdown_timer", None) is not None:
+            self._record_countdown_timer.stop()
+            self._record_countdown_timer.deleteLater()
+            self._record_countdown_timer = None
+            if hasattr(self, "_record_btn_original_text"):
+                self.record_btn.setText(self._record_btn_original_text)
+            self.status_message.emit("Recording cancelled")
+            return
+
+        # Pre-roll countdown — gives the user time to walk into the capture
+        # volume before the camera buffer actually starts. Click again to
+        # cancel.
+        self._record_btn_original_text = self.record_btn.text()
+        self._record_countdown_remaining = 3
+        self.record_btn.setText(
+            f"Starting in {self._record_countdown_remaining}s... (click to cancel)"
+        )
+        self.status_message.emit(
+            f"Recording starts in {self._record_countdown_remaining}s"
+        )
+        self._record_countdown_timer = QTimer(self)
+        self._record_countdown_timer.timeout.connect(self._record_countdown_tick)
+        self._record_countdown_timer.start(1000)
+
+    def _record_countdown_tick(self):
+        self._record_countdown_remaining -= 1
+        if self._record_countdown_remaining > 0:
+            self.record_btn.setText(
+                f"Starting in {self._record_countdown_remaining}s... "
+                f"(click to cancel)"
+            )
+            self.status_message.emit(
+                f"Recording starts in {self._record_countdown_remaining}s"
+            )
+            return
+        # Countdown done — drop the timer and kick off the real recording.
+        if self._record_countdown_timer is not None:
+            self._record_countdown_timer.stop()
+            self._record_countdown_timer.deleteLater()
+            self._record_countdown_timer = None
+        if hasattr(self, "_record_btn_original_text"):
+            self.record_btn.setText(self._record_btn_original_text)
+        self._begin_recording_now()
+
+    def _begin_recording_now(self):
         from datetime import datetime
 
         workout_dir = self._get_workout_dir()
@@ -2456,7 +3079,32 @@ class WorkoutPage(QWidget):
 
         self._is_recording = True
         self._recording_keypoints = []
+        self._record_arrivals = {}
         self._recording_start_time = time.perf_counter()
+
+        # Snapshot the active view transform so the npz written at the end
+        # of this trial has detection points already rotated + zeroed
+        # (downstream consumers want body-frame coords, not camera frame).
+        # Snapshot at record-time, NOT at finish-time, so a mid-trial
+        # re-zero wouldn't change what gets written. Re-orthonormalisation
+        # happens inside write_raw_buffer.
+        #
+        # Source of truth: when zero has been pressed, the (R, t) we want
+        # is _zero_origin_rotation/_zero_origin_translation — those are
+        # the values _compute_zero_origin actually maintains AND what the
+        # DB roundtrip preserves. _view_rotation only ever holds the
+        # rotation-only matrix; its translation column stays zero even
+        # after Zero is pressed, so reading translation from it gives the
+        # wrong answer (rotated keypoints with no offset = ankles at z≈3).
+        if self._view_has_origin and self._zero_origin_rotation is not None \
+                and self._zero_origin_translation is not None:
+            R_snap = np.asarray(self._zero_origin_rotation, dtype=np.float64).copy()
+            t_snap = np.asarray(self._zero_origin_translation, dtype=np.float64).copy()
+        else:
+            R_snap = self._view_rotation[:3, :3].copy()
+            t_snap = np.zeros(3)
+        self._recording_view_R = R_snap
+        self._recording_view_t = t_snap
         # Drop footstep history from the previous session so the overlay
         # reflects only the current recording.
         self.skeleton_view.clear_footsteps()
@@ -2474,8 +3122,19 @@ class WorkoutPage(QWidget):
             self.pause_tracking_during_record_checkbox.isChecked()
         )
         if self._tracking_paused_for_recording:
-            if self.detection_worker is not None:
-                self._stop_detection()
+            # Pause the worker (don't tear it down) so the user gets the
+            # full frame budget for the camera reads, but the multi-second
+            # YOLO + VitPose load isn't paid again on resume. If the
+            # worker class doesn't expose pause/resume (shouldn't happen
+            # — all current backends do), fall back to a real stop so
+            # detection actually halts; silently no-op'ing means the user
+            # sees no perf benefit at all.
+            worker = self.detection_worker
+            if worker is not None:
+                if hasattr(worker, "pause"):
+                    worker.pause()
+                else:
+                    self._stop_detection()
         else:
             # Ensure detection is running for 3D keypoint collection
             if self.detection_worker is None and self._calibrated_cameras is not None:
@@ -2501,6 +3160,17 @@ class WorkoutPage(QWidget):
         if self.detection_worker is not None:
             self.detection_worker.submit_frame(port, pixels)
 
+        # Track per-port arrival times for the post-recording stats and
+        # push to the live FPS graph.
+        now = time.perf_counter()
+        self._record_arrivals.setdefault(port, []).append(now)
+        prev = self._last_frame_time.get(port)
+        if prev is not None:
+            dt = now - prev
+            if dt > 0:
+                self.fps_graph.push_fps(port, 1.0 / dt)
+        self._last_frame_time[port] = now
+
     def _on_record_progress(self, current: int, total: int):
         elapsed = current / max(self._target_fps, 1)
         remaining = (total - current) / max(self._target_fps, 1)
@@ -2515,25 +3185,43 @@ class WorkoutPage(QWidget):
         keypoints_3d.raw.npz and per-person CSVs to the session dir.
         """
         if self._current_session_dir is None or self._calibrated_cameras is None:
+            self._offline_csv_pending = False
             return
-        # Build port -> video path. Recording writes port_N.mp4 by convention.
+        # Build port -> video path. RecordingWorker writes
+        # port_{N}_{sanitized_serial}.mp4; older sessions used port_{N}.mp4.
+        # find_video_for_port checks both, so paused-tracking trials work
+        # regardless of which generation produced the videos.
+        from .video_utils import find_video_for_port
         session_dir = self._current_session_dir
         port_to_video = {}
         for port in self.opened_ports:
-            mp4 = session_dir / f"port_{port}.mp4"
-            if mp4.exists():
-                port_to_video[port] = mp4
+            cam = self.state_manager.state.cameras.get(port)
+            serial = getattr(cam.info, "serial_number", None) if cam else None
+            video = find_video_for_port(session_dir, port, serial=serial)
+            if video is not None:
+                port_to_video[port] = video
         if not port_to_video:
-            self.status_message.emit(
-                "Offline processing skipped: no port_*.mp4 files found"
+            msg = (
+                f"Offline processing skipped: no port_*.mp4 found in "
+                f"{session_dir.name}"
             )
+            print(msg, flush=True)
+            self.status_message.emit(msg)
+            # Clear the pending flag — without this, the next successful
+            # offline run would inherit stale state and fire CSV/analysis
+            # against the wrong session.
+            self._offline_csv_pending = False
             return
 
         frame_time_csv = session_dir / "frame_time_history.csv"
         if not frame_time_csv.exists():
-            self.status_message.emit(
-                "Offline processing skipped: frame_time_history.csv missing"
+            msg = (
+                f"Offline processing skipped: frame_time_history.csv "
+                f"missing in {session_dir.name}"
             )
+            print(msg, flush=True)
+            self.status_message.emit(msg)
+            self._offline_csv_pending = False
             return
 
         cameras = self._normalize_calibrated_cameras(self._calibrated_cameras)
@@ -2550,14 +3238,45 @@ class WorkoutPage(QWidget):
         except Exception:
             pass
 
-        from .workers import OfflineProcessingWorker
-        self._offline_worker = OfflineProcessingWorker(
-            session_dir=session_dir,
-            cameras=cameras,
-            port_to_video=port_to_video,
-            frame_time_csv=frame_time_csv,
-            batch_size=batch_size,
-        )
+        # Pick the unified-offline worker by default so the offline path
+        # shares the live pipeline's primitives (and therefore its
+        # tracker config + person-confidence default + fragmentation
+        # behaviour). Setting CALIMERGE_LEGACY_OFFLINE=1 falls back to
+        # the deprecated batch-mode worker — useful while the unified
+        # path is still being validated against real recordings on
+        # CUDA / MPS hosts. See unified_offline_worker.py header.
+        import os
+        use_legacy = bool(os.environ.get("CALIMERGE_LEGACY_OFFLINE"))
+
+        if use_legacy:
+            from .workers import OfflineProcessingWorker
+            self._offline_worker = OfflineProcessingWorker(
+                session_dir=session_dir,
+                cameras=cameras,
+                port_to_video=port_to_video,
+                frame_time_csv=frame_time_csv,
+                batch_size=batch_size,
+                view_rotation=getattr(self, "_recording_view_R", None),
+                view_translation=getattr(self, "_recording_view_t", None),
+            )
+        else:
+            from .unified_offline_worker import UnifiedOfflineWorker
+            # Use the same backend the user picked for the live path.
+            # Offline-only fallback: when no extrinsics are available
+            # _start_detection picks pytorch (the only backend that works
+            # without calibration), so do the same here.
+            backend = self.detect_backend_combo.currentData() or "pytorch"
+            self._offline_worker = UnifiedOfflineWorker(
+                session_dir=session_dir,
+                cameras=cameras,
+                port_to_video=port_to_video,
+                frame_time_csv=frame_time_csv,
+                backend=backend,
+                view_rotation=getattr(self, "_recording_view_R", None),
+                view_translation=getattr(self, "_recording_view_t", None),
+                batch_size=batch_size,
+                person_confidence=self._current_person_confidence(),
+            )
         self._offline_worker.progress.connect(self._on_offline_progress)
         self._offline_worker.log_message.connect(self._on_offline_log)
         self._offline_worker.finished_ok.connect(self._on_offline_finished)
@@ -2586,14 +3305,208 @@ class WorkoutPage(QWidget):
         QTimer.singleShot(4000, self._hide_offline_progress)
         self._offline_worker = None
 
+        # If the trial that triggered this offline run had pause-tracking on
+        # AND "Generate CSV after save" enabled, the in-memory keypoint
+        # buffer is empty and _handle_csv_export already early-returned.
+        # Now that the offline worker has written keypoints_3d.raw.npz, fan
+        # out a CSV worker pointed at that file.
+        if getattr(self, "_offline_csv_pending", False):
+            self._offline_csv_pending = False
+            sd = getattr(self, "_offline_csv_session_dir", None) or Path(session_dir)
+            session_id = getattr(self, "_offline_csv_session_id", None)
+            cal_path = getattr(self, "_offline_csv_calibration_path", None)
+            backend, model_name = self._detection_model_label()
+            try:
+                self._spawn_csv_worker(
+                    session_dir=sd,
+                    buffer=None,  # forces the worker to read raw_buffer_path
+                    session_id=session_id,
+                    model_backend=backend,
+                    model_name=model_name,
+                    calibration_path=cal_path,
+                )
+                self.status_message.emit(
+                    f"Generating CSV from offline keypoints for {Path(sd).name}"
+                )
+            except Exception as e:
+                self.status_message.emit(f"CSV export from offline failed: {e}")
+
+            # Run workout analysis on the keypoints just written. The npz
+            # holds points in view frame (R+t already applied during write),
+            # so pass already_in_view_frame=True to skip the body-transform
+            # step inside _run_workout_analysis.
+            try:
+                from ..keypoint_export import read_raw_buffer, RAW_FILENAME
+                buf = read_raw_buffer(Path(sd) / RAW_FILENAME)
+                if buf:
+                    self._run_workout_analysis(
+                        session_id, buffer=buf, already_in_view_frame=True,
+                    )
+            except Exception as e:
+                self.status_message.emit(
+                    f"Analysis from offline keypoints failed: {e}"
+                )
+
     def _on_offline_failed(self, error: str):
         self.offline_status_label.setText(f"Offline processing failed: {error[:200]}")
         self.offline_progress_bar.setValue(0)
         QTimer.singleShot(8000, self._hide_offline_progress)
         self._offline_worker = None
+        # Don't leave the pending flag set — otherwise the next offline run
+        # (different trial) would erroneously trigger a CSV from stale state.
+        self._offline_csv_pending = False
 
     def _hide_offline_progress(self):
         self.offline_progress_container.setVisible(False)
+
+    def _report_recording_stats(self):
+        """Print + status-bar framerate stats for the just-finished trial.
+
+        Source priority: prefer the per-port frame timestamps written by
+        RecordingWorker into frame_time_history.csv — those reflect the
+        actual capture loop, including any frames the loop dropped. The
+        GUI-receipt timestamps (self._record_arrivals) are a fallback;
+        they're measured at signal-delivery time on a rate-limited
+        producer, so they look like a metronome (always ≈ target fps)
+        and don't actually reveal capture problems.
+
+        Also reports detection rate when a detection worker was active,
+        since that's usually where slowdowns hit.
+        """
+        msg_parts: list[str] = []
+
+        # ── Capture rate from frame_time_history.csv (authoritative) ──
+        capture_block = self._capture_stats_from_csv()
+        if capture_block is None:
+            # Fall back to GUI-receipt timing only when the CSV is missing
+            # (e.g. recording aborted before _save_frame_times).
+            capture_block = self._capture_stats_from_arrivals()
+        if capture_block is not None:
+            msg_parts.append(capture_block)
+
+        # ── Detection rate (if detection ran during the trial) ──
+        if self._recording_keypoints:
+            n = len(self._recording_keypoints)
+            t0 = float(self._recording_keypoints[0].get("time", 0.0))
+            t1 = float(self._recording_keypoints[-1].get("time", 0.0))
+            elapsed = t1 - t0
+            if elapsed > 0 and n > 1:
+                det_fps = (n - 1) / elapsed
+                msg_parts.append(
+                    f"detection: {n} frames over {elapsed:.1f}s "
+                    f"= {det_fps:.1f} fps"
+                )
+            else:
+                msg_parts.append(f"detection: {n} frames")
+        else:
+            paused = bool(getattr(self, "_tracking_paused_for_recording", False))
+            msg_parts.append(
+                "detection: paused" if paused else "detection: 0 frames"
+            )
+
+        if not msg_parts:
+            return
+        long_msg = "Recording stats — " + "; ".join(msg_parts)
+        print(long_msg, flush=True)
+        self.status_message.emit(long_msg)
+
+    def _capture_stats_from_csv(self) -> str | None:
+        """Per-port capture-rate summary from frame_time_history.csv."""
+        if self._current_session_dir is None:
+            return None
+        csv_path = self._current_session_dir / "frame_time_history.csv"
+        if not csv_path.exists():
+            return None
+        # CSV columns (after a single comment line): sync_index, port,
+        # frame_index, frame_time. frame_time = perf_counter offset from
+        # recording start, so per-port np.diff(...) gives real inter-frame
+        # gaps including any frame-loop overruns.
+        try:
+            import csv as _csv
+            per_port: dict[int, list[float]] = {}
+            with open(csv_path, "r", newline="") as f:
+                # Skip leading "# cameras: ..." comment line.
+                first = f.readline()
+                if not first.startswith("#"):
+                    f.seek(0)
+                reader = _csv.reader(f)
+                header = next(reader, None)
+                if header is None:
+                    return None
+                for row in reader:
+                    if len(row) < 4:
+                        continue
+                    try:
+                        port = int(row[1])
+                        ft = float(row[3])
+                    except (ValueError, IndexError):
+                        continue
+                    per_port.setdefault(port, []).append(ft)
+        except Exception:
+            return None
+
+        all_dts: list[float] = []
+        per_port_summary: list[str] = []
+        for port in sorted(per_port):
+            times = np.asarray(per_port[port], dtype=float)
+            if times.size < 2:
+                continue
+            dts = np.diff(times)
+            if dts.size == 0:
+                continue
+            all_dts.extend(dts.tolist())
+            per_port_summary.append(
+                f"port {port}: {1.0 / dts.mean():.1f} fps "
+                f"(max dt {dts.max() * 1000:.1f} ms)"
+            )
+
+        if not all_dts:
+            return None
+        a = np.asarray(all_dts, dtype=float)
+        avg_dt = float(a.mean())
+        median_dt = float(np.median(a))
+        max_dt = float(a.max())
+        avg_fps = 1.0 / avg_dt if avg_dt > 0 else 0.0
+        median_fps = 1.0 / median_dt if median_dt > 0 else 0.0
+        return (
+            f"capture (from frame_time_history.csv) avg dt "
+            f"{avg_dt * 1000:.1f} ms ({avg_fps:.1f} fps), median "
+            f"{median_fps:.1f} fps, max dt {max_dt * 1000:.1f} ms; "
+            + ", ".join(per_port_summary)
+        )
+
+    def _capture_stats_from_arrivals(self) -> str | None:
+        """Fallback: use GUI-receipt timestamps when no CSV is available.
+
+        These are measured on a rate-limited producer so they tend to
+        report exactly the target rate even if real capture is unhealthy
+        — which is why the CSV is preferred. We surface the source so the
+        user knows which path produced the numbers.
+        """
+        all_dts: list[float] = []
+        per_port_summary: list[str] = []
+        for port in sorted(self._record_arrivals.keys()):
+            arrs = self._record_arrivals[port]
+            if len(arrs) < 2:
+                continue
+            arr = np.asarray(arrs, dtype=float)
+            dts = np.diff(arr)
+            if dts.size == 0:
+                continue
+            all_dts.extend(dts.tolist())
+            per_port_summary.append(f"port {port}: {1.0 / dts.mean():.1f} fps")
+        if not all_dts:
+            return None
+        a = np.asarray(all_dts, dtype=float)
+        avg_dt = float(a.mean())
+        median_dt = float(np.median(a))
+        max_dt = float(a.max())
+        return (
+            f"capture (GUI-receipt fallback) avg dt {avg_dt * 1000:.1f} ms "
+            f"({1.0 / avg_dt:.1f} fps), median {1.0 / median_dt:.1f} fps, "
+            f"max dt {max_dt * 1000:.1f} ms; "
+            + ", ".join(per_port_summary)
+        )
 
     def _on_record_finished(self, stats: dict):
         self._is_recording = False
@@ -2601,34 +3514,68 @@ class WorkoutPage(QWidget):
         self.record_btn.setText("Record Workout")
         self._update_record_enabled()
 
+        # Live capture stats — printed before any heavier post-processing so
+        # the user gets immediate framerate feedback when iterating on
+        # tracking performance. Stats are aggregated across all ports
+        # (per-frame deltas concatenated) since cameras are sync-captured;
+        # divergent ports show up as a single fat tail in max delta.
+        self._report_recording_stats()
+
         # Resume preview
         if self.preview_worker:
             self.preview_worker.resume()
 
         # If detection was paused for the recording, bring it back so the
-        # live skeleton view starts updating again.
+        # live skeleton view starts updating again. With the pause/resume
+        # path the worker is still alive — just resume it; only fall back
+        # to a full _start_detection if the worker is actually gone (e.g.
+        # the user disabled detection entirely during the recording, or
+        # the worker class lacks resume).
         was_paused = bool(getattr(self, "_tracking_paused_for_recording", False))
         if was_paused:
             self._tracking_paused_for_recording = False
-            if self.detect_checkbox.isChecked() and self.detection_worker is None:
-                self._start_detection()
+            if self.detect_checkbox.isChecked():
+                worker = self.detection_worker
+                if worker is not None and hasattr(worker, "resume"):
+                    worker.resume()
+                else:
+                    # Worker is gone OR doesn't support resume — start fresh.
+                    if worker is None:
+                        self._start_detection()
 
         # If tracking was paused during recording, the live keypoint buffer
         # is empty (or near-empty). Kick off offline post-processing on the
         # saved video files so the user still gets a CSV. Only fires when
-        # the user has 'Generate CSV after save' on.
+        # the user has 'Generate CSV after save' on. The CSV worker is
+        # spawned in _on_offline_finished, reading from the freshly
+        # written keypoints_3d.raw.npz on disk (since the in-memory
+        # buffer is empty in this code path).
+        self._offline_csv_pending = False
         if was_paused and self.generate_csv_checkbox.isChecked():
+            self._offline_csv_pending = True
             self._start_offline_processing()
 
-        # Save 3D keypoints to binary file alongside the videos
+        # Save 3D keypoints to binary file alongside the videos. The
+        # record-time view transform snapshot is forwarded so this npz
+        # matches the keypoints_3d.raw.npz the CSV worker writes — both
+        # land in body/hand frame, with the inverse transform recorded
+        # so consumers can recover camera coords if needed. Without
+        # this, the notebook (test_output.ipynb) loaded the .npz file
+        # and saw camera-frame coords (ankle z ≈ 2-3 m) while the live
+        # display showed body-frame (ankle z ≈ 0).
         kps_file = None
         if self._recording_keypoints:
             try:
                 from ..analysis.keypoints_io import save_keypoints_3d
                 kps_file = self._current_session_dir / "keypoints_3d.npz"
+                _save_backend, _save_model_name = self._detection_model_label()
                 save_keypoints_3d(
                     kps_file, self._recording_keypoints,
                     primary_person_index=self._primary_person_index,
+                    view_rotation=getattr(self, "_recording_view_R", None),
+                    view_translation=getattr(self, "_recording_view_t", None),
+                    model_backend=_save_backend,
+                    model_name=_save_model_name,
                 )
             except Exception as e:
                 self.status_message.emit(f"Failed to save keypoints: {e}")
@@ -2656,6 +3603,7 @@ class WorkoutPage(QWidget):
                 # Count sets already recorded in the current program week
                 set_number = self._next_set_number_for_current_exercise()
 
+            _sess_backend, _sess_model_name = self._detection_model_label()
             session_id = create_session(
                 user_id=self._current_user_id,
                 workout_type=self._current_workout_type,
@@ -2669,6 +3617,8 @@ class WorkoutPage(QWidget):
                 extrinsic_calibrated_at=self._calibration_session_created_at,
                 zero_origin_rotation=self._zero_origin_rotation,
                 zero_origin_translation=self._zero_origin_translation,
+                model_backend=_sess_backend,
+                model_name=_sess_model_name,
             )
             sync_count = stats.get("sync_count", 0)
             self.status_message.emit(
@@ -2676,6 +3626,19 @@ class WorkoutPage(QWidget):
             )
         except Exception as e:
             self.status_message.emit(f"Recording saved but DB write failed: {e}")
+
+        # If we kicked off offline processing for this trial (paused-tracking
+        # path), the offline worker is the one that produces the raw
+        # keypoint buffer — so the CSV worker has to wait for it. Stash
+        # session_id + session_dir + calibration_path here so
+        # _on_offline_finished can spawn the CSV worker once the npz is on
+        # disk.
+        if getattr(self, "_offline_csv_pending", False):
+            self._offline_csv_session_id = session_id
+            self._offline_csv_session_dir = self._current_session_dir
+            self._offline_csv_calibration_path = (
+                str(self._calibration_path) if self._calibration_path else None
+            )
 
         # Refresh the Today's Plan counts and button label
         self._refresh_todays_plan()
@@ -2779,7 +3742,10 @@ class WorkoutPage(QWidget):
         backend, model_name = self._detection_model_label()
         # Always persist the raw buffer alongside the videos. This lets a
         # queued job survive a process restart, AND gives the immediate
-        # path a recovery point if the worker crashes.
+        # path a recovery point if the worker crashes. The snapshotted
+        # view transform (R, t) is forwarded so the keypoints in the npz
+        # are already in body/hand frame and the inverse transform is
+        # recorded for consumers that want camera coords.
         history_path = session_dir / FRAME_TIME_HISTORY_FILENAME
         try:
             write_raw_buffer(
@@ -2788,6 +3754,10 @@ class WorkoutPage(QWidget):
                 frame_time_history_path=(
                     history_path if history_path.exists() else None
                 ),
+                view_rotation=getattr(self, "_recording_view_R", None),
+                view_translation=getattr(self, "_recording_view_t", None),
+                model_backend=backend,
+                model_name=model_name,
             )
         except Exception as e:
             self.status_message.emit(f"Failed to dump raw keypoints: {e}")
@@ -2798,9 +3768,19 @@ class WorkoutPage(QWidget):
         cal_path = str(self._calibration_path) if self._calibration_path else None
 
         if immediate:
+            # Pass buffer=None so the CSV worker reads from the
+            # raw_buffer_path npz we just wrote — that file has the
+            # view transform (rotate-to-human + zero) ALREADY applied
+            # by write_raw_buffer. The in-memory _recording_keypoints
+            # is still in CAMERA frame (the detection worker emits raw
+            # 3D, _on_keypoints_3d appends it without transforming),
+            # so handing that buffer to the worker would write a CSV
+            # in camera frame while the npz was in view frame — that's
+            # how ankle showed up at ~2.4 m in the CSV but ~0 m in
+            # the live view + npz.
             self._spawn_csv_worker(
                 session_dir=session_dir,
-                buffer=list(self._recording_keypoints),
+                buffer=None,
                 session_id=session_id,
                 model_backend=backend,
                 model_name=model_name,
@@ -2884,12 +3864,27 @@ class WorkoutPage(QWidget):
         worker.finished_ok.connect(_ok)
         worker.failed.connect(_fail)
         worker.progress.connect(_progress)
+        # Belt-and-braces cleanup: the worker holds a full keypoint
+        # buffer + (potentially) detector model refs, so if it raises
+        # before either finished_ok or failed fires, the entry pinned
+        # in self._csv_workers leaks the entire blob. Hook QThread's
+        # built-in finished signal too — that fires unconditionally
+        # when run() returns, success or exception.
+        worker.finished.connect(lambda w=worker: self._cleanup_csv_worker(w))
         worker.start()
 
     def _cleanup_csv_worker(self, worker):
         try:
             if hasattr(self, "_csv_workers") and worker in self._csv_workers:
                 self._csv_workers.remove(worker)
+        except Exception:
+            pass
+        # Schedule the QThread for deletion so its event loop + ref to
+        # the keypoint buffer go away. deleteLater is the Qt-safe way:
+        # the object stays alive until the next event-loop iteration,
+        # then dies.
+        try:
+            worker.deleteLater()
         except Exception:
             pass
 
@@ -3140,26 +4135,59 @@ class WorkoutPage(QWidget):
         rec_name = Path(session["recording_path"]).name if session.get("recording_path") else ""
         self.status_message.emit(f"Loaded analysis for {rec_name}")
 
-    def _run_workout_analysis(self, session_id: int | None):
-        """Analyze collected 3D keypoints after recording."""
-        if not self._recording_keypoints:
+    def _run_workout_analysis(
+        self,
+        session_id: int | None,
+        buffer: list[dict] | None = None,
+        already_in_view_frame: bool = False,
+    ):
+        """Analyze collected 3D keypoints after recording.
+
+        Parameters
+        ----------
+        session_id : int | None
+            Workouts.db row id to attach metrics to.
+        buffer : list[dict] | None
+            Override input. Defaults to ``self._recording_keypoints``;
+            pass an explicit buffer when running on data loaded from a
+            just-written keypoints_3d.raw.npz (paused-tracking offline
+            path).
+        already_in_view_frame : bool
+            When True, skip the body_R/body_origin transform — points
+            are already in the user-zeroed view frame (the offline npz
+            stores them that way after the view-transform-in-write
+            change). When False (in-memory live buffer), apply the
+            body transform as before.
+        """
+        if buffer is None:
+            buffer = self._recording_keypoints
+        if not buffer:
             self.status_message.emit("No 3D keypoints collected — was Live Detection enabled?")
             return
 
-        # Load body transform if available (for body-centred coordinates)
+        # Body-centred coordinates: when the buffer is in camera frame
+        # (live path), apply the active model's saved (R, t) from the
+        # view-transform DB. When already_in_view_frame is True, the
+        # buffer is already there — leave the transform as identity so
+        # we don't double-apply.
         body_R = None
         body_origin = None
-        try:
-            import rtoml
-            rig_path = self._get_camera_rig_path()
-            if rig_path and rig_path.exists():
-                data = rtoml.load(rig_path)
-                bt = data.get("body_transform", {})
-                if "rotation" in bt and "origin_world" in bt:
-                    body_R = np.array(bt["rotation"]).reshape(3, 3)
-                    body_origin = np.array(bt["origin_world"])
-        except Exception:
-            pass
+        if not already_in_view_frame:
+            try:
+                from ..config import load_view_transform
+                preset = load_view_transform(self._current_model_key())
+                if preset is not None:
+                    R_view, t_view, has_origin = preset
+                    if has_origin:
+                        # _run_workout_analysis expects the form
+                        #     p_body = R @ (p - origin)
+                        # whereas the DB stores
+                        #     p_view = R @ p + t
+                        # i.e. origin = -R^T @ t. Convert.
+                        body_R = R_view
+                        body_origin = -R_view.T @ t_view
+            except Exception:
+                pass
 
         # Extract per-frame signals
         # COCO-17: 0=nose, 5=L_sho, 6=R_sho, 7=L_elb, 8=R_elb, 9=L_wri, 10=R_wri,
@@ -3176,7 +4204,7 @@ class WorkoutPage(QWidget):
         knee_z_max = []
         # Determine which person is the primary subject (closest to origin).
         # Use per-frame primary_index stored by the tracker; fall back to 0.
-        for frame in self._recording_keypoints:
+        for frame in buffer:
             t = frame["time"]
             persons = frame["persons"]
             if not persons:
@@ -3475,33 +4503,48 @@ class WorkoutPage(QWidget):
         self.show_results(result.to_dict())
 
     def show_results(self, results: dict):
+        # Each metric appears in the result dict whether or not it was
+        # actually computed \u2014 analysers leave fields they couldn't fill
+        # set to None (e.g. sit-to-stand on a level-walk recording can't
+        # measure work/power because COM displacement is zero, so
+        # avg_power_watts comes back None). Guarding only on key
+        # presence used to crash with
+        #     TypeError: unsupported format string passed to NoneType.__format__
+        # whenever the user re-ran analysis on a recording that didn't
+        # match the active analyser.
+        def _v(key):
+            """Return the numeric value at `key` if present and not None."""
+            v = results.get(key)
+            return v if v is not None else None
+
         lines = []
-        if "duration_seconds" in results:
-            lines.append(f"TUG duration: {results['duration_seconds']:.2f} s")
-        if "max_head_speed" in results:
-            lines.append(f"Max head speed: {results['max_head_speed']:.2f} m/s")
-        if "rep_count" in results:
-            lines.append(f"Repetitions: {results['rep_count']}")
-        if "total_time_seconds" in results:
-            lines.append(f"Total time: {results['total_time_seconds']:.1f} s")
-        if "per_rep_times" in results and results["per_rep_times"]:
-            avg = sum(results["per_rep_times"]) / len(results["per_rep_times"])
+        if (v := _v("duration_seconds")) is not None:
+            lines.append(f"TUG duration: {v:.2f} s")
+        if (v := _v("max_head_speed")) is not None:
+            lines.append(f"Max head speed: {v:.2f} m/s")
+        if (v := _v("rep_count")) is not None:
+            lines.append(f"Repetitions: {v}")
+        if (v := _v("total_time_seconds")) is not None:
+            lines.append(f"Total time: {v:.1f} s")
+        prt = results.get("per_rep_times")
+        if prt:  # truthy: non-empty list
+            avg = sum(prt) / len(prt)
             lines.append(f"Avg rep time: {avg:.2f} s")
-        if "avg_range_deg" in results:
-            lines.append(f"Avg range: {results['avg_range_deg']:.0f}\u00b0")
-        if "avg_range_m" in results:
-            lines.append(f"Avg range: {results['avg_range_m'] * 100:.0f} cm")
-        if "avg_power_watts" in results:
-            lines.append(f"Avg power: {results['avg_power_watts']:.1f} W")
-        if "work_per_rep_joules" in results:
-            lines.append(f"Work per rep: {results['work_per_rep_joules']:.1f} J")
+        if (v := _v("avg_range_deg")) is not None:
+            lines.append(f"Avg range: {v:.0f}\u00b0")
+        if (v := _v("avg_range_m")) is not None:
+            lines.append(f"Avg range: {v * 100:.0f} cm")
+        if (v := _v("avg_power_watts")) is not None:
+            lines.append(f"Avg power: {v:.1f} W")
+        if (v := _v("work_per_rep_joules")) is not None:
+            lines.append(f"Work per rep: {v:.1f} J")
         # Duration-based (tandem, stretch)
-        if "hold_seconds" in results:
-            lines.append(f"Hold: {results['hold_seconds']:.1f} s")
-        if "stability_fraction" in results:
-            lines.append(f"Stable: {results['stability_fraction'] * 100:.0f}%")
-        if "steadiness" in results:
-            lines.append(f"Steadiness: {results['steadiness'] * 100:.0f}%")
+        if (v := _v("hold_seconds")) is not None:
+            lines.append(f"Hold: {v:.1f} s")
+        if (v := _v("stability_fraction")) is not None:
+            lines.append(f"Stable: {v * 100:.0f}%")
+        if (v := _v("steadiness")) is not None:
+            lines.append(f"Steadiness: {v * 100:.0f}%")
 
         self.results_label.setText("\n".join(lines) if lines else "No results")
         self.results_label.setStyleSheet("color: #FFF; font-size: 16px;")

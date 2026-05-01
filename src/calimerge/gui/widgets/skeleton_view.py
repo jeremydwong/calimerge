@@ -263,12 +263,26 @@ class SkeletonViewWidget(QWidget):
         self.update()
 
     def clear(self) -> None:
+        # Only clears the displayed data — NOT the view transform. The
+        # transform is per-model state owned by the parent page; it
+        # survives detection stop/start and is updated explicitly via
+        # set_view_transform when the user picks a different model. (We
+        # used to reset _view_transform here, which silently wiped the
+        # rotate-to-human + zero settings every time the user switched
+        # backends, so e.g. flipping to CUDA looked like the transform
+        # had never been engaged.)
         self._persons = []
         self._persons_age = []
         self._message = "No detection"
+        self.clear_footsteps()
+        self.update()
+
+    def reset_view_transform(self) -> None:
+        """Explicitly reset the view transform to identity. Use this when
+        the user wants to drop the saved orientation, not when stopping
+        detection."""
         self._has_origin = False
         self._view_transform = _DEFAULT_TRANSFORM.copy()
-        self.clear_footsteps()
         self.update()
 
     def clear_footsteps(self) -> None:

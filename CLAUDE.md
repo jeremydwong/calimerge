@@ -2,6 +2,32 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## No ad-hoc `python -c` for diagnosis
+
+When a bug needs Python to investigate (loading an npz, parsing a CSV,
+checking the shape of a structure, comparing two arrays, etc.), **do not
+run an inline `python -c "..."` from Bash**. Put the diagnostic in a
+real file under `tests/`:
+
+- Permanent checks → a proper `tests/test_*.py`.
+- Throwaway scratch → `tests/test_scratch.py` (overwrite freely) or a
+  fresh `tests/manual/<name>.py` if it's a runner rather than a unit test.
+
+This rule applies even mid-debug-session when "just one quick check"
+feels efficient. The throwaway scripts reproduce; the inline ones don't.
+
+## Active focus
+
+The post-tracking pipeline (offline path: paused-tracking trial -> CUDA batch run -> per-track CSVs -> Python stitcher -> npz/csv) is the area we are actively debugging right now. The headless reproducer for that pipeline is:
+
+- **`tests/manual/run_offline_pipeline_on_test_data.py`**
+
+It runs end-to-end against the fixture in `tests/data/zelda_20260428_151934_fga_horizontal_head_turns/`, using the most recent extrinsic from `extrinsics.db` and the saved `vitpose` view transform from `view_transforms.db`, and prints a final report listing pre-stitch C-track count vs. post-stitch surviving persons + per-survivor hip-COM bbox. **When changing anything in `OfflineProcessingWorker`, `cuda_binding.run_cuda_pipeline`, the C tracker, the view-transform application, or the npz writers, re-run this script and confirm the post-stitch person count is sensible.**
+
+```
+VIRTUAL_ENV= ~/.local/bin/uv run python tests/manual/run_offline_pipeline_on_test_data.py
+```
+
 ## Data integrity (scientific codebase)
 
 Calimerge is a scientific codebase. Recorded keypoints, intrinsics, extrinsics, and any other measurement-derived signal are **raw data** and must be preserved unmodified end-to-end. Filtering, smoothing, interpolation, outlier rejection, debouncing, exponential moving averages, etc. are **lossy and non-invertible** — once applied to the data on disk, the original is gone.

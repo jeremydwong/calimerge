@@ -933,6 +933,62 @@ def load_latest_extrinsic_session(
     return int(row["id"]), created_at, cameras
 
 
+def find_extrinsic_session_by_serials(
+    serials: set[str] | list[str] | tuple[str, ...],
+    db_path: Path | None = None,
+    intrinsics_db: Path | None = None,
+) -> tuple[int, str, dict[int, CalibratedCamera]] | None:
+    """Find the newest extrinsic session whose camera serial set is exactly `serials`.
+
+    Walks sessions newest-first and returns the first one whose serials match
+    the requested set exactly (no extras, no missing). Returns None if no
+    session matches.
+    """
+    target = {str(s) for s in serials}
+    if not target:
+        return None
+
+    if db_path is None:
+        db_path = extrinsics_db_path()
+    if not db_path.exists():
+        return None
+
+    init_extrinsics_db(db_path)
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            """
+            SELECT s.id, s.created_at,
+                   GROUP_CONCAT(c.serial_number) AS serials
+            FROM extrinsic_sessions s
+            JOIN extrinsic_cameras c ON c.session_id = s.id
+            GROUP BY s.id
+            ORDER BY s.created_at DESC, s.id DESC
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    for row in rows:
+        if not row["serials"]:
+            continue
+        session_serials = {s for s in row["serials"].split(",") if s}
+        if session_serials == target:
+            loaded = load_extrinsic_session(
+                int(row["id"]), db_path=db_path, intrinsics_db=intrinsics_db,
+            )
+            if loaded is None:
+                continue
+            created_at, cameras = loaded
+            # Drop in case load_extrinsic_session lost a camera to missing
+            # intrinsics — that would no longer be an exact match.
+            if {c.serial_number for c in cameras.values()} == target:
+                return int(row["id"]), created_at, cameras
+
+    return None
+
+
 def import_calibration_toml_into_db(
     toml_path: Path,
     rmse: float | None = None,
@@ -1071,6 +1127,13 @@ _APP_SETTINGS_DEFAULTS: dict = {
     # ``keypoint_export.make_job_descriptor`` (session_dir, session_id, ...).
     # Persisted here so unprocessed sessions survive a restart.
     "pending_csv_jobs": [],
+    # Detection model + backend last selected on the workout page.
+    # Restored at startup so the user lands in the same configuration
+    # they were using last session.
+    "last_detect_model": "vitpose",        # "vitpose" | "mediapipe_hands"
+    "last_detect_backend": "pytorch",      # "pytorch" | "cuda"
+    # Person-detection confidence slider (0.10 .. 0.95).
+    "last_detect_confidence": 0.50,
 }
 
 
@@ -1234,6 +1297,14 @@ def init_workouts_db(db_path: Path | None = None) -> None:
         conn.execute("ALTER TABLE sessions ADD COLUMN zero_origin_rotation BLOB")
     if "zero_origin_translation" not in session_cols:
         conn.execute("ALTER TABLE sessions ADD COLUMN zero_origin_translation BLOB")
+    # Detection-pipeline provenance: which backend ("pytorch" | "cuda" |
+    # "mps") and which model ("vitpose_synthpose" | "mediapipe_hands" |
+    # ...) produced the keypoints. The schema already had model_version
+    # but it was free-form; these split it into typed fields.
+    if "model_backend" not in session_cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN model_backend TEXT")
+    if "model_name" not in session_cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN model_name TEXT")
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS session_results (
@@ -1513,6 +1584,8 @@ def create_session(user_id: int, workout_type: str,
                    extrinsic_calibrated_at: str | None = None,
                    zero_origin_rotation: np.ndarray | None = None,
                    zero_origin_translation: np.ndarray | None = None,
+                   model_backend: str | None = None,
+                   model_name: str | None = None,
                    db_path: Path | None = None) -> int:
     """Insert a new workout session row.
 
@@ -1523,6 +1596,11 @@ def create_session(user_id: int, workout_type: str,
     zero_origin_rotation / zero_origin_translation: optional 3x3 + (3,)
     transform captured by the live UI (e.g. when the user pressed
     "Zero L-Ankle"). Stored as raw float64 bytes.
+
+    model_backend / model_name: detection pipeline provenance. backend
+    is "pytorch" | "cuda" | "mps"; model_name is e.g. "vitpose_synthpose"
+    or "mediapipe_hands". Lets later consumers tell which inference path
+    produced the keypoints without reopening the npz.
     """
     conn = _workouts_conn(db_path)
 
@@ -1538,12 +1616,14 @@ def create_session(user_id: int, workout_type: str,
         "recording_path, calibration_path, config_blob, "
         "program_exercise_id, set_number, "
         "extrinsic_session_id, extrinsic_calibrated_at, "
-        "zero_origin_rotation, zero_origin_translation) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "zero_origin_rotation, zero_origin_translation, "
+        "model_backend, model_name) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (user_id, workout_type, duration_seconds, recording_path, calibration_path,
          config_blob, program_exercise_id, set_number,
          extrinsic_session_id, extrinsic_calibrated_at,
-         rot_bytes, trans_bytes))
+         rot_bytes, trans_bytes,
+         model_backend, model_name))
     conn.commit()
     session_id = cur.lastrowid
     conn.close()
@@ -1699,3 +1779,125 @@ def count_sets_since(user_id: int, program_exercise_id: int, since: str,
     ).fetchone()
     conn.close()
     return int(row["n"]) if row else 0
+
+
+# ============================================================================
+# Per-model view-transform presets (rotate-to-human + zero-origin)
+# ============================================================================
+#
+# The live skeleton viewer applies a per-model R, t to display detections
+# in a sensible frame (body-up for VitPose, hand-frame for MediaPipe Hands).
+# Pressing "Rotate to Human" + "Zero at L_Ankle/Thumb" should be a one-time
+# operation per model — switching back to a previously-used model should
+# restore that model's transform automatically.
+#
+# Storage: one row per model in <app_data>/models/view_transforms.db.
+# Floats are stored as little-endian float64 BLOBs (9 + 3 = 96 bytes per row);
+# the alternative of stringified TOML/JSON would round-trip slower and risks
+# precision loss on the rotation matrix.
+
+def view_transforms_db_path() -> Path:
+    """Per-machine sqlite holding per-model view-transform presets."""
+    return models_dir() / "view_transforms.db"
+
+
+def init_view_transforms_db(db_path: Path | None = None) -> None:
+    if db_path is None:
+        db_path = view_transforms_db_path()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS view_transforms (
+                model_key TEXT PRIMARY KEY,
+                rotation BLOB NOT NULL,
+                translation BLOB NOT NULL,
+                has_origin INTEGER NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def save_view_transform(
+    model_key: str,
+    rotation: np.ndarray,
+    translation: np.ndarray,
+    has_origin: bool,
+    db_path: Path | None = None,
+) -> None:
+    """Upsert the view-transform preset for `model_key`.
+
+    `rotation` is a 3x3 matrix (must be approximately orthonormal — the
+    caller is expected to project to SO(3) via SVD before persisting).
+    `translation` is a 3-vector. `has_origin` is True when the user has
+    actually pressed Zero (so reloads should also re-zero); False when only
+    Rotate-to-Human has been pressed.
+    """
+    if db_path is None:
+        db_path = view_transforms_db_path()
+    init_view_transforms_db(db_path)
+    R = np.ascontiguousarray(np.asarray(rotation, dtype=np.float64).reshape(3, 3))
+    t = np.ascontiguousarray(np.asarray(translation, dtype=np.float64).reshape(3))
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            """
+            INSERT INTO view_transforms (model_key, rotation, translation,
+                                          has_origin, updated_at)
+            VALUES (?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(model_key) DO UPDATE SET
+                rotation = excluded.rotation,
+                translation = excluded.translation,
+                has_origin = excluded.has_origin,
+                updated_at = excluded.updated_at
+            """,
+            (str(model_key), R.tobytes(), t.tobytes(), 1 if has_origin else 0),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def load_view_transform(
+    model_key: str,
+    db_path: Path | None = None,
+) -> tuple[np.ndarray, np.ndarray, bool] | None:
+    """Return (R, t, has_origin) for `model_key`, or None if no preset saved."""
+    if db_path is None:
+        db_path = view_transforms_db_path()
+    if not db_path.exists():
+        return None
+    init_view_transforms_db(db_path)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        row = conn.execute(
+            "SELECT rotation, translation, has_origin FROM view_transforms "
+            "WHERE model_key = ?",
+            (str(model_key),),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    R = np.frombuffer(row[0], dtype=np.float64).reshape(3, 3).copy()
+    t = np.frombuffer(row[1], dtype=np.float64).copy()
+    return R, t, bool(row[2])
+
+
+def delete_view_transform(model_key: str, db_path: Path | None = None) -> None:
+    if db_path is None:
+        db_path = view_transforms_db_path()
+    if not db_path.exists():
+        return
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("DELETE FROM view_transforms WHERE model_key = ?",
+                     (str(model_key),))
+        conn.commit()
+    finally:
+        conn.close()

@@ -150,11 +150,31 @@ def _person_id_for(persons_packet: Any, person_index: int) -> int:
 # ----------------------------------------------------------------------------
 
 
+def _orthonormalize_rotation(R: np.ndarray) -> np.ndarray:
+    """Project a near-rotation 3x3 matrix to the closest proper rotation.
+
+    Uses SVD: R_ortho = U @ Vt; if det < 0 we flip the last column of U
+    so the result is in SO(3) rather than O(3) (no reflection). This is
+    the standard "nearest rotation matrix" projection (Kabsch).
+    """
+    R = np.asarray(R, dtype=np.float64).reshape(3, 3)
+    U, _, Vt = np.linalg.svd(R)
+    R_ortho = U @ Vt
+    if np.linalg.det(R_ortho) < 0:
+        U[:, -1] *= -1
+        R_ortho = U @ Vt
+    return R_ortho
+
+
 def write_raw_buffer(
     path: Path,
     recording_keypoints: list[dict],
     *,
     frame_time_history_path: Path | None = None,
+    view_rotation: np.ndarray | None = None,
+    view_translation: np.ndarray | None = None,
+    model_backend: str | None = None,
+    model_name: str | None = None,
 ) -> None:
     """
     Dump the in-memory recording buffer to an .npz file.
@@ -167,7 +187,7 @@ def write_raw_buffer(
     path : Path
         Output ``.npz`` location.
     recording_keypoints : list[dict]
-        Buffered detection results.
+        Buffered detection results, in CAMERA frame.
     frame_time_history_path : Path | None, optional
         When provided and the file exists, an extra array
         ``frame_times_per_port`` of shape ``(n_frames, n_cameras)`` is
@@ -181,6 +201,16 @@ def write_raw_buffer(
         ``sync_index`` in the history file is used as the row index, so
         the first ``n_frames`` rows of the history are mapped one-for-
         one onto the buffer's frame ordering.
+    view_rotation, view_translation : np.ndarray | None, optional
+        When provided, every keypoint is mapped from camera frame to view
+        frame via ``p_view = R @ p_cam + t`` before being saved. The
+        transform itself is also persisted in the npz under
+        ``view_transform_R`` (3x3) and ``view_transform_t`` (3,) so
+        consumers that want camera coords can invert via
+        ``p_cam = R.T @ (p_view - t)``. R is re-orthonormalised via SVD
+        before being applied + saved (defends against slow drift through
+        repeated TOML/sqlite roundtrips). When omitted, keypoints are
+        written as-is and an identity transform is recorded.
     """
     if not recording_keypoints:
         return
@@ -211,6 +241,21 @@ def write_raw_buffer(
     )
     person_counts = np.zeros(n_frames, dtype=np.int32)
 
+    # Resolve the view transform once. Default = identity (no rotation,
+    # no translation) so legacy callers that pass nothing get the old
+    # camera-frame behaviour. Applied below as p_view = R @ p_cam + t.
+    if view_rotation is not None:
+        R_view = _orthonormalize_rotation(view_rotation).astype(np.float64)
+    else:
+        R_view = np.eye(3, dtype=np.float64)
+    if view_translation is not None:
+        t_view = np.asarray(view_translation, dtype=np.float64).reshape(3)
+    else:
+        t_view = np.zeros(3, dtype=np.float64)
+    apply_transform = not (
+        np.allclose(R_view, np.eye(3)) and np.allclose(t_view, 0.0)
+    )
+
     for i, fr in enumerate(recording_keypoints):
         times[i] = float(fr.get("time", 0.0))
         primary[i] = int(fr.get("primary_index", 0))
@@ -230,7 +275,10 @@ def write_raw_buffer(
                     continue
                 if arr.size < 3:
                     continue
-                keypoints[i, p_idx, k_idx, :] = arr[:3]
+                pt = arr[:3].astype(np.float64)
+                if apply_transform:
+                    pt = R_view @ pt + t_view
+                keypoints[i, p_idx, k_idx, :] = pt.astype(np.float32)
 
     extra_arrays: dict[str, np.ndarray] = {}
     if frame_time_history_path is not None:
@@ -248,6 +296,20 @@ def write_raw_buffer(
             extra_arrays["frame_time_ports"] = np.asarray(
                 ports_in_order, dtype=np.int32
             )
+
+    # Always record the view transform in effect at write time, even when
+    # it's identity. Lets downstream consumers tell "the file says identity
+    # because it really was" apart from "this is a legacy file with no
+    # transform field"; legacy files have no `view_transform_R` key at all.
+    extra_arrays["view_transform_R"] = R_view.astype(np.float64)
+    extra_arrays["view_transform_t"] = t_view.astype(np.float64)
+
+    # Record the detection backend + model name so a consumer can tell
+    # which pipeline produced the keypoints. Stored as 0-d unicode arrays
+    # so np.load round-trips cleanly. Empty string means "unknown" — the
+    # caller didn't pass it. Same behaviour for save_keypoints_3d.
+    extra_arrays["model_backend"] = np.array(model_backend or "", dtype="<U32")
+    extra_arrays["model_name"] = np.array(model_name or "", dtype="<U64")
 
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(

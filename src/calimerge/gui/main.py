@@ -282,26 +282,33 @@ def main():
     # bolder Segoe UI variant that reads as 'fat' if we don't pin this.
     _ui_font = QFont()
     _ui_font.setFamilies([
-        "Gill Sans",        # macOS / Windows (if installed)
-        "Gill Sans MT",     # Windows (Office bundled — lighter weight)
-        "Gill Sans Std",    # Adobe-installed variant
-        "Helvetica Neue",   # macOS fallback
-        "Helvetica",        # macOS fallback
-        "Segoe UI",         # Windows fallback
-        "Arial",            # universal sans fallback
-        # NOTE: 'Gill Sans Nova' deliberately omitted — its default weight
-        # ships heavier than classic Gill Sans and renders 'thick' against
-        # the rest of the UI. If you have it and prefer it, add it here.
+        "Gill Sans Nova Light",   # Win11 ships Nova family with Light/Cond Light faces
+        "Gill Sans Nova",         # request weight pin (ExtraLight/Light) below
+        "Gill Sans MT Light",     # explicit Light variant from Office bundle
+        "Gill Sans Light",        # generic Light face name
+        "Gill Sans MT",           # Windows (Office bundled)
+        "Gill Sans",              # macOS / Windows (if installed)
+        "Gill Sans Std",          # Adobe-installed variant
+        "Helvetica Neue",
+        "Helvetica",
+        "Segoe UI Light",         # Windows fallback (lighter than Segoe UI Normal)
+        "Segoe UI",
+        "Arial",
     ])
-    _ui_font.setWeight(QFont.Weight.Normal)
+    _ui_font.setWeight(QFont.Weight.ExtraLight)  # 200 — try thinner; falls back to Light if unavailable
+    _ui_font.setPointSize(10)  # slight bump from the platform default (~9pt on Windows)
     _ui_font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
     app.setFont(_ui_font)
 
-    # Print the actually-resolved family so the user can verify whether
-    # Gill Sans was found or if Qt fell through to Segoe UI / Arial.
+    # Print the actually-resolved family + weight so the user can verify
+    # whether Gill Sans Light was found or if Qt fell through to a fallback.
     from PySide6.QtGui import QFontInfo
-    actual = QFontInfo(_ui_font).family()
-    print(f"[ui-font] requested Gill Sans, resolved to: {actual!r}", flush=True)
+    info = QFontInfo(_ui_font)
+    print(
+        f"[ui-font] requested Gill Sans Light, resolved to: {info.family()!r} "
+        f"(weight={info.weight()})",
+        flush=True,
+    )
 
     window = MainWindow()
     window.show()

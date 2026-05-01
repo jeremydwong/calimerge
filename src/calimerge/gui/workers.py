@@ -758,10 +758,34 @@ class PoseDetectionWorker(QThread):
         self._pending: dict[int, "np.ndarray"] = {}
         self._has_work = threading.Event()
 
+        # Pause flag — when set, the run() loop drains the queue and skips
+        # detection without tearing down the loaded models. Toggling Live
+        # Detection from the GUI uses this rather than stopping the worker
+        # so the multi-second YOLO + VitPose load isn't paid every time.
+        self._paused: bool = False
+
+        # Cached camera_params + projection matrices for live triangulation.
+        # `self.cameras` is set at construction and never mutated, so building
+        # these once on first use is sound. Re-computed only if the cameras
+        # dict object identity changes.
+        self._cached_cameras_id: int | None = None
+        self._cached_cam_params: list | None = None
+        self._cached_proj_matrices = None
+        self._cached_port_to_cam_index: dict[int, int] | None = None
+
     def submit_frame(self, port: int, frame: "np.ndarray"):
         """Submit a frame for detection (non-blocking, keeps only latest per port)."""
         with self._lock:
             self._pending[port] = frame
+        self._has_work.set()
+
+    def pause(self):
+        """Stop running detection on incoming frames without unloading models."""
+        self._paused = True
+
+    def resume(self):
+        """Re-enable detection on incoming frames."""
+        self._paused = False
         self._has_work.set()
 
     def run(self):
@@ -787,6 +811,16 @@ class PoseDetectionWorker(QThread):
             self.error.emit(f"Failed to load pose models: {e}")
             return
 
+        # Periodic GPU cache release. PyTorch's caching allocator can
+        # fragment over a long live session — empty_cache() returns
+        # unused blocks to the driver. Cheap (microseconds when the
+        # cache is small) and helps with the "live pose gets gradually
+        # slower over hours" symptom. Throttled to once per ~60 s so
+        # we don't churn on every frame.
+        import time as _time
+        last_cache_release = _time.perf_counter()
+        cache_release_interval = 60.0  # seconds
+
         # Main loop: wait for frames, run detection
         while self.running:
             self._has_work.wait(timeout=0.1)
@@ -802,66 +836,58 @@ class PoseDetectionWorker(QThread):
             if not work:
                 continue
 
-            for port, frame_bgr in work.items():
-                if not self.running:
-                    break
-                try:
-                    annotated = self._detect_and_draw(port, frame_bgr)
-                    self.detection_ready.emit(port, annotated)
-                except Exception:
-                    # On detection error, just pass through original frame
-                    self.detection_ready.emit(port, frame_bgr)
+            # Paused: drop frames on the floor instead of running models.
+            # Cheaper than tearing the worker down and reloading weights
+            # when the user toggles the Live Detection checkbox off/on.
+            if self._paused:
+                continue
+
+            try:
+                self._detect_and_draw_batch(work)
+            except Exception:
+                # Batch path failed (rare) — fall back to per-port so a
+                # single bad frame doesn't kill the whole batch.
+                for port, frame_bgr in work.items():
+                    if not self.running:
+                        break
+                    try:
+                        annotated = self._detect_and_draw(port, frame_bgr)
+                        self.detection_ready.emit(port, annotated)
+                    except Exception:
+                        self.detection_ready.emit(port, frame_bgr)
 
             # Attempt live triangulation if calibration available
             if self.cameras is not None and len(self._last_kps_per_port) >= 2:
                 self._triangulate_live()
 
-    def _detect_and_draw(self, port: int, frame_bgr: "np.ndarray") -> "np.ndarray":
-        """Run detection on a single frame and draw keypoints with per-person colors."""
+            # Periodic GPU cache release (CUDA only — MPS / CPU no-op).
+            now = _time.perf_counter()
+            if now - last_cache_release >= cache_release_interval:
+                last_cache_release = now
+                try:
+                    if self._device == "cuda":
+                        import torch
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
+
+    def _draw_overlay(
+        self,
+        frame_bgr: "np.ndarray",
+        all_keypoints: list,
+        all_scores: list,
+        boxes_voc: "np.ndarray",
+    ) -> "np.ndarray":
+        """Draw skeleton + boxes onto a copy of frame_bgr; return the copy."""
         import cv2
-        import numpy as np
-        from PIL import Image
-
-        from ..tracking.pose_detector import detect_persons, estimate_poses
-
-        person_model, pose_processor, pose_model = self._models
-
-        # BGR -> RGB -> PIL
-        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        pil_image = Image.fromarray(rgb)
-
-        # Detect persons
-        boxes_voc, boxes_coco, scores = detect_persons(
-            pil_image, person_model, self._device, confidence_threshold=self.confidence_threshold
-        )
-
-        if boxes_voc.size == 0:
-            # No detections: remove stale keypoints for this port
-            self._last_kps_per_port.pop(port, None)
-            return frame_bgr
-
-        # Estimate poses
-        all_keypoints, all_scores = estimate_poses(
-            pil_image, boxes_coco, pose_processor, pose_model, self._device,
-        )
-
-        # Store all persons' raw keypoints for live triangulation
-        if all_keypoints:
-            self._last_kps_per_port[port] = list(zip(all_keypoints, all_scores))
-
-        # Draw on frame
         vis = frame_bgr.copy()
         n_colors = len(self._PERSON_COLORS)
 
         for person_idx, (kps, kp_scores) in enumerate(zip(all_keypoints, all_scores)):
             color = self._PERSON_COLORS[person_idx % n_colors]
-
-            # Brighter variant for keypoints
             kp_color = tuple(min(255, int(c * 1.3)) for c in color)
-
             n = kps.shape[0]
 
-            # Draw limbs
             for i, j in self._SKELETON:
                 if i >= n or j >= n:
                     continue
@@ -871,14 +897,12 @@ class PoseDetectionWorker(QThread):
                 pt2 = (int(kps[j, 0]), int(kps[j, 1]))
                 cv2.line(vis, pt1, pt2, color, 2, cv2.LINE_AA)
 
-            # Draw keypoints
             for k in range(n):
                 if kp_scores[k] < 0.3:
                     continue
                 pt = (int(kps[k, 0]), int(kps[k, 1]))
                 cv2.circle(vis, pt, 4, kp_color, -1, cv2.LINE_AA)
 
-            # Draw bounding box + person index
             if person_idx < len(boxes_voc):
                 box = boxes_voc[person_idx].astype(int)
                 cv2.rectangle(vis, (box[0], box[1]), (box[2], box[3]),
@@ -887,6 +911,115 @@ class PoseDetectionWorker(QThread):
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
 
         return vis
+
+    def _detect_and_draw(self, port: int, frame_bgr: "np.ndarray") -> "np.ndarray":
+        """Run detection on a single frame (per-port fallback path)."""
+        import cv2
+        from PIL import Image
+        from ..tracking.pose_detector import detect_persons, estimate_poses
+
+        person_model, pose_processor, pose_model = self._models
+
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        pil_image = Image.fromarray(rgb)
+
+        boxes_voc, boxes_coco, _ = detect_persons(
+            pil_image, person_model, self._device,
+            confidence_threshold=self.confidence_threshold,
+        )
+
+        if boxes_voc.size == 0:
+            self._last_kps_per_port.pop(port, None)
+            return frame_bgr
+
+        all_keypoints, all_scores = estimate_poses(
+            pil_image, boxes_coco, pose_processor, pose_model, self._device,
+        )
+
+        if all_keypoints:
+            self._last_kps_per_port[port] = list(zip(all_keypoints, all_scores))
+
+        return self._draw_overlay(frame_bgr, all_keypoints, all_scores, boxes_voc)
+
+    def _detect_and_draw_batch(self, work: dict[int, "np.ndarray"]):
+        """Run YOLO + VitPose on all pending ports as a single batched call.
+
+        With N cameras, the previous per-port loop did N independent forward
+        passes through YOLO and N independent passes through VitPose. The
+        GPU sits idle most of the time waiting for kernel launches and
+        host↔device transfers between calls. Batching collapses both models
+        to one forward pass each per detection cycle, which is the dominant
+        win for live tracking with multiple cameras.
+        """
+        import cv2
+        from PIL import Image
+        from ..tracking.pose_detector import (
+            detect_persons_batch, estimate_poses_batch,
+        )
+
+        person_model, pose_processor, pose_model = self._models
+
+        ports = list(work.keys())
+        if not ports:
+            return
+        frames_bgr = [work[p] for p in ports]
+
+        # BGR → RGB → PIL once per frame.
+        pil_images = [
+            Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB))
+            for f in frames_bgr
+        ]
+
+        # Batch person detection — one YOLO call across all ports.
+        det_results = detect_persons_batch(
+            pil_images, person_model, self._device,
+            confidence_threshold=self.confidence_threshold,
+            batch_size=max(1, len(pil_images)),
+        )
+
+        # Build VitPose input by skipping ports with no detections (avoids
+        # the dummy-box overhead inside estimate_poses_batch).
+        pose_input: list = []
+        pose_index_map: list[int] = []   # pose_input[k] -> ports[idx]
+        for i, (boxes_voc, boxes_coco, _scores) in enumerate(det_results):
+            if boxes_voc.size > 0:
+                pose_input.append((pil_images[i], boxes_coco))
+                pose_index_map.append(i)
+
+        pose_results: list = []
+        if pose_input:
+            pose_results = estimate_poses_batch(
+                pose_input, pose_processor, pose_model, self._device,
+                batch_size=max(1, len(pose_input)),
+            )
+
+        # Map pose results back to per-port indices.
+        pose_by_index: dict[int, tuple[list, list]] = {}
+        for k, idx in enumerate(pose_index_map):
+            if k < len(pose_results):
+                pose_by_index[idx] = pose_results[k]
+            else:
+                pose_by_index[idx] = ([], [])
+
+        # Annotate + emit per port.
+        for i, port in enumerate(ports):
+            if not self.running:
+                break
+            boxes_voc, _, _ = det_results[i]
+            frame_bgr = frames_bgr[i]
+            if boxes_voc.size == 0:
+                self._last_kps_per_port.pop(port, None)
+                self.detection_ready.emit(port, frame_bgr)
+                continue
+            all_keypoints, all_scores = pose_by_index.get(i, ([], []))
+            if all_keypoints:
+                self._last_kps_per_port[port] = list(zip(all_keypoints, all_scores))
+            else:
+                self._last_kps_per_port.pop(port, None)
+            annotated = self._draw_overlay(
+                frame_bgr, all_keypoints, all_scores, boxes_voc,
+            )
+            self.detection_ready.emit(port, annotated)
 
     # ── Live triangulation helpers ────────────────────────────────────────
 
@@ -987,6 +1120,48 @@ class PoseDetectionWorker(QThread):
 
         return [g for g in groups if len(g) >= 2]
 
+    def _ensure_camera_caches(self):
+        """Build (or reuse) the camera_params + projection-matrix cache.
+
+        Called from the live triangulation path. Rebuilds only when the
+        `self.cameras` dict object identity changes (which currently never
+        happens once the worker is running — the worker is restarted on
+        calibration change — but the identity check guards against future
+        re-binding).
+        """
+        if self.cameras is None:
+            self._cached_cam_params = None
+            self._cached_proj_matrices = None
+            self._cached_port_to_cam_index = None
+            self._cached_cameras_id = None
+            return
+        if id(self.cameras) == self._cached_cameras_id and self._cached_cam_params is not None:
+            return
+
+        import cv2
+        import numpy as np
+        from ..tracking.triangulation import calculate_projection_matrices
+
+        sorted_ports = sorted(self.cameras.keys())
+        camera_params: list = []
+        port_to_cam_index: dict[int, int] = {}
+        for i, port in enumerate(sorted_ports):
+            cam = self.cameras[port]
+            rvec, _ = cv2.Rodrigues(cam.extrinsics.rotation)
+            camera_params.append({
+                "matrix": cam.intrinsics.matrix,
+                "distortions": cam.intrinsics.distortion,
+                "size": np.array(cam.intrinsics.resolution),
+                "rotation": rvec.flatten(),
+                "translation": cam.extrinsics.translation,
+                "port": port,
+            })
+            port_to_cam_index[port] = i
+        self._cached_cam_params = camera_params
+        self._cached_proj_matrices = calculate_projection_matrices(camera_params)
+        self._cached_port_to_cam_index = port_to_cam_index
+        self._cached_cameras_id = id(self.cameras)
+
     def _triangulate_live(self):
         """Triangulate 3D keypoints for all matched persons and emit the results.
 
@@ -994,97 +1169,94 @@ class PoseDetectionWorker(QThread):
         pipeline: per-pair epipolar Hungarian on hip-COM, then union-find to
         merge into groups. Greedy "closest to origin" matching mis-associates
         people who are at similar depths.
+
+        NOTE: this method used to wrap its body in ``except Exception:
+        pass``. That hid a calibration-mismatch bug for an entire
+        debugging session — when the runner loaded the wrong extrinsic,
+        the bipartite matcher rejected every cross-view pairing because
+        epipolar distances landed >100 px off the line, and we silently
+        produced zero detections. Now we let the underlying error
+        propagate (callers run on a QThread so a stray raise doesn't
+        kill the GUI process — it just stops this triangulation pass).
         """
-        try:
-            import cv2
-            import numpy as np
-            from ..tracking.triangulation import calculate_projection_matrices, triangulate_keypoints
-            from ..tracking.tracker import (
-                group_detections_across_views_bipartite,
-                calculate_2d_com,
-            )
-            from ..tracking.markers import HIP_INDICES
+        import numpy as np
+        from ..tracking.triangulation import triangulate_keypoints
+        from ..tracking.tracker import (
+            group_detections_across_views_bipartite,
+            calculate_2d_com,
+        )
+        from ..tracking.markers import HIP_INDICES
 
-            # Build camera_params
-            sorted_ports = sorted(self.cameras.keys())
-            camera_params, port_to_cam_index = [], {}
-            for i, port in enumerate(sorted_ports):
-                cam = self.cameras[port]
-                rvec, _ = cv2.Rodrigues(cam.extrinsics.rotation)
-                camera_params.append({
-                    "matrix": cam.intrinsics.matrix,
-                    "distortions": cam.intrinsics.distortion,
-                    "size": np.array(cam.intrinsics.resolution),
-                    "rotation": rvec.flatten(),
-                    "translation": cam.extrinsics.translation,
-                    "port": port,
-                })
-                port_to_cam_index[port] = i
+        # Camera params + projection matrices are static for a given
+        # `self.cameras` dict — compute once, reuse every frame. Previously
+        # this rebuilt + ran cv2.Rodrigues per camera per frame.
+        self._ensure_camera_caches()
+        camera_params = self._cached_cam_params
+        port_to_cam_index = self._cached_port_to_cam_index
+        projection_matrices = self._cached_proj_matrices
+        if camera_params is None:
+            return
 
-            projection_matrices = calculate_projection_matrices(camera_params)
+        port_persons = {
+            port: persons
+            for port, persons in self._last_kps_per_port.items()
+            if port in port_to_cam_index and persons
+        }
+        if len(port_persons) < 2:
+            return
 
-            port_persons = {
-                port: persons
-                for port, persons in self._last_kps_per_port.items()
-                if port in port_to_cam_index and persons
-            }
-            if len(port_persons) < 2:
-                return
-
-            # Build the per-port detection-dict format the bipartite grouper
-            # expects: each detection carries `keypoints` (N,3 with score) and
-            # the 2D hip COM used for the cost matrix.
-            detected_persons_2d: dict[int, list[dict]] = {}
-            for port, persons in port_persons.items():
-                port_dets: list[dict] = []
-                for kps, scores in persons:
-                    # Stitch (x,y,score) per keypoint and compute COM in the
-                    # same way the batch pipeline does.
-                    kps_with_score = np.concatenate([kps, scores[:, None]], axis=1)
-                    com_2d = calculate_2d_com(kps_with_score.tolist(), HIP_INDICES)
-                    if com_2d is None:
-                        continue
-                    port_dets.append({
-                        "keypoints": kps_with_score,
-                        "com_2d": com_2d,
-                    })
-                if port_dets:
-                    detected_persons_2d[port] = port_dets
-
-            if len(detected_persons_2d) < 2:
-                return
-
-            groups = group_detections_across_views_bipartite(
-                detected_persons_2d,
-                projection_matrices,
-                port_to_cam_index,
-                camera_params,
-                # Live frames have more detection noise than batch processing,
-                # so loosen the gate compared to the batch default (30).
-                epipolar_threshold=50.0,
-            )
-
-            # Triangulate full keypoints for each matched group
-            all_persons_3d = []
-            for group in groups:
-                if len(group) < 2:
+        # Build the per-port detection-dict format the bipartite grouper
+        # expects: each detection carries `keypoints` (N,3 with score) and
+        # the 2D hip COM used for the cost matrix.
+        detected_persons_2d: dict[int, list[dict]] = {}
+        for port, persons in port_persons.items():
+            port_dets: list[dict] = []
+            for kps, scores in persons:
+                # Stitch (x,y,score) per keypoint and compute COM in the
+                # same way the batch pipeline does.
+                kps_with_score = np.concatenate([kps, scores[:, None]], axis=1)
+                com_2d = calculate_2d_com(kps_with_score.tolist(), HIP_INDICES)
+                if com_2d is None:
                     continue
-                kp_dict = {port: det["keypoints"] for port, det in group.items()}
-                kps_3d = triangulate_keypoints(
-                    kp_dict, port_to_cam_index, camera_params, projection_matrices
-                )
-                all_persons_3d.append(kps_3d)
+                port_dets.append({
+                    "keypoints": kps_with_score,
+                    "com_2d": com_2d,
+                })
+            if port_dets:
+                detected_persons_2d[port] = port_dets
 
-            # Cross-frame association: turn the per-frame group list into a
-            # set of stable track ids before emitting. Stored on the worker
-            # so downstream consumers (CSV export, foot-placement viz) can
-            # correlate without changing the existing signal contract.
-            self.last_person_ids = self._tracker.step(all_persons_3d)
+        if len(detected_persons_2d) < 2:
+            return
 
-            if all_persons_3d:
-                self.keypoints_3d_ready.emit(all_persons_3d)
-        except Exception:
-            pass
+        groups = group_detections_across_views_bipartite(
+            detected_persons_2d,
+            projection_matrices,
+            port_to_cam_index,
+            camera_params,
+            # Live frames have more detection noise than batch processing,
+            # so loosen the gate compared to the batch default (30).
+            epipolar_threshold=50.0,
+        )
+
+        # Triangulate full keypoints for each matched group
+        all_persons_3d = []
+        for group in groups:
+            if len(group) < 2:
+                continue
+            kp_dict = {port: det["keypoints"] for port, det in group.items()}
+            kps_3d = triangulate_keypoints(
+                kp_dict, port_to_cam_index, camera_params, projection_matrices
+            )
+            all_persons_3d.append(kps_3d)
+
+        # Cross-frame association: turn the per-frame group list into a
+        # set of stable track ids before emitting. Stored on the worker
+        # so downstream consumers (CSV export, foot-placement viz) can
+        # correlate without changing the existing signal contract.
+        self.last_person_ids = self._tracker.step(all_persons_3d)
+
+        if all_persons_3d:
+            self.keypoints_3d_ready.emit(all_persons_3d)
 
     def stop(self):
         self.running = False
@@ -1153,10 +1325,23 @@ class MediaPipeHandsDetectionWorker(QThread):
         self._pending: dict[int, "np.ndarray"] = {}
         self._has_work = threading.Event()
 
+        # Pause flag: when set, the run() loop drains queued frames and
+        # skips detection without unloading the MP detector. Mirrors the
+        # PoseDetectionWorker pattern so the GUI can pause/resume any
+        # backend uniformly.
+        self._paused: bool = False
+
     def submit_frame(self, port: int, frame: "np.ndarray"):
         """Submit a frame for detection (non-blocking, keeps only latest per port)."""
         with self._lock:
             self._pending[port] = frame
+        self._has_work.set()
+
+    def pause(self):
+        self._paused = True
+
+    def resume(self):
+        self._paused = False
         self._has_work.set()
 
     def run(self):
@@ -1217,6 +1402,10 @@ class MediaPipeHandsDetectionWorker(QThread):
                 self._pending.clear()
 
             if not work:
+                continue
+
+            # Paused: drop the queued frames without running detection.
+            if self._paused:
                 continue
 
             for port, frame_bgr in work.items():
@@ -1584,6 +1773,11 @@ class CudaStreamDetectionWorker(QThread):
         self._pending: dict[int, object] = {}
         self._has_work = threading.Event()
 
+        # Pause flag: lets the GUI suppress detection without unloading
+        # the TensorRT engines + CUDA streams (which are expensive to
+        # rebuild). Mirrors PoseDetectionWorker / MediaPipeHandsDetectionWorker.
+        self._paused: bool = False
+
     def submit_frame(self, port: int, frame):
         """Submit a frame for detection (non-blocking, keeps only latest per port)."""
         with self._lock:
@@ -1591,6 +1785,13 @@ class CudaStreamDetectionWorker(QThread):
             have_all = len(self._pending) >= len(self._cameras)
         if have_all:
             self._has_work.set()
+
+    def pause(self):
+        self._paused = True
+
+    def resume(self):
+        self._paused = False
+        self._has_work.set()
 
     def run(self):
         try:
@@ -1634,6 +1835,12 @@ class CudaStreamDetectionWorker(QThread):
                 latest_frames.update(self._pending)
                 self._pending.clear()
 
+            # Paused: drain the queue but skip the CUDA pipeline. The
+            # TensorRT engines stay loaded so resuming is instantaneous.
+            if self._paused:
+                latest_frames.clear()
+                continue
+
             # Need at least 2 cameras to triangulate
             if len(latest_frames) < 2:
                 continue
@@ -1648,6 +1855,12 @@ class CudaStreamDetectionWorker(QThread):
                     raw_frames[port] = f
 
             if len(frame_list) < 2:
+                continue
+
+            # If shutdown was signaled between drain and call, skip the
+            # inference rather than racing the pipeline close. Cheap and
+            # defends against a stray TRT enqueue mid-teardown.
+            if not self.running or self._pipeline is None:
                 continue
 
             try:
@@ -1673,8 +1886,29 @@ class CudaStreamDetectionWorker(QThread):
                     self.last_person_ids = []
 
             except Exception as e:
-                import traceback
-                self.error.emit(f"CUDA error: {e}\n{traceback.format_exc()}")
+                # Swallow shutdown-race errors quietly — the GUI is on its
+                # way out and surfacing a red MessageBox is just noise.
+                # Anything else still goes through the normal error signal.
+                if not self.running:
+                    print(f"[cuda] suppressed shutdown error: {e}", flush=True)
+                else:
+                    import traceback
+                    self.error.emit(f"CUDA error: {e}\n{traceback.format_exc()}")
+
+        # Close the pipeline ON THIS THREAD (the worker), not from stop()
+        # which runs on the GUI thread. Closing while another thread is
+        # mid process_frame produced
+        #   "[TRT ERROR] enqueueV3: Bad configuration in RunInfo"
+        # on window close. _stop_detection waits on this thread, so by
+        # the time _stop_detection returns the pipeline is fully torn
+        # down with no concurrent inference in flight.
+        if self._pipeline is not None:
+            try:
+                self._pipeline.close()
+            except Exception as e:
+                print(f"[cuda] pipeline close raised (suppressed): {e}",
+                      flush=True)
+            self._pipeline = None
 
     def _build_projection_params(self):
         """Precompute per-camera projection parameters for 3D→2D reprojection."""
@@ -1755,21 +1989,288 @@ class CudaStreamDetectionWorker(QThread):
         return vis
 
     def stop(self):
+        # Signal-only: do NOT close the TRT pipeline here. stop() is
+        # called from the GUI thread and the worker thread may be inside
+        # _pipeline.process_frame() at this very moment — closing under
+        # an in-flight enqueueV3 produces a "Bad configuration in
+        # RunInfo" Myelin error on window close. The pipeline is closed
+        # at the end of run() (worker thread) instead; _stop_detection
+        # blocks on wait() until that completes.
         self.running = False
-        self._has_work.set()  # unblock wait
+        self._has_work.set()
+
+
+class MpsStreamDetectionWorker(QThread):
+    """Live 2D/3D pose detection using the macOS MPS / CoreML streaming pipeline.
+
+    Apple-Silicon counterpart to :class:`CudaStreamDetectionWorker`: same
+    interface (submit_frame / pause / resume / stop, same emitted signals),
+    same shutdown-race protection (close pipeline in ``run()``, never in
+    ``stop()`` — see CUDA worker comment for the underlying race).
+    """
+
+    detection_ready = Signal(int, object)  # port, annotated BGR frame
+    keypoints_3d_ready = Signal(list)      # list of person keypoints
+    log_message = Signal(str)
+    error = Signal(str)
+
+    # Same SynthPose-52 skeleton as CudaStreamDetectionWorker — keep in sync
+    # if either skeleton is ever revised.
+    _SKELETON = CudaStreamDetectionWorker._SKELETON
+    _PERSON_COLORS = CudaStreamDetectionWorker._PERSON_COLORS
+
+    def __init__(
+        self,
+        cameras: dict,
+        calibration_path: str,
+        yolo_model_path: str,
+        vitpose_model_path: str,
+        max_persons: int = 2,
+        person_confidence: float = 0.50,
+    ):
+        super().__init__()
+        self._cameras = cameras
+        self._calibration_path = calibration_path
+        self._yolo_model_path = yolo_model_path
+        self._vitpose_model_path = vitpose_model_path
+        self._max_persons = max_persons
+        self._person_confidence = float(person_confidence)
+        # Stable track ids parallel to the persons list emitted on
+        # keypoints_3d_ready. Populated from PT_MPS_StreamPerson.person_id
+        # which the C tracker assigns on its own.
+        self.last_person_ids: list[int] = []
+        self._pipeline = None
+        self._sync_index = 0
+        self.running = True
+
+        import threading
+        self._lock = threading.Lock()
+        self._pending: dict[int, object] = {}
+        self._has_work = threading.Event()
+
+        # Pause flag: lets the GUI suppress detection without unloading
+        # the CoreML models (which are expensive to recompile on first
+        # use). Mirrors PoseDetectionWorker / CudaStreamDetectionWorker.
+        self._paused: bool = False
+
+    def submit_frame(self, port: int, frame):
+        """Submit a frame for detection (non-blocking, keeps only latest per port)."""
+        with self._lock:
+            self._pending[port] = frame
+            have_all = len(self._pending) >= len(self._cameras)
+        if have_all:
+            self._has_work.set()
+
+    def pause(self):
+        self._paused = True
+
+    def resume(self):
+        self._paused = False
+        self._has_work.set()
+
+    def run(self):
+        try:
+            from ..tracking.mps_stream_binding import MpsStreamPipeline
+
+            ports = sorted(self._cameras.keys())
+            w, h = self._cameras[ports[0]].intrinsics.resolution
+
+            self.log_message.emit("Initializing MPS pipeline...")
+            self._pipeline = MpsStreamPipeline(
+                num_cameras=len(ports),
+                frame_width=w,
+                frame_height=h,
+                calibration_toml_path=self._calibration_path,
+                yolo_model_path=self._yolo_model_path,
+                vitpose_model_path=self._vitpose_model_path,
+                max_persons=self._max_persons,
+                person_confidence=self._person_confidence,
+            )
+            self.log_message.emit("MPS pipeline ready")
+        except Exception as e:
+            import traceback
+            self.error.emit(f"MPS pipeline init failed: {e}\n{traceback.format_exc()}")
+            return
+
+        import cv2
+
+        ports = sorted(self._cameras.keys())
+        w, h = self._cameras[ports[0]].intrinsics.resolution
+        latest_frames: dict[int, object] = {}
+
+        while self.running:
+            self._has_work.wait(timeout=0.05)
+            if not self.running:
+                break
+            self._has_work.clear()
+
+            with self._lock:
+                latest_frames.update(self._pending)
+                self._pending.clear()
+
+            # Paused: drain the queue but skip CoreML inference. The
+            # MLModel stays loaded so resuming is instantaneous.
+            if self._paused:
+                latest_frames.clear()
+                continue
+
+            # Need at least 2 cameras to triangulate
+            if len(latest_frames) < 2:
+                continue
+
+            frame_list = []
+            raw_frames = {}
+            for port in ports:
+                if port in latest_frames:
+                    f = cv2.resize(latest_frames[port], (w, h))
+                    frame_list.append((f, port))
+                    raw_frames[port] = f
+
+            if len(frame_list) < 2:
+                continue
+
+            # If shutdown was signaled between drain and call, skip the
+            # inference rather than racing the pipeline close.
+            if not self.running or self._pipeline is None:
+                continue
+
+            try:
+                result = self._pipeline.process_frame(frame_list, sync_index=self._sync_index)
+                self._sync_index += 1
+
+                for port, frame in raw_frames.items():
+                    vis = self._draw_reprojected(port, frame, result)
+                    self.detection_ready.emit(port, vis)
+
+                if result.num_persons > 0:
+                    self.last_person_ids = [
+                        int(p.person_id) for p in result.persons
+                    ]
+                    self.keypoints_3d_ready.emit([
+                        p.keypoints_3d for p in result.persons
+                    ])
+                else:
+                    self.last_person_ids = []
+
+            except Exception as e:
+                # Suppress shutdown-race errors quietly — same rationale
+                # as CudaStreamDetectionWorker.
+                if not self.running:
+                    print(f"[mps] suppressed shutdown error: {e}", flush=True)
+                else:
+                    import traceback
+                    self.error.emit(f"MPS error: {e}\n{traceback.format_exc()}")
+
+        # Close the pipeline ON THIS THREAD (the worker), not from stop()
+        # which runs on the GUI thread.  Closing under an in-flight CoreML
+        # prediction is the macOS analogue of the TRT enqueueV3 race that
+        # bit us on the CUDA path.
         if self._pipeline is not None:
-            self._pipeline.close()
+            try:
+                self._pipeline.close()
+            except Exception as e:
+                print(f"[mps] pipeline close raised (suppressed): {e}",
+                      flush=True)
             self._pipeline = None
+
+    def _build_projection_params(self):
+        """Precompute per-camera projection parameters for 3D->2D reprojection."""
+        import cv2
+        self._proj_params = {}
+        for port, cam in self._cameras.items():
+            R = cam.extrinsics.rotation       # 3x3
+            t = cam.extrinsics.translation    # (3,)
+            rvec, _ = cv2.Rodrigues(R)
+            self._proj_params[port] = {
+                "rvec": rvec,
+                "tvec": t.reshape(3, 1),
+                "K": cam.intrinsics.matrix,
+                "dist": cam.intrinsics.distortion,
+            }
+
+    def _draw_reprojected(self, port, frame, result):
+        """Draw reprojected 3D keypoints and skeleton onto a camera frame."""
+        import cv2
+        import numpy as np
+
+        if result.num_persons == 0:
+            return frame
+
+        if not hasattr(self, "_proj_params"):
+            self._build_projection_params()
+
+        params = self._proj_params.get(port)
+        if params is None:
+            return frame
+
+        vis = frame.copy()
+        n_colors = len(self._PERSON_COLORS)
+
+        for pi, person in enumerate(result.persons):
+            color = self._PERSON_COLORS[pi % n_colors]
+            kp_color = tuple(min(255, int(c * 1.3)) for c in color)
+
+            pts_3d = {}
+            for k, kp in enumerate(person.keypoints_3d):
+                if kp is not None:
+                    pts_3d[k] = kp
+
+            if not pts_3d:
+                continue
+
+            indices = sorted(pts_3d.keys())
+            arr_3d = np.array([pts_3d[k] for k in indices], dtype=np.float64)
+            pts_2d, _ = cv2.projectPoints(
+                arr_3d, params["rvec"], params["tvec"],
+                params["K"], params["dist"]
+            )
+            pts_2d = pts_2d.reshape(-1, 2)
+
+            kp_2d = {}
+            for idx, ki in enumerate(indices):
+                kp_2d[ki] = (int(pts_2d[idx, 0]), int(pts_2d[idx, 1]))
+
+            for i, j in self._SKELETON:
+                if i in kp_2d and j in kp_2d:
+                    cv2.line(vis, kp_2d[i], kp_2d[j], color, 2, cv2.LINE_AA)
+
+            for ki, pt in kp_2d.items():
+                cv2.circle(vis, pt, 4, kp_color, -1, cv2.LINE_AA)
+
+            if 0 in kp_2d:
+                lx, ly = kp_2d[0]
+                cv2.putText(vis, f"P{pi}", (lx, ly - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+
+        return vis
+
+    def stop(self):
+        # Signal-only.  See CudaStreamDetectionWorker.stop() for why we do
+        # NOT close the pipeline here.
+        self.running = False
+        self._has_work.set()
 
 
 class OfflineProcessingWorker(QThread):
-    """Run the CUDA batch pipeline on a recorded session, then convert its
-    per-person CSV outputs into the unified keypoints_3d.csv + raw.npz that
-    the live path also produces.
+    """DEPRECATED: superseded by :class:`UnifiedOfflineWorker`.
 
-    Used when 'Pause live tracking during recording' is on AND 'Generate CSV
-    after save' is on: the live path can't fill the keypoint buffer, so we
-    re-run pose tracking offline against the saved videos.
+    Runs the CUDA batch pipeline (or the MPS batch pipeline on macOS) on a
+    recorded session, then converts its per-person CSV outputs into the
+    unified keypoints_3d.csv + raw.npz that the live path also produces.
+
+    The unified worker
+    (``calimerge.gui.unified_offline_worker.UnifiedOfflineWorker``) drives
+    the same per-sync streaming primitive that the live workers use, so
+    online and offline now share their inference + tracking code paths.
+    Differences in fragmentation behaviour, person-confidence defaults,
+    and tracker config between live and offline were the source of
+    multiple bugs that the unified path eliminates by construction.
+
+    Kept for now as a fallback: set the ``CALIMERGE_LEGACY_OFFLINE=1``
+    environment variable before launching to use this worker instead of
+    the unified one. Will be deleted once the unified worker has been
+    validated against a representative set of real recordings on both
+    CUDA and MPS — see TODO.md.
 
     Emits progress(step_name, fraction) so the UI can show a progress bar.
     """
@@ -1786,6 +2287,26 @@ class OfflineProcessingWorker(QThread):
         port_to_video: dict,
         frame_time_csv: "Path",
         batch_size: int = 8,
+        view_rotation: "np.ndarray | None" = None,
+        view_translation: "np.ndarray | None" = None,
+        # Tracker params. Defaults bumped from run_cuda_pipeline's stock
+        # values (0.15 m / 30 frames) to match what the live _LiveTracker
+        # uses (0.5 m + a long patience). The default 0.15 m gate
+        # rejects valid re-identifications across momentary detection
+        # gaps and was the main cause of one subject fragmenting into
+        # 13 person ids over a single trial. The C tracker also has a
+        # hard view-set constraint that breaks re-id when a camera
+        # misses one frame; we paper over that downstream by stitching
+        # tracks in _convert_outputs.
+        max_track_distance: float = 0.5,
+        track_patience: int = 60,
+        # Post-stitch params (Python-side). Stitches pairs of C tracks
+        # where (a) the gap between A's last frame and B's first frame
+        # is <= stitch_max_gap_frames, and (b) the hip-COM Euclidean
+        # distance is <= stitch_max_distance_m. Defeats the C-side
+        # view-set hard constraint without touching the C code.
+        stitch_max_gap_frames: int = 90,        # ~3 s @ 30 fps
+        stitch_max_distance_m: float = 0.6,
     ):
         super().__init__()
         self._session_dir = session_dir
@@ -1793,24 +2314,76 @@ class OfflineProcessingWorker(QThread):
         self._port_to_video = port_to_video
         self._frame_time_csv = frame_time_csv
         self._batch_size = int(batch_size)
+        # View transform (camera frame -> view frame) snapshotted at
+        # record-time. Forwarded to write_raw_buffer so the converted
+        # keypoints_3d.raw.npz mirrors what the live path would have saved.
+        self._view_rotation = view_rotation
+        self._view_translation = view_translation
+        self._max_track_distance = float(max_track_distance)
+        self._track_patience = int(track_patience)
+        self._stitch_max_gap_frames = int(stitch_max_gap_frames)
+        self._stitch_max_distance_m = float(stitch_max_distance_m)
+
+    @staticmethod
+    def _pick_offline_backend() -> str:
+        """Pick the offline pose-tracking backend for the current host.
+
+        Returns one of:
+            "mps"  — macOS + libcalimerge_mps.dylib loadable
+            "cuda" — Windows/Linux + calimerge_cuda.dll loadable
+            "none" — no native offline backend available
+
+        The output schema (per-track CSV filenames + columns) is identical
+        across "mps" and "cuda", so the downstream
+        :meth:`_convert_outputs` path is platform-blind.
+        """
+        import sys
+        if sys.platform == "darwin":
+            try:
+                from ..tracking.mps_offline_binding import is_available as _mps_avail
+                if _mps_avail():
+                    return "mps"
+            except Exception:
+                pass
+        try:
+            from ..tracking.cuda_binding import is_available as _cuda_avail
+            if _cuda_avail():
+                return "cuda"
+        except Exception:
+            pass
+        return "none"
 
     def run(self):
         try:
             from pathlib import Path
             import tempfile
+            import warnings
             from ..config import (
                 models_dir as _models_dir,
                 write_cuda_calibration_toml,
             )
-            from ..tracking.cuda_binding import run_cuda_pipeline
 
+            # Surface the deprecation both as a Python warning (caught by
+            # tooling / pytest) and as a Qt log message (visible in the
+            # workout-page status strip) so the user knows when the legacy
+            # path is in play. See class docstring for the migration plan.
+            warnings.warn(
+                "OfflineProcessingWorker is deprecated; use "
+                "UnifiedOfflineWorker instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            self.log_message.emit(
+                "[offline] DeprecationWarning: OfflineProcessingWorker is "
+                "deprecated; use UnifiedOfflineWorker instead."
+            )
+
+            backend = self._pick_offline_backend()
+
+            self.log_message.emit(f'[offline] backend={backend}')
             self.log_message.emit('[offline] writing calibration TOML...')
-            cuda_cal = Path(tempfile.gettempdir()) / 'calimerge_offline_cal.toml'
-            write_cuda_calibration_toml(self._cameras, cuda_cal)
-
-            onnx_dir = _models_dir() / 'onnx'
-            yolo_onnx = onnx_dir / 'yolo_v10s.onnx'
-            vitpose_onnx = onnx_dir / 'vitpose_synthpose.onnx'
+            offline_cal = Path(tempfile.gettempdir()) / 'calimerge_offline_cal.toml'
+            write_cuda_calibration_toml(self._cameras, offline_cal)
 
             self.progress.emit('starting', 0.0)
 
@@ -1820,22 +2393,62 @@ class OfflineProcessingWorker(QThread):
             def _on_log(msg: str):
                 self.log_message.emit(f'[offline] {msg}')
 
-            run_cuda_pipeline(
-                video_paths=self._port_to_video,
-                calibration_toml=cuda_cal,
-                frame_time_csv=self._frame_time_csv,
-                output_path=self._session_dir,
-                yolo_onnx=yolo_onnx if yolo_onnx.exists() else None,
-                vitpose_onnx=vitpose_onnx if vitpose_onnx.exists() else None,
-                batch_size=self._batch_size,
-                progress_callback=_on_prog,
-                log_callback=_on_log,
-            )
+            if backend == "mps":
+                from ..tracking.mps_offline_binding import run_mps_pipeline
+                # CoreML mlpackage models live alongside the ONNX models in
+                # the data dir, under coreml/ — same convention the live
+                # MPS path uses.
+                coreml_dir = _models_dir() / 'coreml'
+                yolo_pkg = coreml_dir / 'yolo_v10s.mlpackage'
+                vitpose_pkg = coreml_dir / 'vitpose_synthpose.mlpackage'
+
+                run_mps_pipeline(
+                    video_paths=self._port_to_video,
+                    calibration_toml=offline_cal,
+                    frame_time_csv=self._frame_time_csv,
+                    output_path=self._session_dir,
+                    yolo_coreml=yolo_pkg if yolo_pkg.exists() else None,
+                    vitpose_coreml=vitpose_pkg if vitpose_pkg.exists() else None,
+                    batch_size=self._batch_size,
+                    max_track_distance=self._max_track_distance,
+                    track_patience=self._track_patience,
+                    progress_callback=_on_prog,
+                    log_callback=_on_log,
+                )
+            elif backend == "cuda":
+                from ..tracking.cuda_binding import run_cuda_pipeline
+                onnx_dir = _models_dir() / 'onnx'
+                yolo_onnx = onnx_dir / 'yolo_v10s.onnx'
+                vitpose_onnx = onnx_dir / 'vitpose_synthpose.onnx'
+
+                run_cuda_pipeline(
+                    video_paths=self._port_to_video,
+                    calibration_toml=offline_cal,
+                    frame_time_csv=self._frame_time_csv,
+                    output_path=self._session_dir,
+                    yolo_onnx=yolo_onnx if yolo_onnx.exists() else None,
+                    vitpose_onnx=vitpose_onnx if vitpose_onnx.exists() else None,
+                    batch_size=self._batch_size,
+                    # Bumped from the run_cuda_pipeline 0.15 m / 30 frame
+                    # defaults to match the live tracker's tolerance.
+                    max_track_distance=self._max_track_distance,
+                    track_patience=self._track_patience,
+                    progress_callback=_on_prog,
+                    log_callback=_on_log,
+                )
+            else:
+                raise RuntimeError(
+                    "No offline pose-tracking backend available on this "
+                    "host. Build the CUDA dll (Windows) or the MPS dylib "
+                    "(macOS) before re-running."
+                )
 
             # Convert per-person C-side CSVs into the unified format the live
             # path uses, so notebooks and downstream readers see the same
             # keypoints_3d.raw.npz / keypoints_3d.csv regardless of how the
-            # session was processed.
+            # session was processed. The schema is identical across CUDA
+            # and MPS backends — same filenames, same columns — so this
+            # converter is platform-blind.
             self.progress.emit('converting CSV', 0.95)
             self._convert_outputs()
 
@@ -1846,31 +2459,61 @@ class OfflineProcessingWorker(QThread):
             self.failed.emit(f'{e}\n{traceback.format_exc()}')
 
     def _convert_outputs(self) -> None:
-        """Read per-person C-side wide CSVs and produce keypoints_3d.raw.npz
-        + keypoints_3d.csv in the long format the live path writes."""
+        """Read per-person C-side wide CSVs and produce
+        keypoints_3d.raw.npz + keypoints_3d.npz + keypoints_3d.csv in the
+        long format the live path writes.
+
+        Two passes:
+
+          1. Parse per-track CSVs into a (track_id) -> {sync: kps} map.
+          2. Stitch fragmented tracks. The C tracker enforces a hard
+             view-set match (pt_tracker.cpp) which spawns a fresh
+             track_id whenever the camera subset changes for a single
+             frame — so one subject ends up split into many tracks.
+             We greedily merge a 'late' track into an 'early' track if
+             the gap between them is small (< stitch_max_gap_frames)
+             AND the hip-COM jump is small (< stitch_max_distance_m).
+             For 1-person trials this collapses 13-fragment messes
+             back to a single track.
+          3. Re-emit the long-form npzs against the stitched tracks.
+        """
         import numpy as np
         from ..keypoint_export import write_raw_buffer
+        from ..analysis.keypoints_io import save_keypoints_3d
 
-        per_person = sorted(self._session_dir.glob('output_3d_poses_tracked_person*.csv'))
+        # The C-side exporter writes files named
+        # `output_3d_poses_tracked.csv_person<N>.csv` (see
+        # src/cuda_pipeline/pt_export.cpp). The previous glob
+        # `output_3d_poses_tracked_person*.csv` (underscore instead of
+        # `.csv_`) never matched anything, so the offline path produced
+        # zero npz outputs. Match both forms so old recordings keep working.
+        per_person = sorted(
+            list(self._session_dir.glob('output_3d_poses_tracked.csv_person*.csv'))
+            + list(self._session_dir.glob('output_3d_poses_tracked_person*.csv'))
+        )
         if not per_person:
             self.log_message.emit('[offline] no per-person CSVs to convert')
             return
 
-        # Build (sync_index, person_id) -> [(kp_idx, x, y, z), ...]
-        frames: dict[int, list[list["np.ndarray | None"]]] = {}
+        # ── Pass 1: parse each track into {sync: keypoint_list}. ──
+        # tracks: pid -> {sync: [np.array(3,) | None] of length n_kps}
+        tracks: dict[int, dict[int, list]] = {}
+        n_kps_global = 0
         for csv_path in per_person:
             try:
                 pid = int(csv_path.stem.rsplit('person', 1)[1])
             except Exception:
                 pid = 0
+            tracks.setdefault(pid, {})
             with open(csv_path, 'r', newline='') as f:
                 import csv as _csv
                 reader = _csv.reader(f)
                 header = next(reader, None)
                 if header is None:
                     continue
-                # Header: sync_index, person_id, K0_X, K0_Y, K0_Z, K1_X, ...
+                # sync_index, person_id, K0_X, K0_Y, K0_Z, K1_X, ...
                 n_kps = (len(header) - 2) // 3
+                n_kps_global = max(n_kps_global, n_kps)
                 for row in reader:
                     if len(row) < 2 + 3 * n_kps:
                         continue
@@ -1887,21 +2530,38 @@ class OfflineProcessingWorker(QThread):
                             kps_for_person.append(None)
                         else:
                             try:
-                                kps_for_person.append(np.array([float(sx), float(sy), float(sz)]))
+                                kps_for_person.append(
+                                    np.array([float(sx), float(sy), float(sz)])
+                                )
                             except ValueError:
                                 kps_for_person.append(None)
-                    frames.setdefault(sync, [None] * 1)  # type: ignore[arg-type]
-                    while len(frames[sync]) <= pid:
-                        frames[sync].append(None)
-                    frames[sync][pid] = kps_for_person
+                    tracks[pid][sync] = kps_for_person
 
-        if not frames:
+        if not tracks:
             return
 
-        recording: list[dict] = []
-        sync_indices = sorted(frames.keys())
-        # Use sync_index / FPS estimate for time. If no frame_time_csv parsed,
-        # synthesize 30fps. Conservative — better than no time axis.
+        # ── Pass 2: stitch tracks that look like the same subject. ──
+        n_before = len(tracks)
+        tracks = self._stitch_tracks(tracks)
+        if n_before != len(tracks):
+            self.log_message.emit(
+                f'[offline] stitched {n_before} tracks -> {len(tracks)} '
+                f'(gap<={self._stitch_max_gap_frames}f, '
+                f'dist<={self._stitch_max_distance_m:.2f}m)'
+            )
+
+        # ── Re-emit the long-form (sync -> persons-list) buffer from
+        # the stitched tracks. Stable pid order so person 0 stays the
+        # subject. ──
+        sorted_pids = sorted(tracks.keys())
+        pid_to_idx = {pid: i for i, pid in enumerate(sorted_pids)}
+        all_syncs: set[int] = set()
+        for sync_map in tracks.values():
+            all_syncs.update(sync_map.keys())
+        sync_indices = sorted(all_syncs)
+
+        # FPS for the time axis: prefer frame_time_history.csv, fall back
+        # to 30 fps. Same logic as before.
         fps_est = 30.0
         try:
             with open(self._frame_time_csv, 'r', newline='') as ft:
@@ -1912,15 +2572,22 @@ class OfflineProcessingWorker(QThread):
                 if len(rows) > 1:
                     times = [float(r[3]) for r in rows if len(r) > 3]
                     if len(times) > 1:
-                        dt = (max(times) - min(times)) / max(1, (len(times) - 1))
+                        dt = (
+                            (max(times) - min(times))
+                            / max(1, (len(times) - 1))
+                        )
                         if dt > 0:
                             fps_est = 1.0 / dt
         except Exception:
             pass
 
+        recording: list[dict] = []
         for sync in sync_indices:
-            persons = frames[sync]
-            # Drop None placeholders past the last real person.
+            persons: list = [None] * len(sorted_pids)
+            for pid, sync_map in tracks.items():
+                kps = sync_map.get(sync)
+                if kps is not None:
+                    persons[pid_to_idx[pid]] = kps
             while persons and persons[-1] is None:
                 persons.pop()
             recording.append({
@@ -1929,7 +2596,140 @@ class OfflineProcessingWorker(QThread):
                 'primary_index': 0,
             })
 
-        npz_path = self._session_dir / 'keypoints_3d.raw.npz'
-        write_raw_buffer(npz_path, recording)
-        self.log_message.emit(f'[offline] wrote {npz_path.name} ({len(recording)} frames)')
+        # write keypoints_3d.raw.npz (the existing canonical write) ...
+        # The deprecated worker only ever runs the C-side CUDA batch
+        # pipeline, so backend is always "cuda" and model is the
+        # SynthPose VitPose ONNX. Pin them as constants here so the
+        # npz is self-describing without us having to carry a setting.
+        raw_path = self._session_dir / 'keypoints_3d.raw.npz'
+        write_raw_buffer(
+            raw_path,
+            recording,
+            view_rotation=self._view_rotation,
+            view_translation=self._view_translation,
+            model_backend='cuda',
+            model_name='vitpose_synthpose',
+        )
+        # ... AND keypoints_3d.npz, the file the notebook + workout
+        # playback widget read. Live trials write both; offline trials
+        # used to drop this one entirely, which is why the user got no
+        # npz from a paused-tracking trial.
+        npz_path = self._session_dir / 'keypoints_3d.npz'
+        try:
+            save_keypoints_3d(
+                npz_path,
+                recording,
+                num_keypoints=max(1, n_kps_global),
+                view_rotation=self._view_rotation,
+                view_translation=self._view_translation,
+                model_backend='cuda',
+                model_name='vitpose_synthpose',
+            )
+            self.log_message.emit(
+                f'[offline] wrote {raw_path.name} + {npz_path.name} '
+                f'({len(recording)} frames, {len(sorted_pids)} tracks)'
+            )
+        except Exception as e:
+            self.log_message.emit(
+                f'[offline] wrote {raw_path.name} only; {npz_path.name} '
+                f'failed: {e}'
+            )
+
+    @staticmethod
+    def _hip_com(kps: list) -> "np.ndarray | None":
+        """Hip COM from a keypoint list; falls back to a wider torso
+        average if the hips themselves are NaN. Used for stitching.
+        SynthPose-52: 11 = L_Hip, 12 = R_Hip, 5 = L_Sho, 6 = R_Sho.
+        """
+        import numpy as np
+        pts = []
+        for idx in (11, 12):
+            if idx < len(kps) and kps[idx] is not None:
+                arr = np.asarray(kps[idx], dtype=float)
+                if arr.size >= 3 and not np.isnan(arr[:3]).any():
+                    pts.append(arr[:3])
+        if not pts:
+            for idx in (5, 6):
+                if idx < len(kps) and kps[idx] is not None:
+                    arr = np.asarray(kps[idx], dtype=float)
+                    if arr.size >= 3 and not np.isnan(arr[:3]).any():
+                        pts.append(arr[:3])
+        if not pts:
+            return None
+        return np.mean(pts, axis=0)
+
+    def _stitch_tracks(
+        self,
+        tracks: dict[int, dict[int, list]],
+    ) -> dict[int, dict[int, list]]:
+        """Greedy temporal stitching of fragmented C-side tracks.
+
+        For each pair (A, B) where A's last sync precedes B's first
+        sync, merge B into A if:
+          - B's first sync - A's last sync <= stitch_max_gap_frames
+          - || hip_COM(B's first frame) - hip_COM(A's last frame) ||
+              <= stitch_max_distance_m
+
+        Lower track_id is the survivor (matches "first appearance wins"
+        which keeps the originally-detected primary subject). Iterates
+        until no more merges. Worst case O(n^2) over track count, but
+        n is typically <= 20 even in pathological cases.
+        """
+        import numpy as np
+
+        if not tracks:
+            return tracks
+
+        gap_max = self._stitch_max_gap_frames
+        dist_max = self._stitch_max_distance_m
+
+        def _summary(sync_map: dict[int, list]):
+            if not sync_map:
+                return None
+            syncs = sorted(sync_map.keys())
+            first_sync, last_sync = syncs[0], syncs[-1]
+            first_com = self._hip_com(sync_map[first_sync])
+            last_com = self._hip_com(sync_map[last_sync])
+            return first_sync, last_sync, first_com, last_com
+
+        merged = True
+        while merged:
+            merged = False
+            ids = sorted(tracks.keys())
+            for i in range(len(ids)):
+                a = ids[i]
+                if a not in tracks:
+                    continue
+                a_sum = _summary(tracks[a])
+                if a_sum is None:
+                    continue
+                _, a_last, _, a_last_com = a_sum
+                if a_last_com is None:
+                    continue
+                for j in range(i + 1, len(ids)):
+                    b = ids[j]
+                    if b not in tracks or a not in tracks:
+                        continue
+                    b_sum = _summary(tracks[b])
+                    if b_sum is None:
+                        continue
+                    b_first, b_last, b_first_com, _ = b_sum
+                    if b_first_com is None:
+                        continue
+                    if b_first <= a_last:
+                        # Tracks overlap in time -> they ARE separate
+                        # people, not a fragmentation. Don't merge.
+                        continue
+                    if b_first - a_last > gap_max:
+                        continue
+                    if float(np.linalg.norm(a_last_com - b_first_com)) > dist_max:
+                        continue
+                    # Merge B into A.
+                    tracks[a].update(tracks[b])
+                    del tracks[b]
+                    merged = True
+                    break
+                if merged:
+                    break
+        return tracks
 

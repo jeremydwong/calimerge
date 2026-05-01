@@ -12,7 +12,6 @@ from pathlib import Path
 from datetime import datetime
 import time
 
-import cv2
 import numpy as np
 
 from PySide6.QtWidgets import (
@@ -69,9 +68,17 @@ def camera_color(port: int) -> QColor:
 class FpsGraphWidget(QWidget):
     """Rolling FPS graph with one line per camera."""
 
-    def __init__(self, buffer_size: int = 120, parent: QWidget | None = None):
+    def __init__(
+        self,
+        buffer_size: int = 120,
+        parent: QWidget | None = None,
+        y_max_factor: float = 1.5,
+        time_window_s: float | None = None,
+    ):
         super().__init__(parent)
         self.buffer_size = buffer_size
+        self._y_max_factor = y_max_factor
+        self._time_window_s = time_window_s
         self._series: dict[int, deque[float]] = {}
         self._names: dict[int, str] = {}
         self._target_fps: int = 30
@@ -80,8 +87,14 @@ class FpsGraphWidget(QWidget):
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
     def set_target_fps(self, fps: int):
-        """Set target FPS - Y-axis fixed at 0 to 1.5*target."""
+        """Set target FPS - Y-axis fixed at 0 to y_max_factor*target."""
         self._target_fps = max(1, fps)
+        if self._time_window_s is not None:
+            new_size = max(2, int(round(self._target_fps * self._time_window_s)))
+            if new_size != self.buffer_size:
+                self.buffer_size = new_size
+                for port, dq in list(self._series.items()):
+                    self._series[port] = deque(dq, maxlen=new_size)
         self.update()
 
     def set_cameras(self, camera_info: dict[int, str]):
@@ -122,8 +135,8 @@ class FpsGraphWidget(QWidget):
             painter.end()
             return
 
-        # Fixed Y-axis: 0 to 1.5 * target FPS
-        y_max = int(self._target_fps * 1.5)
+        # Fixed Y-axis: 0 to y_max_factor * target FPS
+        y_max = max(1, int(round(self._target_fps * self._y_max_factor)))
         time_span_s = self.buffer_size / max(self._target_fps, 1)
 
         # Y-axis grid lines
@@ -204,7 +217,7 @@ class CamerasTab(QWidget):
         self.preview_worker: CameraPreviewWorker | None = None
         self.recording_worker: RecordingWorker | None = None
         self.detection_worker: PoseDetectionWorker | None = None
-        self._last_annotated: dict[int, "np.ndarray"] = {}  # port -> last annotated frame
+        self._last_annotated: set[int] = set()  # ports that have received >=1 annotation
         self.opened_cameras: list = []
         self.opened_ports: list[int] = []
         from ...config import default_recordings_dir
@@ -1089,22 +1102,24 @@ class CamerasTab(QWidget):
     # ── Frame handling ──
 
     def _on_frame_received(self, port: int, frame):
-        # If live detection is active, send frame to detection worker
-        if self.detection_worker is not None and self.detection_worker.isRunning():
-            self.detection_worker.submit_frame(port, frame)
-            # Show last annotated frame (faded) instead of raw to avoid flicker
-            if port in self._last_annotated:
-                # Fade overlay by 5%: blend 95% last annotated + 5% raw
-                blended = cv2.addWeighted(
-                    self._last_annotated[port], 0.95, frame, 0.05, 0
-                )
-                self._last_annotated[port] = blended
-                self.camera_grid.update_frame(port, blended)
-            else:
-                # No annotation yet for this port — show raw
-                self.camera_grid.update_frame(port, frame)
+        detection_running = (
+            self.detection_worker is not None
+            and self.detection_worker.isRunning()
+        )
+
+        # When detection is on AND we already have at least one annotated frame
+        # for this port, skip painting raw — _on_detection_ready will repaint
+        # whenever the next detection lands. This avoids the per-frame
+        # cv2.addWeighted full-frame blend on the GUI thread that was the main
+        # source of GUI-thread saturation when live tracking was enabled.
+        if detection_running and port in self._last_annotated:
+            pass
         else:
             self.camera_grid.update_frame(port, frame)
+
+        # Forward the raw frame to the detection worker.
+        if detection_running:
+            self.detection_worker.submit_frame(port, frame)
 
         # Compute FPS
         now = time.perf_counter()
@@ -1116,7 +1131,7 @@ class CamerasTab(QWidget):
 
     def _on_detection_ready(self, port: int, annotated_frame):
         """Replace the camera grid frame with the annotated version."""
-        self._last_annotated[port] = annotated_frame.copy()
+        self._last_annotated.add(port)
         self.camera_grid.update_frame(port, annotated_frame)
 
     def _on_preview_error(self, error: str):

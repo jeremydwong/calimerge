@@ -115,3 +115,11 @@ output.txt
 
 # ── Claude Code worktrees ──
 .claude/worktrees/
+
+# Test fixture videos / npz dumps — regenerable via
+# tests/manual/run_offline_pipeline_on_test_data.py
+tests/data/
+
+# Recovery snapshots from in-place stash repair sessions; leave on
+# disk for safety, never commit.
+.recovery_backup/
