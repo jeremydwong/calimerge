@@ -47,7 +47,7 @@ def main() -> int:
     sessions = list_extrinsic_sessions()
     print(f"\nall extrinsic sessions in db ({len(sessions)} total, newest-first):")
     for s in sessions:
-        marker = " ← chosen" if str(s["created_at"]) <= RECORDING_ISO else ""
+        marker = " <-- chosen" if str(s["created_at"]) <= RECORDING_ISO else ""
         delta = "before" if str(s["created_at"]) <= RECORDING_ISO else "after "
         print(
             f"  id={s['id']:>3}  created={s['created_at']}  ({delta} recording){marker}"

@@ -34,6 +34,7 @@ import argparse
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -42,7 +43,7 @@ import numpy as np
 REPO = Path(__file__).resolve().parents[2]
 RECORDING_NAME = "zelda_20260428_151934_fga_horizontal_head_turns"
 ZELDA = REPO / "tests" / "data" / RECORDING_NAME
-BASELINE_TMP = Path("/tmp") / f"baseline_{RECORDING_NAME}_keypoints_3d.npz"
+BASELINE_TMP = Path(tempfile.gettempdir()) / f"baseline_{RECORDING_NAME}_keypoints_3d.npz"
 RUNNER = REPO / "tests" / "manual" / "run_offline_pipeline_on_test_data.py"
 
 # Hip indices for SynthPose-52 (= COCO-17 indices for hips)
@@ -61,7 +62,7 @@ def _extract_baseline_from_git() -> bool:
     if rc != 0 or BASELINE_TMP.stat().st_size == 0:
         print(f"[baseline] FAILED to extract from git ({cmd})")
         return False
-    print(f"[baseline] saved git HEAD copy → {BASELINE_TMP} "
+    print(f"[baseline] saved git HEAD copy -> {BASELINE_TMP} "
           f"({BASELINE_TMP.stat().st_size} bytes)")
     return True
 
@@ -71,7 +72,7 @@ def _stage_baseline_from_path(src: Path) -> bool:
         print(f"[baseline] FAILED: --baseline-path {src} does not exist")
         return False
     shutil.copy2(src, BASELINE_TMP)
-    print(f"[baseline] copied {src} → {BASELINE_TMP} "
+    print(f"[baseline] copied {src} -> {BASELINE_TMP} "
           f"({BASELINE_TMP.stat().st_size} bytes)")
     return True
 
@@ -98,7 +99,7 @@ def _run_backend(backend: str) -> bool:
     """Run the offline pipeline for one backend; copy outputs into per-backend files."""
     print(f"\n[run] backend={backend} (full recording, no sync cap)")
     cmd = [
-        "uv", "run", "python3", str(RUNNER),
+        sys.executable, str(RUNNER),
         "--unified-backend", backend,
     ]
     rc = subprocess.run(cmd, cwd=str(REPO)).returncode
@@ -113,7 +114,7 @@ def _run_backend(backend: str) -> bool:
         print(f"[run] expected {src} after run, missing")
         return False
     shutil.copy2(src, dst)
-    print(f"[run] snapshot → {dst.name}")
+    print(f"[run] snapshot -> {dst.name}")
     return True
 
 
@@ -299,7 +300,7 @@ def _print_report(label: str, baseline_path: Path, backend_path: Path) -> None:
     print(f"  backend:   backend={backend_params.get('model_backend','?')}  model={backend_params.get('model_name','?')}")
     params_ok = _check_param_invariant(baseline_params, backend_params)
     if not params_ok:
-        print("  ⚠ tracker params diverge between baseline and backend — distance metrics below are not apples-to-apples.")
+        print("  [WARN] tracker params diverge between baseline and backend -- distance metrics below are not apples-to-apples.")
 
     base = np.load(baseline_path)["keypoints_3d"]
     back = np.load(backend_path)["keypoints_3d"]
@@ -356,6 +357,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Local npz to use as the baseline (overrides git extraction). "
              "Useful when the new baseline hasn't been committed yet.",
     )
+    parser.add_argument(
+        "--visualize", action="store_true",
+        help="After comparison, run annotate_offline_npz.py and "
+             "plot_offline_diagnostics.py for each backend, writing output "
+             "to <recordings_dir>/<recording_name>/annotated/.",
+    )
     args = parser.parse_args(argv)
 
     if args.baseline_path is not None:
@@ -390,6 +397,30 @@ def main(argv: list[str] | None = None) -> int:
     baseline_path = BASELINE_TMP
     for b in available:
         _print_report(f"{b}", baseline_path, ZELDA / f"keypoints_3d.{b}.npz")
+
+    if args.visualize and available:
+        from calimerge.config import workouts_db_path
+        out_dir = workouts_db_path().parent / RECORDING_NAME / "annotated"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        print(f"\n[visualize] output dir: {out_dir}")
+        annotate = REPO / "tests" / "manual" / "annotate_offline_npz.py"
+        diag = REPO / "tests" / "manual" / "plot_offline_diagnostics.py"
+        for b in available:
+            npz_name = f"keypoints_3d.{b}.npz"
+            if not (ZELDA / npz_name).exists():
+                continue
+            print(f"\n[visualize] annotating {b}...")
+            subprocess.run(
+                [sys.executable, str(annotate),
+                 "--npz", npz_name, "--out-dir", str(out_dir)],
+                cwd=str(REPO),
+            )
+            print(f"[visualize] plotting diagnostics {b}...")
+            subprocess.run(
+                [sys.executable, str(diag),
+                 "--npz", npz_name, "--out-dir", str(out_dir)],
+                cwd=str(REPO),
+            )
 
     print("\n[done]")
     return 0

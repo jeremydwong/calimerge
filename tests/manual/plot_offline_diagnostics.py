@@ -230,13 +230,17 @@ def main(argv: list[str] | None = None) -> int:
         "--out-stem", type=str, default=None,
         help="override output filename stem (default derived from --npz)",
     )
+    parser.add_argument(
+        "--out-dir", type=Path, default=None,
+        help="Output directory; default is <recording>/annotated/.",
+    )
     args = parser.parse_args(argv)
 
     npz_path = ZELDA / args.npz
     if not npz_path.exists():
         print(f"missing: {npz_path}")
         return 1
-    out_dir = ZELDA / "annotated"
+    out_dir = args.out_dir if args.out_dir is not None else ZELDA / "annotated"
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = args.out_stem or Path(args.npz).stem  # e.g. keypoints_3d, keypoints_3d.mps
 

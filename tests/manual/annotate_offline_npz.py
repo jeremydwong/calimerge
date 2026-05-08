@@ -213,6 +213,10 @@ def main(argv: list[str] | None = None) -> int:
         "--out-name", type=str, default=None,
         help="Override the output filename stem; default derives from --npz.",
     )
+    parser.add_argument(
+        "--out-dir", type=Path, default=None,
+        help="Output directory; default is <recording>/annotated/.",
+    )
     args = parser.parse_args(argv)
 
     npz_path = ZELDA / args.npz
@@ -268,7 +272,7 @@ def main(argv: list[str] | None = None) -> int:
     Ps = _compute_proj_matrices(session_id, list(port_to_video.keys()))
     out_stem = args.out_name or Path(args.npz).stem  # e.g. 'keypoints_3d' or 'keypoints_3d.mps'
 
-    out_dir = ZELDA / "annotated"
+    out_dir = args.out_dir if args.out_dir is not None else ZELDA / "annotated"
     print(f"output dir: {out_dir}")
 
     rc = 0
