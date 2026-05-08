@@ -57,12 +57,6 @@ dependencies = [
     { name = "rtoml" },
     { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "scipy", version = "1.17.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-    { name = "torch", version = "2.10.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin'" },
-    { name = "torch", version = "2.10.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform != 'darwin'" },
-    { name = "torchvision", version = "0.25.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin'" },
-    { name = "torchvision", version = "0.25.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform != 'darwin'" },
-    { name = "transformers" },
-    { name = "ultralytics" },
 ]
 
 [package.optional-dependencies]
@@ -70,6 +64,15 @@ dev = [
     { name = "pytest" },
     { name = "pytest-qt" },
     { name = "ruff" },
+]
+pytorch-backend = [
+    { name = "pillow" },
+    { name = "torch", version = "2.10.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin'" },
+    { name = "torch", version = "2.10.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform != 'darwin'" },
+    { name = "torchvision", version = "0.25.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin'" },
+    { name = "torchvision", version = "0.25.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform != 'darwin'" },
+    { name = "transformers" },
+    { name = "ultralytics" },
 ]
 
 [package.metadata]
@@ -82,6 +85,7 @@ requires-dist = [
     { name = "onnxscript", specifier = ">=0.6.2" },
     { name = "opencv-contrib-python", specifier = ">=4.8.0" },
     { name = "pandas", specifier = ">=2.0.0" },
+    { name = "pillow", marker = "extra == 'pytorch-backend'", specifier = ">=9.0.0" },
     { name = "pyqtgraph", specifier = ">=0.13.0" },
     { name = "pyside6", specifier = ">=6.6.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0.0" },
@@ -89,14 +93,14 @@ requires-dist = [
     { name = "rtoml", specifier = ">=0.10.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.1.0" },
     { name = "scipy", specifier = ">=1.11.0" },
-    { name = "torch", marker = "sys_platform != 'darwin'", specifier = ">=2.0.0", index = "https://download.pytorch.org/whl/cu128" },
-    { name = "torch", marker = "sys_platform == 'darwin'", specifier = ">=2.0.0", index = "https://pypi.org/simple" },
-    { name = "torchvision", marker = "sys_platform != 'darwin'", specifier = ">=0.15.0", index = "https://download.pytorch.org/whl/cu128" },
-    { name = "torchvision", marker = "sys_platform == 'darwin'", specifier = ">=0.15.0", index = "https://pypi.org/simple" },
-    { name = "transformers", specifier = ">=4.36.0" },
-    { name = "ultralytics", specifier = ">=8.0.0" },
+    { name = "torch", marker = "sys_platform == 'darwin' and extra == 'pytorch-backend'", specifier = ">=2.0.0", index = "https://pypi.org/simple" },
+    { name = "torch", marker = "sys_platform != 'darwin' and extra == 'pytorch-backend'", specifier = ">=2.0.0", index = "https://download.pytorch.org/whl/cu128" },
+    { name = "torchvision", marker = "sys_platform == 'darwin' and extra == 'pytorch-backend'", specifier = ">=0.15.0", index = "https://pypi.org/simple" },
+    { name = "torchvision", marker = "sys_platform != 'darwin' and extra == 'pytorch-backend'", specifier = ">=0.15.0", index = "https://download.pytorch.org/whl/cu128" },
+    { name = "transformers", marker = "extra == 'pytorch-backend'", specifier = ">=4.36.0" },
+    { name = "ultralytics", marker = "extra == 'pytorch-backend'", specifier = ">=8.0.0" },
 ]
-provides-extras = ["dev"]
+provides-extras = ["dev", "pytorch-backend"]
 
 [[package]]
 name = "certifi"
