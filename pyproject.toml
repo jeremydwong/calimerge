@@ -14,10 +14,6 @@ dependencies = [
     "numba>=0.59.0",
     "scipy>=1.11.0",
     "rtoml>=0.10.0",
-    "torch>=2.0.0",
-    "torchvision>=0.15.0",
-    "transformers>=4.36.0",
-    "ultralytics>=8.0.0",
     "huggingface-hub>=0.20.0",
     "pandas>=2.0.0",
     "onnxscript>=0.6.2",
@@ -31,6 +27,13 @@ dev = [
     "pytest>=7.0.0",
     "pytest-qt>=4.2.0",
     "ruff>=0.1.0",
+]
+pytorch-backend = [
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+    "transformers>=4.36.0",
+    "ultralytics>=8.0.0",
+    "Pillow>=9.0.0",
 ]
 
 [project.scripts]
