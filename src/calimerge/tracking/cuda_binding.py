@@ -55,12 +55,30 @@ _AVAILABLE = False
 def _load_library() -> None:
     global _LIB, _AVAILABLE
 
-    # Search paths: cuda_pipeline dir (sibling of calimerge package),
-    # next to this file, system PATH
+    # Search paths: build output dir (preferred), cuda_pipeline source dir,
+    # next to this file.
+    _repo = Path(__file__).resolve().parent.parent.parent.parent
     search_dirs = [
-        Path(__file__).resolve().parent.parent.parent / "cuda_pipeline",
+        _repo / "build" / "cuda",
+        _repo / "src" / "cuda_pipeline",
         Path(__file__).resolve().parent,
     ]
+
+    # On Windows, register known dependency directories so the DLL loader
+    # can find TensorRT, CUDA runtime, and OpenCV regardless of PATH.
+    import os, sys
+    if sys.platform == "win32" and hasattr(os, "add_dll_directory"):
+        _dep_dirs = [
+            Path(r"C:\TensorRT\lib"),
+            Path(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9\bin"),
+            Path(r"C:\OpenCV\opencv\build\x64\vc16\bin"),
+        ]
+        for dep in _dep_dirs:
+            if dep.exists():
+                try:
+                    os.add_dll_directory(str(dep))
+                except OSError:
+                    pass
 
     for d in search_dirs:
         dll_path = d / "calimerge_cuda.dll"
