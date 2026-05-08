@@ -5,6 +5,9 @@
 :: Output: build\native\ (relative to repo root)
 
 echo Build script starting...
+:: vswhere.exe is not on PATH by default; prepend its dir to suppress the
+:: harmless "not recognized" warning VsDevCmd.bat emits when it can't find it.
+set PATH=C:\Program Files (x86)\Microsoft Visual Studio\Installer;%PATH%
 call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat" -arch=amd64
 
 :: Resolve repo root (two levels up from src/native/)

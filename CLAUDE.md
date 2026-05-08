@@ -194,6 +194,32 @@ eval "$('/c/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/Common7/
 # "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat"
 ```
 
+#### vswhere.exe warning (do not chase this)
+
+`VsDevCmd.bat` internally calls `vswhere.exe` to locate VS installs. On this
+machine `vswhere.exe` is NOT on PATH by default, so you see:
+
+```
+'vswhere.exe' is not recognized as an internal or external command
+```
+
+**This is harmless** — VsDevCmd.bat still sets up cl.exe/link.exe correctly
+and the build proceeds. Do NOT treat this as a build failure or spend time
+diagnosing it.
+
+To suppress the warning in any `.bat` build script, prepend vswhere to PATH
+**before** calling VsDevCmd.bat:
+
+```bat
+set PATH=C:\Program Files (x86)\Microsoft Visual Studio\Installer;%PATH%
+call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat" -arch=amd64
+```
+
+`vswhere.exe` lives at:
+```
+C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe
+```
+
 Build the native Windows DLL:
 ```bash
 bash build.sh release                   # preferred — cross-platform dispatcher

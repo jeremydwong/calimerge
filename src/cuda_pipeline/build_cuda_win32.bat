@@ -18,6 +18,8 @@ echo.
 setlocal
 
 :: ---- MSVC ----
+:: vswhere.exe is not on PATH by default — prepend to suppress harmless warning.
+set PATH=C:\Program Files (x86)\Microsoft Visual Studio\Installer;%PATH%
 call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat" -arch=amd64
 
 :: ---- CUDA 12.9 ----
