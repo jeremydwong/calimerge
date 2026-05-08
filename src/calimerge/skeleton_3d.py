@@ -17,12 +17,18 @@ from statistics import median
 
 import numpy as np
 
-from .tracking.markers import SYNTHPOSE_MARKERS
+from .tracking.registry import SYNTHPOSE_SCHEMA  # re-export for back-compat
 from .types import KeypointSchema, Skeleton3D, XYZPoints
 
-
-SYNTHPOSE_SCHEMA = KeypointSchema(
-    names=tuple(SYNTHPOSE_MARKERS[i] for i in sorted(SYNTHPOSE_MARKERS))
+__all__ = (
+    "SYNTHPOSE_SCHEMA",
+    "Skeleton3D",
+    "XYZPoints",
+    "KeypointSchema",
+    "build_skeleton_3d",
+    "load_skeleton_3d_npz",
+    "load_sync_index_times",
+    "save_skeleton_3d_npz",
 )
 
 

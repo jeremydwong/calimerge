@@ -219,36 +219,66 @@ int pt_coreml_infer(PT_CoreMLModel *model,
 
         MLMultiArray *output_array = output_feat.multiArrayValue;
 
-        /* Copy output to caller's buffer */
+        /* MLMultiArray storage may not be contiguous: CoreML often pads
+         * inner dimensions for SIMD alignment. For (batch, 300, 6) FP16,
+         * we've observed strides=[9600, 32, 1] — i.e. each detection has
+         * 26 fp16 slots of padding after its 6 real fields. Reading the
+         * raw dataPointer assuming unit strides yields valid det[0] then
+         * 26 zero values (the padding) being misread as det[1..5]. Honor
+         * strides explicitly. */
+        NSArray<NSNumber *> *out_shape = output_array.shape;
+        NSArray<NSNumber *> *out_strides = output_array.strides;
+        int rank = (int)out_shape.count;
+        int dims[8] = {0};
+        int strs[8] = {0};
+        for (int i = 0; i < rank && i < 8; i++) {
+            dims[i] = out_shape[i].intValue;
+            strs[i] = out_strides[i].intValue;
+        }
+
         int out_count = (int)output_array.count;
-        if (output_array.dataType == MLMultiArrayDataTypeFloat32) {
-            memcpy(output_data, output_array.dataPointer,
-                   out_count * sizeof(float));
-        } else if (output_array.dataType == MLMultiArrayDataTypeFloat16) {
-            /* Convert fp16 -> fp32 */
-            const uint16_t *fp16 = (const uint16_t *)output_array.dataPointer;
-            for (int i = 0; i < out_count; i++) {
-                /* Use vImage or manual conversion */
-                uint16_t h = fp16[i];
+        const uint8_t *base = (const uint8_t *)output_array.dataPointer;
+        size_t elem_size =
+            (output_array.dataType == MLMultiArrayDataTypeFloat32) ? 4 :
+            (output_array.dataType == MLMultiArrayDataTypeFloat16) ? 2 :
+            (output_array.dataType == MLMultiArrayDataTypeDouble)  ? 8 : 0;
+
+        /* Walk canonical index 0..count-1, decompose into per-axis indices
+         * by repeated divmod against the shape, then dot with strides for
+         * the byte offset. Works for any rank up to 8 and any stride
+         * pattern, contiguous or otherwise. */
+        for (int i = 0; i < out_count; i++) {
+            int rem = i;
+            size_t offset = 0;
+            for (int a = rank - 1; a >= 0; a--) {
+                int idx = rem % dims[a];
+                rem /= dims[a];
+                offset += (size_t)idx * (size_t)strs[a];
+            }
+            offset *= elem_size;
+            const void *p = base + offset;
+            float v;
+            if (output_array.dataType == MLMultiArrayDataTypeFloat32) {
+                v = *(const float *)p;
+            } else if (output_array.dataType == MLMultiArrayDataTypeFloat16) {
+                uint16_t h = *(const uint16_t *)p;
                 uint32_t sign = (h >> 15) & 1;
                 uint32_t exp  = (h >> 10) & 0x1F;
                 uint32_t frac = h & 0x3FF;
                 uint32_t f;
                 if (exp == 0) {
-                    f = sign << 31;  /* zero or subnormal (treat as zero) */
+                    f = sign << 31;
                 } else if (exp == 31) {
-                    f = (sign << 31) | 0x7F800000 | (frac << 13);  /* inf/nan */
+                    f = (sign << 31) | 0x7F800000 | (frac << 13);
                 } else {
                     f = (sign << 31) | ((exp + 112) << 23) | (frac << 13);
                 }
-                memcpy(&output_data[i], &f, sizeof(float));
+                memcpy(&v, &f, sizeof(float));
+            } else {
+                v = (float)[[output_array objectAtIndexedSubscript:i]
+                            floatValue];
             }
-        } else {
-            /* Double or other — cast element by element */
-            for (int i = 0; i < out_count; i++) {
-                output_data[i] = (float)[[output_array objectAtIndexedSubscript:i]
-                                         floatValue];
-            }
+            output_data[i] = v;
         }
     }
 

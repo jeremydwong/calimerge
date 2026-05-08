@@ -70,12 +70,12 @@ from .programs import DEFAULT_PROGRAMS
 def workout_spec_db_path() -> Path:
     """Single-file location for the spec DB.
 
-    Lives alongside ``view_transforms.db`` under ``<app_data>/models/``
-    rather than ``workouts.db`` because (a) it is content-addressable
-    factory data, not user-generated, and (b) workouts.db is in the
-    user's project tree where it gets backed up — this DB is regenerable.
+    Lives at the app-data top level alongside ``view_transforms.db``,
+    ``extrinsics.db``, etc. — these are app-state databases, not ML
+    artifacts, so they belong outside ``models/``. The DB is rebuildable
+    from ``programs.py`` defaults if missing.
     """
-    return data_dir() / "models" / "workout_spec.db"
+    return data_dir() / "workout_spec.db"
 
 
 # ── Per-workout-type analyser + threshold metadata ─────────────────────

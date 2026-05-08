@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## No ad-hoc `python -c` for diagnosis
+## No ad-hoc `python -c` for diagnosis — **ALWAYS use a file**
 
 When a bug needs Python to investigate (loading an npz, parsing a CSV,
 checking the shape of a structure, comparing two arrays, etc.), **do not
@@ -15,6 +15,27 @@ real file under `tests/`:
 
 This rule applies even mid-debug-session when "just one quick check"
 feels efficient. The throwaway scripts reproduce; the inline ones don't.
+
+**Wrong** (do not do, even for "tiny" checks):
+
+```bash
+uv run python3 -c "
+import numpy as np
+d = np.load('foo.npz')
+print('keys:', d.files, 'shape:', d['kp'].shape)
+"
+```
+
+**Right** — always:
+
+```
+1. Write tests/manual/inspect_foo_npz.py (or test_scratch.py for one-off).
+2. Run via:  uv run python3 tests/manual/inspect_foo_npz.py
+```
+
+The `tests/manual/*.py` pattern is also pre-approved in
+`.claude/settings.local.json`, so it doesn't prompt for permission. The
+inline variant DOES prompt and breaks flow. Both reasons; pick the file.
 
 ## Active focus
 

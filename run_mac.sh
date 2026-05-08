@@ -34,25 +34,57 @@ if [[ ${#args[@]} -eq 0 ]]; then
 fi
 
 NATIVE_LIB="build/native/libcalimerge.dylib"
+MPS_LIB="build/mps/libcalimerge_mps.dylib"
 
-needs_build=0
+# Returns 0 (true) if $1 (the dylib) is missing or older than any matching
+# source under $2 (the source dir). Globs are passed as remaining args.
+is_stale() {
+    local target="$1"; shift
+    local src_dir="$1"; shift
+    [[ ! -f "$target" ]] && return 0
+    local found
+    found=$(find "$src_dir" -type f \( "$@" \) -newer "$target" -print -quit 2>/dev/null || true)
+    [[ -n "$found" ]]
+}
+
+# ---- native camera dylib ----
+needs_native=0
 if [[ "$SKIP_BUILD" == "1" ]]; then
-    needs_build=0
+    needs_native=0
 elif [[ "$FORCE_REBUILD" == "1" ]]; then
-    needs_build=1
-elif [[ ! -f "$NATIVE_LIB" ]]; then
-    echo "→ native library missing"
-    needs_build=1
-elif [[ -n "$(find src/native -type f \( -name '*.mm' -o -name '*.cpp' -o -name '*.h' \) -newer "$NATIVE_LIB" -print -quit 2>/dev/null)" ]]; then
-    echo "→ native source newer than $NATIVE_LIB"
-    needs_build=1
+    needs_native=1
+elif is_stale "$NATIVE_LIB" "src/native" -name '*.mm' -o -name '*.cpp' -o -name '*.h'; then
+    needs_native=1
 fi
-
-if [[ "$needs_build" == "1" ]]; then
-    echo "→ building native library…"
+if [[ "$needs_native" == "1" ]]; then
+    echo "→ building native camera dylib…"
     (cd src/native && ./build_macos.sh release)
 else
-    echo "→ native library up to date"
+    echo "→ native camera dylib up to date"
+fi
+
+# ---- mps pose pipeline dylib ----
+needs_mps=0
+if [[ "$SKIP_BUILD" == "1" ]]; then
+    needs_mps=0
+elif [[ "$FORCE_REBUILD" == "1" ]]; then
+    needs_mps=1
+elif is_stale "$MPS_LIB" "src/mps_pipeline" -name '*.m' -o -name '*.c' -o -name '*.h'; then
+    needs_mps=1
+elif is_stale "$MPS_LIB" "src/pt_shared" -name '*.cpp' -o -name '*.h'; then
+    needs_mps=1
+fi
+if [[ "$needs_mps" == "1" ]]; then
+    echo "→ building mps pose pipeline dylib…"
+    bash src/mps_pipeline/build_mps.sh release
+else
+    echo "→ mps pose pipeline dylib up to date"
+fi
+
+# ---- coreml model artifacts (warning only — slow to build, not auto) ----
+if [[ ! -d "models/coreml/yolo_v10s.mlpackage" || ! -d "models/coreml/vitpose_synthpose.mlpackage" ]]; then
+    echo "→ NOTE: CoreML mlpackages missing under models/coreml/."
+    echo "        MPS backend will not work until you run:  bash build_mac_models.sh"
 fi
 
 UV_BIN="${UV_BIN:-$HOME/.local/bin/uv}"

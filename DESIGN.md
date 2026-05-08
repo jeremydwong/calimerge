@@ -347,6 +347,53 @@ Round-trip contract: `Program.from_json(path) → Program → to_json()` produce
 
 ---
 
+## 2.5 Pose-model registry — staging the work
+
+The §1.3 registry isn't one chunk of work; it's three. Tracking the
+phases here so we don't conflate "Python registry exists" with "any HF
+model is now drop-in".
+
+### Phase A — Python registry (DONE)
+
+Landed in [src/calimerge/tracking/registry.py](src/calimerge/tracking/registry.py):
+
+- `PoseModelSpec` dataclass (`types.py`) carrying id, hf_repo, input_shape, normalization, schema, onnx/coreml filenames, fp16_safe_io, preprocess, postprocess.
+- `MODEL_REGISTRY` seeded with two built-ins (`synthpose`, `mediapipe_hands`); user-added entries read from `models/registry/*.toml` at first access.
+- `pose_backend: str` (registry key) instead of the old Literal in [types.py:235](src/calimerge/types.py#L235); transparent legacy alias maps `"vitpose"` → `"synthpose"`.
+- `is_c_runnable(spec)` predicate that flags whether a registry entry fits today's C-side shape contract (52 kp, 256×192 input, crop_affine preprocess).
+
+This phase does *not* unlock new model shapes by itself — it gives us a single source of truth and the type plumbing the next two phases need.
+
+### Phase B — Curate-server protocol (TODO)
+
+A small server (or static-bucket convention) hosting pre-converted artefacts for HF models that already fit the C-side shape contract:
+
+- Each curated model = a TOML registry entry + the pre-built artefacts (ONNX for the CUDA path, mlpackage for the MPS path).
+- Calimerge's installer / `uv run calimerge models pull <id>` fetches the TOML + artefact bundle; entry shows up in the GUI's model dropdown next launch.
+- Server's curation gate is what enforces "fits the C contract" — anything that doesn't is rejected upstream, so end users never hit a registry entry that mysteriously doesn't run on MPS/CUDA.
+
+What this is *not*: an arbitrary-HF-model loader. It's a curated allow-list of converted weights. End-user flow: pick a model from the server, calimerge downloads it, model appears in the dropdown.
+
+Open questions before building this:
+- Where does the server live? GitHub Release artefact bucket? Self-hosted? HF Hub Space?
+- Authentication / signing of artefacts?
+- Versioning — when SynthPose-v2 ships, is it `synthpose-v2` (new entry) or `synthpose` (overwrite)?
+
+### Phase C — C++ runtime-parametric (TODO, gated on a real use case)
+
+The compile-time constants in [pt_common.h](src/pt_shared/pt_common.h) are the gate to running models that *don't* match the current C contract. To add Sapiens (308 kp), RTMPose (SimCC head), or WholeBody (133 kp), we need:
+
+- `PT_NUM_KEYPOINTS` becomes a runtime field on `PoseEngine`; struct sizes (`PT_Detection2D.keypoints[]`, heatmap buffers) become heap-allocated.
+- `PT_VITPOSE_INPUT_H/W` and `PT_YOLO_INPUT_H/W` become per-engine fields read from the registry spec.
+- A kernel registry: `PreprocessKernel { id, writes_dtype, output_shape }` so the engine builder reads `kernel.writes_dtype` to decide FP16 I/O instead of filename-sniffing (the current FP16 hack at [pt_tensorrt.cpp:303-332](src/cuda_pipeline/pt_tensorrt.cpp#L303-L332)).
+- New kernels for `simcc_input` (RTMPose), `sapiens_square` (Sapiens). Keep this set small — most top-down models fit `letterbox` or `crop_affine`.
+
+**Cost vs. benefit:** Phase C is a ~1-week C++ refactor that buys nothing on its own. It only matters once we have a *concrete* model in mind that doesn't fit the current shape. Don't speculatively build it — wait for the first time someone says "I want to try Sapiens".
+
+**Speculative work the design's §6 R6 warns against:** it would be easy to call this "future-proofing" and do it now. Resist. The C-runnable predicate already tells us upfront which registry entries won't run; that's enough early-warning.
+
+---
+
 ## 3. Shared concern: the schema-vs-indices split
 
 Both designs rely on one thing: keypoints addressed by **name**, never by raw index, everywhere above the backend layer. Today this invariant is violated (hip indices hardcoded in tracker; analyzers read fixed array slots). Fixing this is the smallest possible change that unlocks both pluggable backends *and* cross-model analysis. It is the prerequisite for everything else.

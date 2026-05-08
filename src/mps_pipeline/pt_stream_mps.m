@@ -335,9 +335,16 @@ int pt_mps_stream_process_frame(PT_MPS_Stream *s,
 
         double t_vp_infer = mps_time_seconds();
 
-        /* VitPose inference on all crops */
+        /* VitPose's mlpackage is fixed-batch (PT_MAX_DETECTIONS slots).
+         * Pad with zero crops up to that batch so the model accepts it.
+         * vitpose_input is calloc'd to max_crops slots so the trailing
+         * slots are already zero. */
+        int vp_batch = s->vitpose_model.input_batch;
+        if (vp_batch < total_crops) vp_batch = total_crops;  /* defensive */
+        if (vp_batch > s->max_crops) vp_batch = s->max_crops;
+
         int vp_rc = pt_coreml_infer(&s->vitpose_model, s->vitpose_input,
-                                     s->vitpose_heatmaps, total_crops);
+                                     s->vitpose_heatmaps, vp_batch);
         if (vp_rc != PT_OK) {
             fprintf(stderr, "[pt_mps_stream] VitPose inference failed (error %d)\n", vp_rc);
             /* Continue with zero keypoints rather than failing */

@@ -1,4 +1,4 @@
-"""Headless dump of <app_data>/models/view_transforms.db.
+"""Headless dump of <app_data>/view_transforms.db.
 
 Lists every saved per-model rotate-to-human + zero-origin preset so you
 can verify what the GUI is actually persisting (and pick up

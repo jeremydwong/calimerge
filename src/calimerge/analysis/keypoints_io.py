@@ -52,6 +52,9 @@ def save_keypoints_3d(
     view_translation: np.ndarray | None = None,
     model_backend: str | None = None,
     model_name: str | None = None,
+    person_confidence: float | None = None,
+    max_track_distance: float | None = None,
+    track_patience: int | None = None,
 ) -> None:
     """
     Save a list of per-frame keypoint records to a .npz file.
@@ -141,6 +144,13 @@ def save_keypoints_3d(
                 else:
                     keypoints[i, p_idx, k_idx, :] = arr
 
+    # Detection-pipeline parameters. NaN sentinel for unspecified, so
+    # the comparator can tell "old npz that pre-dates this field" from
+    # "explicitly recorded value of zero".
+    _pc = float(person_confidence) if person_confidence is not None else float("nan")
+    _mtd = float(max_track_distance) if max_track_distance is not None else float("nan")
+    _tp = int(track_patience) if track_patience is not None else -1
+
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         path,
@@ -155,6 +165,9 @@ def save_keypoints_3d(
         # the caller didn't pass it (legacy compatibility).
         model_backend=np.array(model_backend or "", dtype="<U32"),
         model_name=np.array(model_name or "", dtype="<U64"),
+        person_confidence=np.float32(_pc),
+        max_track_distance=np.float32(_mtd),
+        track_patience=np.int32(_tp),
     )
 
 

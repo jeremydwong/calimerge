@@ -270,6 +270,9 @@ class CudaStreamPipeline:
         use_fp16_yolo: bool = True,
         person_confidence: float = 0.50,
         keypoint_confidence: float = 0.10,
+        max_track_distance: float = 0.5,
+        track_patience: int = 60,
+        epipolar_threshold: float = 10.0,
         log_callback=None,
     ):
         lib = _load_lib()
@@ -284,9 +287,9 @@ class CudaStreamPipeline:
         config.max_persons = max_persons
         config.person_confidence = float(person_confidence)
         config.keypoint_confidence = float(keypoint_confidence)
-        config.epipolar_threshold = 10.0
-        config.max_track_distance = 0.15
-        config.track_patience = 30
+        config.epipolar_threshold = float(epipolar_threshold)
+        config.max_track_distance = float(max_track_distance)
+        config.track_patience = int(track_patience)
         config.use_fp16_yolo = 1 if use_fp16_yolo else 0
 
         config.yolo_onnx_path = yolo_onnx_path.encode("utf-8")[:511]

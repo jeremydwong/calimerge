@@ -7,7 +7,7 @@ Logic is in separate pure functions - these are data containers only.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 import numpy as np
@@ -197,6 +197,48 @@ class KeypointSchema:
 
 
 @dataclass(frozen=True, slots=True)
+class PoseModelSpec:
+    """
+    Self-contained description of a pose-estimation model.
+
+    Loaders, kernels, and analyzers read everything they need from this
+    spec instead of from hardcoded module-level constants. Adding a new
+    model is a matter of adding a registry entry that returns one of
+    these — no branches in calling code, no recompiles for entries that
+    fit the existing C-side shape contract.
+
+    Today's runtime constraints (see DESIGN.md §1.3 + the "C++ runtime
+    parametric" Phase C item): models that don't match
+    ``input_shape == (256, 192)`` and ``schema.K == 52`` will load via
+    the PyTorch backend but won't run through CUDA/MPS until
+    ``PT_NUM_KEYPOINTS`` and the kernel input shapes become runtime
+    fields rather than compile-time constants.
+    """
+
+    id: str                                              # registry key, e.g. "synthpose"
+    display_name: str                                    # human-readable, e.g. "VitPose / SynthPose (52 kp)"
+    hf_repo: str | None = None                           # HuggingFace model id; None for non-HF (e.g. MediaPipe)
+    detector: "PoseModelSpec | None" = None              # upstream person detector for top-down models
+    input_shape: tuple[int, int] = (256, 192)            # (H, W) the model expects
+    normalization: tuple[
+        tuple[float, float, float],
+        tuple[float, float, float],
+    ] = (
+        (0.485, 0.456, 0.406),
+        (0.229, 0.224, 0.225),
+    )                                                    # (mean, std) — ImageNet by default
+    schema: KeypointSchema = field(
+        default_factory=lambda: KeypointSchema(names=())
+    )
+    onnx_filename: str | None = None                     # cached path under models/onnx/<id>/
+    coreml_filename: str | None = None                   # cached path under models/coreml/<id>/
+    fp16_safe_io: bool = False                           # OK to set TRT input I/O to kHALF (YOLO yes, VitPose no)
+    preprocess: Literal["letterbox", "crop_affine"] = "crop_affine"
+    postprocess: Literal["heatmap_argmax", "simcc", "regression"] = "heatmap_argmax"
+    notes: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class Skeleton3D:
     """
     Dense, time-aligned 3D skeleton trajectory.
@@ -232,7 +274,10 @@ class ProjectConfig:
     cameras: dict[str, CameraConfig]  # serial_number -> config
     charuco_intrinsic: CharucoConfig  # For per-camera intrinsic calibration
     charuco_extrinsic: CharucoConfig  # For multi-camera extrinsic calibration
-    pose_backend: Literal["charuco", "mediapipe", "vitpose"] = "charuco"
+    # Registry key into MODEL_REGISTRY (calimerge.tracking.registry). Built-in
+    # entries today: "synthpose" (52 kp body), "mediapipe_hands" (21 kp).
+    # User-added entries land via models/registry/*.toml at startup.
+    pose_backend: str = "synthpose"
     pose_device: str = "cpu"  # "cpu", "cuda", "mps"
     max_persons: int = 1
 

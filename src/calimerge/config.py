@@ -365,7 +365,7 @@ def init_intrinsics_db(db_path: Path | None = None) -> None:
             distortion BLOB NOT NULL,
             error REAL NOT NULL,
             grid_count INTEGER NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            created_at TIMESTAMP DEFAULT (datetime('now', 'localtime')),
             PRIMARY KEY (serial_number, width, height)
         )
     """)
@@ -766,8 +766,13 @@ def save_extrinsic_session(
 
     conn = sqlite3.connect(str(db_path))
     try:
+        # Pass `created_at` explicitly so an old schema with the historic
+        # `DEFAULT CURRENT_TIMESTAMP` (UTC) doesn't clobber us with UTC —
+        # we always store local time so naive comparisons against
+        # local-time recording filenames work.
         cur = conn.execute(
-            "INSERT INTO extrinsic_sessions (rmse, notes) VALUES (?, ?)",
+            "INSERT INTO extrinsic_sessions (rmse, notes, created_at) "
+            "VALUES (?, ?, datetime('now', 'localtime'))",
             (rmse, notes),
         )
         session_id = int(cur.lastrowid)
@@ -1255,7 +1260,7 @@ def init_workouts_db(db_path: Path | None = None) -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
             mass_kg REAL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMP DEFAULT (datetime('now', 'localtime'))
         )
     """)
     # Migration: add program tracking columns to users
@@ -1274,7 +1279,7 @@ def init_workouts_db(db_path: Path | None = None) -> None:
             recording_path TEXT,
             calibration_path TEXT,
             config_blob BLOB,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMP DEFAULT (datetime('now', 'localtime'))
         )
     """)
     session_cols = [row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()]
@@ -1791,14 +1796,19 @@ def count_sets_since(user_id: int, program_exercise_id: int, since: str,
 # operation per model — switching back to a previously-used model should
 # restore that model's transform automatically.
 #
-# Storage: one row per model in <app_data>/models/view_transforms.db.
+# Storage: one row per model in <app_data>/view_transforms.db.
 # Floats are stored as little-endian float64 BLOBs (9 + 3 = 96 bytes per row);
 # the alternative of stringified TOML/JSON would round-trip slower and risks
 # precision loss on the rotation matrix.
 
 def view_transforms_db_path() -> Path:
-    """Per-machine sqlite holding per-model view-transform presets."""
-    return models_dir() / "view_transforms.db"
+    """Per-machine sqlite holding per-model view-transform presets.
+
+    Lives at app-data top level (alongside extrinsics.db / intrinsics.db).
+    This is per-user calibration state, not an ML artifact, so it does
+    not belong under models/.
+    """
+    return data_dir() / "view_transforms.db"
 
 
 def init_view_transforms_db(db_path: Path | None = None) -> None:
@@ -1807,16 +1817,28 @@ def init_view_transforms_db(db_path: Path | None = None) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
     try:
+        # Append-only: every save inserts a new row (no UPSERT). Each row
+        # is tagged with the extrinsic_session_id that was active at save
+        # time, so future loads can pick the preset that matches the
+        # calibration in use — instead of always reading the most-recent
+        # save (which may post-date a recording's calibration).
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS view_transforms (
-                model_key TEXT PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                extrinsic_session_id INTEGER,
+                model_key TEXT NOT NULL,
                 rotation BLOB NOT NULL,
                 translation BLOB NOT NULL,
                 has_origin INTEGER NOT NULL,
-                updated_at TEXT NOT NULL
+                created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+                notes TEXT
             )
             """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_vt_lookup "
+            "ON view_transforms(model_key, extrinsic_session_id, created_at)"
         )
         conn.commit()
     finally:
@@ -1828,15 +1850,22 @@ def save_view_transform(
     rotation: np.ndarray,
     translation: np.ndarray,
     has_origin: bool,
+    extrinsic_session_id: int | None = None,
+    notes: str | None = None,
     db_path: Path | None = None,
-) -> None:
-    """Upsert the view-transform preset for `model_key`.
+) -> int:
+    """Append a new view-transform preset row. Returns the new row id.
 
     `rotation` is a 3x3 matrix (must be approximately orthonormal — the
     caller is expected to project to SO(3) via SVD before persisting).
     `translation` is a 3-vector. `has_origin` is True when the user has
     actually pressed Zero (so reloads should also re-zero); False when only
     Rotate-to-Human has been pressed.
+
+    `extrinsic_session_id` ties this preset to the calibration that was
+    active when it was set. Pass it from the GUI when known so future
+    `load_view_transform(..., extrinsic_session_id=N)` calls can pick the
+    correct preset for a given recording's calibration.
     """
     if db_path is None:
         db_path = view_transforms_db_path()
@@ -1845,29 +1874,41 @@ def save_view_transform(
     t = np.ascontiguousarray(np.asarray(translation, dtype=np.float64).reshape(3))
     conn = sqlite3.connect(str(db_path))
     try:
-        conn.execute(
-            """
-            INSERT INTO view_transforms (model_key, rotation, translation,
-                                          has_origin, updated_at)
-            VALUES (?, ?, ?, ?, datetime('now'))
-            ON CONFLICT(model_key) DO UPDATE SET
-                rotation = excluded.rotation,
-                translation = excluded.translation,
-                has_origin = excluded.has_origin,
-                updated_at = excluded.updated_at
-            """,
-            (str(model_key), R.tobytes(), t.tobytes(), 1 if has_origin else 0),
+        cur = conn.execute(
+            "INSERT INTO view_transforms ("
+            " extrinsic_session_id, model_key, rotation, translation,"
+            " has_origin, notes"
+            ") VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                None if extrinsic_session_id is None else int(extrinsic_session_id),
+                str(model_key),
+                R.tobytes(),
+                t.tobytes(),
+                1 if has_origin else 0,
+                notes,
+            ),
         )
         conn.commit()
+        return int(cur.lastrowid)
     finally:
         conn.close()
 
 
 def load_view_transform(
     model_key: str,
+    extrinsic_session_id: int | None = None,
     db_path: Path | None = None,
 ) -> tuple[np.ndarray, np.ndarray, bool] | None:
-    """Return (R, t, has_origin) for `model_key`, or None if no preset saved."""
+    """Return (R, t, has_origin) for `model_key`.
+
+    Resolution priority:
+      1. If `extrinsic_session_id` is given: most recent row with that
+         exact session id.
+      2. Most recent row with `extrinsic_session_id IS NULL` (untagged
+         saves — backwards compat with older rows).
+      3. Most recent row for `model_key` regardless of session.
+    Returns None if no row matches.
+    """
     if db_path is None:
         db_path = view_transforms_db_path()
     if not db_path.exists():
@@ -1875,11 +1916,28 @@ def load_view_transform(
     init_view_transforms_db(db_path)
     conn = sqlite3.connect(str(db_path))
     try:
-        row = conn.execute(
-            "SELECT rotation, translation, has_origin FROM view_transforms "
-            "WHERE model_key = ?",
-            (str(model_key),),
-        ).fetchone()
+        row = None
+        if extrinsic_session_id is not None:
+            row = conn.execute(
+                "SELECT rotation, translation, has_origin FROM view_transforms "
+                "WHERE model_key = ? AND extrinsic_session_id = ? "
+                "ORDER BY created_at DESC, id DESC LIMIT 1",
+                (str(model_key), int(extrinsic_session_id)),
+            ).fetchone()
+        if row is None:
+            row = conn.execute(
+                "SELECT rotation, translation, has_origin FROM view_transforms "
+                "WHERE model_key = ? AND extrinsic_session_id IS NULL "
+                "ORDER BY created_at DESC, id DESC LIMIT 1",
+                (str(model_key),),
+            ).fetchone()
+        if row is None:
+            row = conn.execute(
+                "SELECT rotation, translation, has_origin FROM view_transforms "
+                "WHERE model_key = ? "
+                "ORDER BY created_at DESC, id DESC LIMIT 1",
+                (str(model_key),),
+            ).fetchone()
     finally:
         conn.close()
     if row is None:

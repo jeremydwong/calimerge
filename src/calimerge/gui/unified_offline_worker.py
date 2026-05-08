@@ -221,12 +221,18 @@ class UnifiedOfflineWorker(QThread):
                 self.log_message.emit("[unified-offline] cancelled")
                 return
 
+            # ── Canonical re-tracking ─────────────────────────────────
+            # Each backend's underlying tracker has different defaults
+            # and different fragmentation behavior (PyTorch _LiveTracker
+            # vs C pt_tracker). Throw away their track ids and re-run a
+            # single canonical _LiveTracker over every recording so the
+            # downstream stitching/output is identical regardless of the
+            # inference backend. Inputs (kps_3d) still differ, but the
+            # tracker code path doesn't.
+            self.progress.emit("re-tracking", 0.90)
+            self._retrack_recording(recording)
+
             # ── Stitch tracks across the recording ────────────────────
-            # Re-merge per-track fragments using the shared stitcher.
-            # The streaming primitive emits stable person ids out of the
-            # C tracker, but PyTorch's _LiveTracker uses its own ids;
-            # both can fragment over long detection gaps, so we run
-            # the stitcher uniformly.
             self.progress.emit("stitching tracks", 0.92)
             tracks_by_id, n_kps_global = self._collect_tracks(
                 recording, n_kps_global,
@@ -297,7 +303,16 @@ class UnifiedOfflineWorker(QThread):
             log_fn=lambda msg: self.log_message.emit(f"[unified-offline] {msg}"),
         )
         worker._models = (person_model, pose_processor, pose_model)
-        worker._tracker.reset()
+        # Replace the default-tuned _LiveTracker so the unified worker's
+        # max_track_distance / track_patience actually take effect — the
+        # constructor at workers.py:752 uses _LiveTracker() with library
+        # defaults (0.5 m / 10 frames) which silently override anything
+        # the GUI passes through this worker.
+        from .workers import _LiveTracker as _LT
+        worker._tracker = _LT(
+            max_match_distance=self._max_track_distance,
+            patience=self._track_patience,
+        )
 
         # Connect the keypoints_3d_ready signal to a local collector.
         collected: list = []
@@ -439,6 +454,8 @@ class UnifiedOfflineWorker(QThread):
             engine_cache_dir=str(cache),
             max_persons=2,
             person_confidence=self._person_confidence,
+            max_track_distance=self._max_track_distance,
+            track_patience=self._track_patience,
             log_callback=lambda m: self.log_message.emit(f"[unified-offline][cuda] {m}"),
         )
         try:
@@ -487,6 +504,8 @@ class UnifiedOfflineWorker(QThread):
             vitpose_model_path=str(vitpose_pkg) if vitpose_pkg.exists() else "",
             max_persons=2,
             person_confidence=self._person_confidence,
+            max_track_distance=self._max_track_distance,
+            track_patience=self._track_patience,
         )
         try:
             return self._loop_streaming_pipeline(
@@ -623,6 +642,37 @@ class UnifiedOfflineWorker(QThread):
             pass
         return 30.0
 
+    def _retrack_recording(self, recording: list[dict]) -> None:
+        """Replace each backend's per-frame track ids with canonical ones.
+
+        Builds a fresh ``_LiveTracker`` parameterised by this worker's
+        ``max_track_distance`` / ``track_patience``, runs it across every
+        frame in order, and overwrites ``entry["_person_ids"]`` with its
+        output. After this pass, downstream code (``_collect_tracks``,
+        ``stitch_tracks``) sees the same id-assignment policy regardless
+        of which backend produced the keypoints.
+        """
+        from .workers import _LiveTracker
+        tracker = _LiveTracker(
+            max_match_distance=self._max_track_distance,
+            patience=self._track_patience,
+        )
+        n_frames_with_persons = 0
+        n_persons_total = 0
+        n_ids_assigned_nonzero = 0
+        for entry in recording:
+            persons = entry.get("persons", []) or []
+            if persons:
+                n_frames_with_persons += 1
+                n_persons_total += len(persons)
+            new_ids = tracker.step(persons)
+            n_ids_assigned_nonzero += sum(1 for i in new_ids if i != 0)
+            entry["_person_ids"] = list(new_ids)
+        self.log_message.emit(
+            f"[unified-offline] retrack: frames_with_persons={n_frames_with_persons} "
+            f"persons={n_persons_total} ids_nonzero={n_ids_assigned_nonzero}"
+        )
+
     def _collect_tracks(
         self,
         recording: list[dict],
@@ -719,7 +769,10 @@ class UnifiedOfflineWorker(QThread):
         # record it in the npz so consumers can tell which pipeline
         # produced these keypoints. Same SynthPose model across all three
         # backends today; expose it as a constant string for now.
-        _model_name = "vitpose_synthpose"
+        # We ship the SynthPose-trained VitPose weights (52 anatomical
+        # keypoints), so the canonical model_name is "synthpose" — same
+        # string used as model_key in view_transforms.db.
+        _model_name = "synthpose"
 
         raw_path = self._session_dir / "keypoints_3d.raw.npz"
         write_raw_buffer(
@@ -741,6 +794,9 @@ class UnifiedOfflineWorker(QThread):
                 view_translation=self._view_translation,
                 model_backend=self._backend,
                 model_name=_model_name,
+                person_confidence=self._person_confidence,
+                max_track_distance=self._max_track_distance,
+                track_patience=self._track_patience,
             )
             self.log_message.emit(
                 f"[unified-offline] wrote {raw_path.name} + {npz_path.name} "

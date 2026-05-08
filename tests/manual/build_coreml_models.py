@@ -55,6 +55,22 @@ def _resolve_onnx(filename: str, override: Path | None) -> Path:
     return legacy
 
 
+def _resolve_yolo_pt(override: Path | None) -> Path:
+    """Locate the Ultralytics YOLO .pt checkpoint."""
+    if override is not None:
+        return override
+
+    try:
+        from calimerge.config import models_dir
+        primary = models_dir() / "yolo" / "yolov10s.pt"
+        if primary.exists():
+            return primary
+    except Exception:
+        pass
+
+    return REPO_ROOT / "models" / "yolo" / "yolov10s.pt"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--yolo-onnx", type=Path, default=None)
@@ -107,7 +123,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: VitPose ONNX not found at {vitpose_onnx}")
         return 2
 
-    print("Converting YOLO v10s ...")
+    print("Converting YOLO v10s (onnx2torch + ct.convert bridge) ...")
     yolo_out = convert_yolo_to_coreml(
         yolo_onnx,
         args.output_dir / "yolo_v10s.mlpackage",

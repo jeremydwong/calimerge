@@ -114,6 +114,19 @@ def _parse_args():
             "values (e.g. 50) iterate in seconds rather than minutes."
         ),
     )
+    parser.add_argument(
+        "--extrinsic-session-id",
+        type=int,
+        default=None,
+        help=(
+            "Force a specific extrinsic_session id from extrinsics.db, "
+            "bypassing the workouts.db lookup + timestamp fallback. "
+            "Use when the chronological selection picks the wrong rig "
+            "(e.g. the user re-calibrated minutes before this recording "
+            "but the BA finished after — its created_at would post-date "
+            "the recording even though it's the right calibration)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -314,24 +327,35 @@ def main() -> int:
     print("offline pipeline test on real recording")
     print("=" * 70)
 
-    try:
-        src = _find_source_recording()
-    except Exception as e:
-        return _blocked(f"finding source recording: {e}\n{traceback.format_exc()}")
-
-    if src is None:
-        return _blocked(
-            f"could not find recording {RECORDING_NAME!r} under "
-            f"<last_project_folder>/workouts/. Check app_settings.json."
-        )
-
     test_data_dir = TEST_DATA_DIR / RECORDING_NAME
-    print(f"[setup] source recording: {src}")
-    print(f"[setup] test data dir:    {test_data_dir}")
-    try:
-        _copy_recording_to_test_data(src, test_data_dir)
-    except Exception as e:
-        return _blocked(f"copying recording: {e}")
+    already_present = (
+        test_data_dir.is_dir()
+        and any(test_data_dir.glob("port_*.mp4"))
+        and (test_data_dir / "frame_time_history.csv").exists()
+    )
+
+    if already_present:
+        print(f"[setup] using existing test data at: {test_data_dir}")
+    else:
+        try:
+            src = _find_source_recording()
+        except Exception as e:
+            return _blocked(f"finding source recording: {e}\n{traceback.format_exc()}")
+
+        if src is None:
+            return _blocked(
+                f"could not find recording {RECORDING_NAME!r} under "
+                f"<last_project_folder>/workouts/ or at {test_data_dir}. "
+                "Either drop the recording into tests/data/<name>/ or set "
+                "last_project_folder via the GUI's project picker."
+            )
+
+        print(f"[setup] source recording: {src}")
+        print(f"[setup] test data dir:    {test_data_dir}")
+        try:
+            _copy_recording_to_test_data(src, test_data_dir)
+        except Exception as e:
+            return _blocked(f"copying recording: {e}")
 
     # ── 2. Discover videos in the test data dir ────────────────────────
     port_to_video: dict[int, Path] = {}
@@ -388,6 +412,18 @@ def main() -> int:
     created_at = None
     calibrated_cams = None
     chosen_via = None
+
+    # (-) explicit override via --extrinsic-session-id
+    if _ARGS.extrinsic_session_id is not None:
+        forced = int(_ARGS.extrinsic_session_id)
+        loaded = load_extrinsic_session(forced)
+        if loaded is None:
+            return _blocked(
+                f"--extrinsic-session-id {forced} not found in extrinsics.db"
+            )
+        created_at, calibrated_cams = loaded
+        sess_id = forced
+        chosen_via = f"--extrinsic-session-id {forced} (forced)"
 
     # (a) workouts.db session row
     try:
@@ -584,13 +620,21 @@ def main() -> int:
 
     if view_R is None:
         try:
-            preset = load_view_transform("vitpose")
+            # Prefer a preset tagged with the calibration we just chose;
+            # fall back to untagged / most-recent presets per
+            # load_view_transform's resolution priority.
+            preset = load_view_transform(
+                "synthpose", extrinsic_session_id=sess_id,
+            )
         except Exception as e:
             preset = None
             print(f"[calib] WARNING: load_view_transform raised: {e}")
         if preset is not None:
             view_R, view_t, _ = preset
-            view_source = "view_transforms.db (model=vitpose)"
+            view_source = (
+                f"view_transforms.db (model=synthpose, "
+                f"session_id={sess_id})"
+            )
 
     if view_R is not None:
         print(f"[calib] view transform source: {view_source}")

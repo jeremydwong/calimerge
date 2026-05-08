@@ -168,7 +168,11 @@ class WorkoutPage(QWidget):
 
         # Detection model + backend toggles (visible in user bar)
         self.detect_model_combo = QComboBox()
-        self.detect_model_combo.addItem("VitPose (Body)", "vitpose")
+        # The body model is the SynthPose-trained VitPose (52 anatomical
+        # keypoints), so the canonical model_key is "synthpose". The
+        # user-facing label can stay "VitPose (Body)" since that's the
+        # architecture, but every persisted reference uses "synthpose".
+        self.detect_model_combo.addItem("VitPose / SynthPose (Body)", "synthpose")
         self.detect_model_combo.addItem("MediaPipe Hands", "mediapipe_hands")
         self.detect_model_combo.setToolTip("Detection model")
         self.detect_model_combo.setFixedWidth(130)
@@ -1590,7 +1594,7 @@ class WorkoutPage(QWidget):
             if idx >= 0:
                 self.detect_model_combo.setCurrentIndex(idx)
         else:
-            idx = self.detect_model_combo.findData("vitpose")
+            idx = self.detect_model_combo.findData("synthpose")
             if idx >= 0:
                 self.detect_model_combo.setCurrentIndex(idx)
 
@@ -1993,7 +1997,7 @@ class WorkoutPage(QWidget):
         camera_rig.toml so each model can have its own saved
         rotate-to-human + zero-origin without overwriting siblings.
         """
-        return self.detect_model_combo.currentData() or "vitpose"
+        return self.detect_model_combo.currentData() or "synthpose"
 
     def _zero_point_for_model(self) -> tuple[int, str]:
         """Return (keypoint_index, label) for the active model's zero origin."""
@@ -2019,7 +2023,11 @@ class WorkoutPage(QWidget):
         except Exception:
             return
 
-        last_model = settings.get("last_detect_model", "vitpose")
+        # Older settings.json may still say "vitpose"; transparently
+        # migrate to the canonical "synthpose" key.
+        last_model = settings.get("last_detect_model", "synthpose")
+        if last_model == "vitpose":
+            last_model = "synthpose"
         last_backend = settings.get("last_detect_backend", "pytorch")
         last_conf = float(settings.get("last_detect_confidence", 0.50))
 
@@ -2051,7 +2059,7 @@ class WorkoutPage(QWidget):
             from ..config import load_app_settings, save_app_settings
             settings = load_app_settings()
             settings["last_detect_model"] = (
-                self.detect_model_combo.currentData() or "vitpose"
+                self.detect_model_combo.currentData() or "synthpose"
             )
             settings["last_detect_backend"] = (
                 self.detect_backend_combo.currentData() or "pytorch"
@@ -2117,7 +2125,7 @@ class WorkoutPage(QWidget):
         if self.detection_worker is not None:
             return
 
-        model = self.detect_model_combo.currentData() or "vitpose"
+        model = self.detect_model_combo.currentData() or "synthpose"
 
         if model == "mediapipe_hands":
             self._start_mediapipe_hands_detection()
@@ -2648,7 +2656,7 @@ class WorkoutPage(QWidget):
     # ── View transform persistence (per-model preset DB) ──
     #
     # Storage is one row per model in a sqlite at
-    # <app_data>/models/view_transforms.db. Switching detection model
+    # <app_data>/view_transforms.db. Switching detection model
     # automatically reloads the saved (R, t) for that model so the user
     # only has to press Rotate-to-Human + Zero once per model.
     #
@@ -2681,7 +2689,7 @@ class WorkoutPage(QWidget):
         """
         try:
             from ..config import load_view_transform, save_view_transform
-            if load_view_transform("vitpose") is not None:
+            if load_view_transform("synthpose") is not None:
                 return
             import rtoml
             rig_path = self._get_camera_rig_path()
@@ -2695,19 +2703,29 @@ class WorkoutPage(QWidget):
             R = T[:3, :3]
             t = T[:3, 3]
             save_view_transform(
-                "vitpose", R, t, bool(lv.get("has_origin", False)),
+                "synthpose", R, t, bool(lv.get("has_origin", False)),
+                notes="legacy migration from camera_rig.toml [live_view]",
             )
         except Exception:
             pass
 
     def _save_view_transform(self, T: np.ndarray, has_origin: bool = False):
-        """Persist the current transform under the active model key."""
+        """Persist the current transform under the active model key.
+
+        Tags the row with the active extrinsic_session_id so future
+        ``load_view_transform(model_key, extrinsic_session_id=N)``
+        calls can resolve the correct preset for a given recording's
+        calibration. The DB schema is append-only — every press of
+        Rotate-to-Human / Zero-at-Ankle stores a new row, none are
+        overwritten.
+        """
         try:
             from ..config import save_view_transform
             R = T[:3, :3]
             t = T[:3, 3]
             save_view_transform(
                 self._current_model_key(), R, t, has_origin,
+                extrinsic_session_id=self._calibration_session_id,
             )
         except Exception:
             pass
@@ -2735,7 +2753,13 @@ class WorkoutPage(QWidget):
         self._migrate_legacy_view_transform()
         try:
             from ..config import load_view_transform
-            loaded = load_view_transform(model_key)
+            # Prefer a preset tagged with the currently-active
+            # calibration session; fall back to untagged most-recent
+            # via load_view_transform's resolution priority.
+            loaded = load_view_transform(
+                model_key,
+                extrinsic_session_id=self._calibration_session_id,
+            )
         except Exception:
             loaded = None
 

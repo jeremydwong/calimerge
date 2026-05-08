@@ -60,6 +60,13 @@ def convert_yolo_to_coreml(
 ) -> Path:
     """Convert the YOLOv10 ONNX detector to a CoreML .mlpackage.
 
+    Goes via the onnx2torch + jit.trace + ct.convert bridge (same path as
+    VitPose). The bridge is numerically correct — verified by a side-by-side
+    diagnostic against ultralytics PyTorch inference (see
+    tests/manual/diagnose_yolo_coreml_quality.py). Ultralytics' direct
+    CoreML exporter would be cleaner architecturally, but its save phase
+    forks an ObjC-touching child that the macOS fork-safety check kills.
+
     Args:
         onnx_path: Path to ``yolo_v10s.onnx``.
         output_path: Path to write ``yolo_v10s.mlpackage``.
@@ -136,6 +143,40 @@ def _resolve_compute_units(name: str):
     return table[name]
 
 
+# Per-kind input contract: (input_name, (batch, C, H, W)).
+# Used for jit-tracing the ONNX-derived PyTorch model. coremltools dropped
+# native ONNX ingestion in v6+, so we go ONNX → PyTorch (via onnx2torch) →
+# trace → ct.convert(source="pytorch").
+#
+# Batch is FIXED here, not dynamic, because onnx2torch bakes literal batch
+# constants into intermediate Reshape ops (e.g. YOLO's anchor-grid reshape
+# becomes (1, 4, 128, 400) regardless of input batch). RangeDim does not
+# override that. Sized for the streaming pipeline:
+#
+#   YOLO:     batch = num_cameras           (one frame per camera per sync)
+#   VitPose:  batch = PT_MAX_DETECTIONS     (one crop per detected person across all cams;
+#                                            C side zero-pads to this fixed batch)
+#
+# Bump _NUM_CAMERAS_DEFAULT in lockstep with the rig you're targeting.
+# _VITPOSE_MAX_BATCH must mirror PT_MAX_DETECTIONS in src/pt_shared/pt_common.h.
+_NUM_CAMERAS_DEFAULT = 2
+_VITPOSE_MAX_BATCH = 16
+
+_INPUT_SHAPES: dict[str, tuple[str, tuple[int, int, int, int]]] = {
+    "yolo":    ("images", (_NUM_CAMERAS_DEFAULT, 3, 640, 640)),
+    "vitpose": ("input",  (_VITPOSE_MAX_BATCH, 3, 256, 192)),
+}
+
+
+def _strip_reshape_allowzero(onnx_model) -> None:
+    for node in onnx_model.graph.node:
+        if node.op_type != "Reshape":
+            continue
+        for i in range(len(node.attribute) - 1, -1, -1):
+            if node.attribute[i].name == "allowzero":
+                del node.attribute[i]
+
+
 def _convert(
     onnx_path: Path,
     output_path: Path,
@@ -143,13 +184,11 @@ def _convert(
     fp16: bool,
     kind: str,
 ) -> Path:
-    """Convert a single ONNX file to CoreML.
-
-    The actual conversion happens here. Imports coremltools lazily so this
-    module is import-clean on Windows without coremltools installed.
-    """
+    """Convert a single ONNX file to CoreML via an in-memory PyTorch bridge."""
     if not onnx_path.exists():
         raise FileNotFoundError(f"ONNX model not found: {onnx_path}")
+    if kind not in _INPUT_SHAPES:
+        raise ValueError(f"unknown kind {kind!r}; valid: {sorted(_INPUT_SHAPES)}")
 
     try:
         import coremltools as ct
@@ -160,26 +199,53 @@ def _convert(
             f"Original error: {e}"
         ) from e
 
+    try:
+        import onnx
+        import onnx2torch
+        import torch
+    except ImportError as e:
+        raise RuntimeError(
+            "onnx2torch + onnx + torch are required to bridge ONNX→PyTorch. "
+            "Install with `pip install onnx2torch onnx torch` "
+            "(or run via `uv run --with onnx2torch ...`). "
+            f"Original error: {e}"
+        ) from e
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    input_name, input_shape = _INPUT_SHAPES[kind]
 
-    logger.info("Converting %s ONNX → CoreML: %s -> %s", kind, onnx_path, output_path)
+    logger.info(
+        "Converting %s ONNX → CoreML: %s -> %s (input %s shape %s)",
+        kind, onnx_path, output_path, input_name, input_shape,
+    )
 
-    # coremltools 7+ accepts the source ONNX path directly via the ML
-    # Program backend (mlpackage). For broader version support we go through
-    # the unified ct.convert API.
+    onnx_model = onnx.load(str(onnx_path))
+    _strip_reshape_allowzero(onnx_model)
+    torch_model = onnx2torch.convert(onnx_model).eval()
+
+    example = torch.randn(*input_shape, dtype=torch.float32)
+    with torch.no_grad():
+        traced = torch.jit.trace(torch_model, example, strict=False)
+        # Freeze + inline graph passes fold away view-ops like aten::resolve_conj
+        # that coremltools' torch frontend doesn't implement. Without this the
+        # convert step trips on phantom complex-number plumbing inserted by the
+        # tracer for real-tensor view operations.
+        traced = torch.jit.freeze(traced)
+        torch._C._jit_pass_inline(traced.graph)
+
     cu = _resolve_compute_units(compute_units)
-
     precision = ct.precision.FLOAT16 if fp16 else ct.precision.FLOAT32
 
     mlmodel = ct.convert(
-        str(onnx_path),
+        traced,
+        source="pytorch",
+        inputs=[ct.TensorType(name=input_name, shape=input_shape)],
         convert_to="mlprogram",
         compute_precision=precision,
         compute_units=cu,
         minimum_deployment_target=ct.target.macOS14,
     )
 
-    # Tag with metadata so the consumer can sanity-check at load time.
     mlmodel.short_description = f"Calimerge {kind} model (FP16={fp16})"
     mlmodel.author = "Calimerge"
     mlmodel.version = "1.0"
