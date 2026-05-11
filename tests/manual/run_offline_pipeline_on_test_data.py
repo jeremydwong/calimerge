@@ -809,6 +809,8 @@ def main() -> int:
             max_track_distance=_ARGS.max_track_distance,
             track_patience=_ARGS.track_patience,
             person_confidence=_ARGS.person_confidence,
+            extrinsic_session_id=sess_id,
+            extrinsic_created_at=str(created_at) if created_at else None,
         )
         # Debugging knob: stop after N sync indices. Implemented by
         # monkey-patching the worker's frame_time_csv reader so it sees

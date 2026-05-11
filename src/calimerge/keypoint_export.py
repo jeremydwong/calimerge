@@ -175,6 +175,8 @@ def write_raw_buffer(
     view_translation: np.ndarray | None = None,
     model_backend: str | None = None,
     model_name: str | None = None,
+    extrinsic_session_id: int | None = None,
+    extrinsic_created_at: str | None = None,
 ) -> None:
     """
     Dump the in-memory recording buffer to an .npz file.
@@ -310,6 +312,11 @@ def write_raw_buffer(
     # caller didn't pass it. Same behaviour for save_keypoints_3d.
     extra_arrays["model_backend"] = np.array(model_backend or "", dtype="<U32")
     extra_arrays["model_name"] = np.array(model_name or "", dtype="<U64")
+
+    if extrinsic_session_id is not None:
+        extra_arrays["extrinsic_session_id"] = np.array(extrinsic_session_id, dtype=np.int32)
+    if extrinsic_created_at is not None:
+        extra_arrays["extrinsic_created_at"] = np.array(extrinsic_created_at, dtype="<U32")
 
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(

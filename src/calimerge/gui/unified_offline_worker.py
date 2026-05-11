@@ -117,6 +117,8 @@ class UnifiedOfflineWorker(QThread):
         # static objects (~t=11s in the head-turn trial that surfaced
         # the bug).
         person_confidence: float = 0.5,
+        extrinsic_session_id: int | None = None,
+        extrinsic_created_at: str | None = None,
     ):
         super().__init__()
         self._session_dir = session_dir
@@ -132,6 +134,8 @@ class UnifiedOfflineWorker(QThread):
         self._stitch_max_distance_m = float(stitch_max_distance_m)
         self._batch_size = int(batch_size)
         self._person_confidence = float(person_confidence)
+        self._extrinsic_session_id = extrinsic_session_id
+        self._extrinsic_created_at = extrinsic_created_at
 
         # Cached on first use to avoid rebuilding per sync. Built off the
         # frame_time_csv in run().
@@ -788,6 +792,8 @@ class UnifiedOfflineWorker(QThread):
             view_translation=self._view_translation,
             model_backend=self._backend,
             model_name=_model_name,
+            extrinsic_session_id=self._extrinsic_session_id,
+            extrinsic_created_at=self._extrinsic_created_at,
         )
 
         npz_path = self._session_dir / "keypoints_3d.npz"
@@ -803,6 +809,8 @@ class UnifiedOfflineWorker(QThread):
                 person_confidence=self._person_confidence,
                 max_track_distance=self._max_track_distance,
                 track_patience=self._track_patience,
+                extrinsic_session_id=self._extrinsic_session_id,
+                extrinsic_created_at=self._extrinsic_created_at,
             )
             self.log_message.emit(
                 f"[unified-offline] wrote {raw_path.name} + {npz_path.name} "

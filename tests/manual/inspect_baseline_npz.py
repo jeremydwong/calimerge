@@ -6,17 +6,21 @@ REPO = Path(__file__).resolve().parents[2]
 FIXTURE = "tests/data/zelda_20260428_151934_fga_horizontal_head_turns"
 
 for name in ("keypoints_3d.npz", "keypoints_3d.raw.npz"):
-    git_path = f"{FIXTURE}/{name}"
-    tmp = Path(tempfile.gettempdir()) / f"_baseline_{name}"
-    subprocess.run(["git", "show", f"HEAD:{git_path}"], stdout=open(tmp, "wb"),
-                   cwd=str(REPO), check=True)
-    d = np.load(str(tmp))
+    # Use working-tree copy (just produced by a test run)
+    src = REPO / FIXTURE / name
+    if not src.exists():
+        print(f"\n=== {name} === MISSING")
+        continue
+    d = np.load(str(src), allow_pickle=True)
     print(f"\n=== {name} ===")
     print(f"  keys: {d.files}")
     for k in d.files:
         arr = d[k]
-        print(f"  {k}: shape={arr.shape} dtype={arr.dtype}"
-              f"  finite={np.isfinite(arr).sum()}/{arr.size}"
-              f"  range=[{np.nanmin(arr):.4f}, {np.nanmax(arr):.4f}]"
-              if arr.dtype.kind == 'f' else
-              f"  {k}: shape={arr.shape} dtype={arr.dtype}")
+        if arr.dtype.kind == 'f' and arr.size > 0:
+            print(f"  {k}: shape={arr.shape} dtype={arr.dtype}"
+                  f"  finite={np.isfinite(arr).sum()}/{arr.size}"
+                  f"  range=[{np.nanmin(arr):.4f}, {np.nanmax(arr):.4f}]")
+        elif arr.ndim == 0:
+            print(f"  {k}: scalar  value={arr.item()!r}")
+        else:
+            print(f"  {k}: shape={arr.shape} dtype={arr.dtype}")

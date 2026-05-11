@@ -55,6 +55,8 @@ def save_keypoints_3d(
     person_confidence: float | None = None,
     max_track_distance: float | None = None,
     track_patience: int | None = None,
+    extrinsic_session_id: int | None = None,
+    extrinsic_created_at: str | None = None,
 ) -> None:
     """
     Save a list of per-frame keypoint records to a .npz file.
@@ -168,6 +170,10 @@ def save_keypoints_3d(
         person_confidence=np.float32(_pc),
         max_track_distance=np.float32(_mtd),
         track_patience=np.int32(_tp),
+        **({} if extrinsic_session_id is None else
+           {"extrinsic_session_id": np.array(extrinsic_session_id, dtype=np.int32)}),
+        **({} if extrinsic_created_at is None else
+           {"extrinsic_created_at": np.array(extrinsic_created_at, dtype="<U32")}),
     )
 
 

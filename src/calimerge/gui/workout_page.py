@@ -3299,6 +3299,8 @@ class WorkoutPage(QWidget):
                 view_translation=getattr(self, "_recording_view_t", None),
                 batch_size=batch_size,
                 person_confidence=self._current_person_confidence(),
+                extrinsic_session_id=self._calibration_session_id,
+                extrinsic_created_at=self._calibration_session_created_at,
             )
         self._offline_worker.progress.connect(self._on_offline_progress)
         self._offline_worker.log_message.connect(self._on_offline_log)
@@ -3599,6 +3601,8 @@ class WorkoutPage(QWidget):
                     view_translation=getattr(self, "_recording_view_t", None),
                     model_backend=_save_backend,
                     model_name=_save_model_name,
+                    extrinsic_session_id=self._calibration_session_id,
+                    extrinsic_created_at=self._calibration_session_created_at,
                 )
             except Exception as e:
                 self.status_message.emit(f"Failed to save keypoints: {e}")
@@ -3781,6 +3785,8 @@ class WorkoutPage(QWidget):
                 view_translation=getattr(self, "_recording_view_t", None),
                 model_backend=backend,
                 model_name=model_name,
+                extrinsic_session_id=self._calibration_session_id,
+                extrinsic_created_at=self._calibration_session_created_at,
             )
         except Exception as e:
             self.status_message.emit(f"Failed to dump raw keypoints: {e}")
