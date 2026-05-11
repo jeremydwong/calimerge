@@ -412,12 +412,12 @@ class WorkoutPage(QWidget):
         btn_layout.addWidget(self.progress_btn)
 
         # CSV export controls
-        self.generate_csv_checkbox = QCheckBox("Generate CSV after save")
+        self.generate_csv_checkbox = QCheckBox("Generate 3D-npz post-trial")
         self.generate_csv_checkbox.setChecked(True)
         self.generate_csv_checkbox.setToolTip(
-            "Checked: write keypoints_3d.csv synchronously after each "
-            "recording. Unchecked: queue the job and process later via "
-            "'Process Pending'."
+            "Checked: run the offline pipeline and write keypoints_3d.npz "
+            "after each recording. Unchecked: queue the job and process "
+            "later via 'Process Pending'."
         )
         self.generate_csv_checkbox.toggled.connect(self._on_csv_toggle_changed)
         # Avoid Qt's platform default of bold-on-checked-text in the global

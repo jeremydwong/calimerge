@@ -31,6 +31,16 @@ git pull
 
 This creates a `.venv/` and installs everything from `pyproject.toml`.
 
+If you want live detection via the **PyTorch backend** (as opposed to the
+MPS/CoreML native pipeline), also install the optional PyTorch group:
+
+```bash
+~/.local/bin/uv sync --extra pytorch-backend
+```
+
+This pulls in `torch`, `torchvision`, `transformers`, and `ultralytics`
+(~2 GB). Not needed if you only use the MPS backend.
+
 ## 3. Copy data directory from an existing Mac
 
 The data directory lives at `~/Library/Application Support/Calimerge/`.
