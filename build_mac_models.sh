@@ -33,8 +33,14 @@ if [[ -z "${UV_BIN:-}" ]]; then
     exit 1
 fi
 
-ONNX_DIR="models/onnx"
-COREML_DIR="models/coreml"
+# All model artifacts live in the App-data models directory so every
+# tool (GUI, offline pipeline, regression tests) finds them without a
+# copy step.  On macOS this is:
+#   ~/Library/Application Support/Calimerge/models/
+DATA_DIR="${CALIMERGE_DATA_DIR:-$HOME/Library/Application Support/Calimerge}"
+MODELS_DIR="$DATA_DIR/models"
+ONNX_DIR="$MODELS_DIR/onnx"
+COREML_DIR="$MODELS_DIR/coreml"
 mkdir -p "$ONNX_DIR" "$COREML_DIR"
 
 YOLO_ONNX="$ONNX_DIR/yolo_v10s.onnx"
@@ -42,17 +48,19 @@ VITPOSE_ONNX="$ONNX_DIR/vitpose_synthpose.onnx"
 YOLO_MLPKG="$COREML_DIR/yolo_v10s.mlpackage"
 VITPOSE_MLPKG="$COREML_DIR/vitpose_synthpose.mlpackage"
 
+echo "Models dir: $MODELS_DIR"
+
 # ---- Stage 1: PyTorch → ONNX ----
 if [[ "$FORCE" == "1" ]] || [[ ! -f "$YOLO_ONNX" ]]; then
     echo "→ exporting YOLO v10s → ONNX"
-    "$UV_BIN" run python3 scripts/export_onnx.py
+    "$UV_BIN" run python3 scripts/export_onnx.py --output-dir "$ONNX_DIR"
 else
     echo "→ $YOLO_ONNX exists (skip)"
 fi
 
 if [[ "$FORCE" == "1" ]] || [[ ! -f "$VITPOSE_ONNX" ]]; then
     echo "→ exporting VitPose SynthPose → ONNX"
-    "$UV_BIN" run python3 scripts/export_synthpose_onnx.py
+    "$UV_BIN" run python3 scripts/export_synthpose_onnx.py --output-dir "$ONNX_DIR"
 else
     echo "→ $VITPOSE_ONNX exists (skip)"
 fi
@@ -67,14 +75,13 @@ if [[ "$need_coreml" == "1" ]]; then
     echo "→ converting ONNX → CoreML (this is the slow step, 5-15 min)"
     # coremltools dropped ONNX ingestion in v6, so we bridge via onnx2torch.
     # Both deps are pulled in transiently with --with so they don't pollute uv.lock.
-    "$UV_BIN" run --with coremltools --with onnx2torch python3 tests/manual/build_coreml_models.py
+    "$UV_BIN" run --with coremltools --with onnx2torch python3 \
+        tests/manual/build_coreml_models.py --output-dir "$COREML_DIR"
 else
     echo "→ CoreML mlpackages exist (skip)"
 fi
 
 echo
-echo "Done."
-echo "  $YOLO_ONNX"
-echo "  $VITPOSE_ONNX"
-echo "  $YOLO_MLPKG"
-echo "  $VITPOSE_MLPKG"
+echo "Done. All models written to:"
+echo "  $ONNX_DIR/"
+echo "  $COREML_DIR/"

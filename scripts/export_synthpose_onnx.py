@@ -21,11 +21,12 @@ from pathlib import Path
 import torch
 
 
-def export():
+def export(output_dir: Path | None = None):
     from transformers import VitPoseForPoseEstimation
 
     model_id = "stanfordmimi/synthpose-vitpose-base-hf"
-    output_dir = Path(__file__).parent.parent / "models" / "onnx"
+    if output_dir is None:
+        output_dir = Path(__file__).parent.parent / "models" / "onnx"
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / "vitpose_synthpose.onnx"
 
@@ -66,4 +67,9 @@ def export():
 
 
 if __name__ == "__main__":
-    export()
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--output-dir", type=Path, default=None,
+                   help="Output directory (default: <repo>/models/onnx/)")
+    args = p.parse_args()
+    export(output_dir=args.output_dir)

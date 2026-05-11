@@ -82,8 +82,10 @@ else
 fi
 
 # ---- coreml model artifacts (warning only — slow to build, not auto) ----
-if [[ ! -d "models/coreml/yolo_v10s.mlpackage" || ! -d "models/coreml/vitpose_synthpose.mlpackage" ]]; then
-    echo "→ NOTE: CoreML mlpackages missing under models/coreml/."
+DATA_DIR="${CALIMERGE_DATA_DIR:-$HOME/Library/Application Support/Calimerge}"
+COREML_DIR="$DATA_DIR/models/coreml"
+if [[ ! -d "$COREML_DIR/yolo_v10s.mlpackage" || ! -d "$COREML_DIR/vitpose_synthpose.mlpackage" ]]; then
+    echo "→ NOTE: CoreML mlpackages missing under $COREML_DIR/"
     echo "        MPS backend will not work until you run:  bash build_mac_models.sh"
 fi
 
