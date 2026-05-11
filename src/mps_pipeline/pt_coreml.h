@@ -33,6 +33,12 @@ typedef struct {
     int   input_width;
     int   output_dims[4];   /* output shape (batch, C, H, W) or (batch, N, 6) */
     char  model_path[512];
+
+    /* Cached across calls to avoid per-inference allocation */
+    void *cached_input_array;    /* MLMultiArray* — reused when batch matches */
+    int   cached_input_batch;    /* batch size the cached array was allocated for */
+    void *cached_input_name;     /* NSString* — input feature name */
+    void *cached_output_name;    /* NSString* — output feature name */
 } PT_CoreMLModel;
 
 /* ============================================================================

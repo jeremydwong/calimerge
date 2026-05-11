@@ -492,7 +492,13 @@ class UnifiedOfflineWorker(QThread):
 
         coreml_dir = models_dir() / "coreml"
         yolo_pkg = coreml_dir / "yolo_v10s.mlpackage"
-        vitpose_pkg = coreml_dir / "vitpose_synthpose.mlpackage"
+        vitpose_rt = coreml_dir / "vitpose_synthpose_rt_batch4.mlpackage"
+        vitpose_pkg = vitpose_rt if vitpose_rt.exists() else (
+            coreml_dir / "vitpose_synthpose.mlpackage"
+        )
+        self.log_message.emit(
+            f"[unified-offline] vitpose model: {vitpose_pkg.name}"
+        )
 
         self.log_message.emit("[unified-offline] initializing MPS pipeline...")
         pipeline = MpsStreamPipeline(

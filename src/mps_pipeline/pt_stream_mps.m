@@ -304,21 +304,23 @@ int pt_mps_stream_process_frame(PT_MPS_Stream *s,
 
     double t_vitpose = mps_time_seconds();
 
+    int vp_max_batch = s->vitpose_model.input_batch;
     int total_crops = 0;
     int crop_offsets[PT_MAX_CAMERAS];
     for (int img = 0; img < valid_image_count; img++) {
         crop_offsets[img] = total_crops;
         int det_count = s->detection_counts[img];
         if (det_count > PT_MAX_DETECTIONS) det_count = PT_MAX_DETECTIONS;
+        int remaining = vp_max_batch - total_crops;
+        if (det_count > remaining) det_count = remaining;
+        s->detection_counts[img] = det_count;
         total_crops += det_count;
     }
 
     if (total_crops > 0 && total_crops <= s->max_crops) {
-        /* Crop + normalize for each image's detections */
         for (int img = 0; img < valid_image_count; img++) {
             int det_count = s->detection_counts[img];
             if (det_count <= 0) continue;
-            if (det_count > PT_MAX_DETECTIONS) det_count = PT_MAX_DETECTIONS;
 
             float *img_boxes = s->detection_boxes + img * PT_MAX_DETECTIONS * 4;
             int crop_start = crop_offsets[img];
@@ -335,13 +337,7 @@ int pt_mps_stream_process_frame(PT_MPS_Stream *s,
 
         double t_vp_infer = mps_time_seconds();
 
-        /* VitPose's mlpackage is fixed-batch (PT_MAX_DETECTIONS slots).
-         * Pad with zero crops up to that batch so the model accepts it.
-         * vitpose_input is calloc'd to max_crops slots so the trailing
-         * slots are already zero. */
-        int vp_batch = s->vitpose_model.input_batch;
-        if (vp_batch < total_crops) vp_batch = total_crops;  /* defensive */
-        if (vp_batch > s->max_crops) vp_batch = s->max_crops;
+        int vp_batch = vp_max_batch;
 
         int vp_rc = pt_coreml_infer(&s->vitpose_model, s->vitpose_input,
                                      s->vitpose_heatmaps, vp_batch);
@@ -356,11 +352,15 @@ int pt_mps_stream_process_frame(PT_MPS_Stream *s,
                               total_crops);
         }
 
-        s->stats.coreml_vitpose_ms += (mps_time_seconds() - t_vp_infer) * 1000.0;
-    }
+        double vp_infer_delta_ms = (mps_time_seconds() - t_vp_infer) * 1000.0;
+        s->stats.coreml_vitpose_ms += vp_infer_delta_ms;
 
-    s->stats.preprocess_ms += (mps_time_seconds() - t_vitpose) * 1000.0
-                             - (s->stats.coreml_vitpose_ms);
+        /* VitPose section time minus inference = crop+normalize time */
+        double vp_section_ms = (mps_time_seconds() - t_vitpose) * 1000.0;
+        s->stats.preprocess_ms += vp_section_ms - vp_infer_delta_ms;
+    } else {
+        s->stats.preprocess_ms += (mps_time_seconds() - t_vitpose) * 1000.0;
+    }
 
     /* ================================================================
      * Step 4: CPU — Build detections, match, triangulate, track

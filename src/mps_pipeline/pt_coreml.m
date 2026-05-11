@@ -114,6 +114,12 @@ int pt_coreml_load(PT_CoreMLModel *model, const char *model_path) {
             break;  /* first output only */
         }
 
+        /* Cache feature name strings to avoid per-call dictionary lookup */
+        NSString *in_name = desc.inputDescriptionsByName.allKeys.firstObject;
+        NSString *out_name = desc.outputDescriptionsByName.allKeys.firstObject;
+        if (in_name)  model->cached_input_name  = (__bridge_retained void *)[in_name copy];
+        if (out_name) model->cached_output_name = (__bridge_retained void *)[out_name copy];
+
         /* Retain the model (prevent ARC from releasing it) */
         model->ml_model = (__bridge_retained void *)ml_model;
 
@@ -127,12 +133,25 @@ int pt_coreml_load(PT_CoreMLModel *model, const char *model_path) {
 }
 
 void pt_coreml_unload(PT_CoreMLModel *model) {
-    if (!model || !model->ml_model) return;
+    if (!model) return;
 
     @autoreleasepool {
-        /* Release the retained MLModel */
-        MLModel *ml = (__bridge_transfer MLModel *)model->ml_model;
-        (void)ml;  /* ARC releases it */
+        if (model->cached_input_array) {
+            MLMultiArray *arr = (__bridge_transfer MLMultiArray *)model->cached_input_array;
+            (void)arr;
+        }
+        if (model->cached_input_name) {
+            NSString *s = (__bridge_transfer NSString *)model->cached_input_name;
+            (void)s;
+        }
+        if (model->cached_output_name) {
+            NSString *s = (__bridge_transfer NSString *)model->cached_output_name;
+            (void)s;
+        }
+        if (model->ml_model) {
+            MLModel *ml = (__bridge_transfer MLModel *)model->ml_model;
+            (void)ml;
+        }
     }
 
     memset(model, 0, sizeof(*model));
@@ -141,6 +160,23 @@ void pt_coreml_unload(PT_CoreMLModel *model) {
 /* ============================================================================
  * Inference
  * ============================================================================ */
+
+static inline float fp16_to_fp32(uint16_t h) {
+    uint32_t sign = (h >> 15) & 1;
+    uint32_t exp  = (h >> 10) & 0x1F;
+    uint32_t frac = h & 0x3FF;
+    uint32_t f;
+    if (exp == 0) {
+        f = sign << 31;
+    } else if (exp == 31) {
+        f = (sign << 31) | 0x7F800000 | (frac << 13);
+    } else {
+        f = (sign << 31) | ((exp + 112) << 23) | (frac << 13);
+    }
+    float v;
+    memcpy(&v, &f, sizeof(float));
+    return v;
+}
 
 int pt_coreml_infer(PT_CoreMLModel *model,
                     const float *input_data,
@@ -153,44 +189,51 @@ int pt_coreml_infer(PT_CoreMLModel *model,
         MLModel *ml = (__bridge MLModel *)model->ml_model;
         NSError *error = nil;
 
-        /* Build input MLMultiArray wrapping caller's buffer (zero-copy).
-         * Shape: (batch, channels, height, width) */
-        NSArray<NSNumber *> *shape = @[
-            @(batch_size),
-            @(model->input_channels),
-            @(model->input_height),
-            @(model->input_width)
-        ];
-
         int total_elements = batch_size * model->input_channels
                            * model->input_height * model->input_width;
 
-        /* Create input array — copy data into MLMultiArray */
-        MLMultiArray *input_array = [[MLMultiArray alloc]
-            initWithShape:shape
-            dataType:MLMultiArrayDataTypeFloat32
-            error:&error];
-        if (!input_array) {
-            pt_coreml_log("Failed to create input array: %s",
-                          error.localizedDescription.UTF8String);
-            return PT_ERR_INFERENCE;
+        /* Reuse cached input MLMultiArray when batch size matches */
+        MLMultiArray *input_array = nil;
+        if (model->cached_input_array && model->cached_input_batch == batch_size) {
+            input_array = (__bridge MLMultiArray *)model->cached_input_array;
+        } else {
+            /* Release old cached array if batch changed */
+            if (model->cached_input_array) {
+                MLMultiArray *old = (__bridge_transfer MLMultiArray *)model->cached_input_array;
+                (void)old;
+                model->cached_input_array = NULL;
+            }
+
+            NSArray<NSNumber *> *shape = @[
+                @(batch_size),
+                @(model->input_channels),
+                @(model->input_height),
+                @(model->input_width)
+            ];
+            input_array = [[MLMultiArray alloc]
+                initWithShape:shape
+                dataType:MLMultiArrayDataTypeFloat32
+                error:&error];
+            if (!input_array) {
+                pt_coreml_log("Failed to create input array: %s",
+                              error.localizedDescription.UTF8String);
+                return PT_ERR_INFERENCE;
+            }
+            model->cached_input_array = (__bridge_retained void *)input_array;
+            model->cached_input_batch = batch_size;
         }
 
-        /* Copy input data */
         memcpy(input_array.dataPointer, input_data,
                total_elements * sizeof(float));
 
-        /* Get input feature name from model description */
-        MLModelDescription *desc = ml.modelDescription;
-        NSString *input_name = desc.inputDescriptionsByName.allKeys.firstObject;
-        NSString *output_name = desc.outputDescriptionsByName.allKeys.firstObject;
-
+        /* Use cached feature names */
+        NSString *input_name  = (__bridge NSString *)model->cached_input_name;
+        NSString *output_name = (__bridge NSString *)model->cached_output_name;
         if (!input_name || !output_name) {
-            pt_coreml_log("Model has no input/output features");
+            pt_coreml_log("Model has no cached input/output feature names");
             return PT_ERR_INFERENCE;
         }
 
-        /* Create feature provider */
         MLDictionaryFeatureProvider *provider =
             [[MLDictionaryFeatureProvider alloc]
                 initWithDictionary:@{input_name: input_array}
@@ -201,7 +244,6 @@ int pt_coreml_infer(PT_CoreMLModel *model,
             return PT_ERR_INFERENCE;
         }
 
-        /* Run prediction */
         id<MLFeatureProvider> result = [ml predictionFromFeatures:provider
                                                            error:&error];
         if (!result) {
@@ -220,65 +262,115 @@ int pt_coreml_infer(PT_CoreMLModel *model,
         MLMultiArray *output_array = output_feat.multiArrayValue;
 
         /* MLMultiArray storage may not be contiguous: CoreML often pads
-         * inner dimensions for SIMD alignment. For (batch, 300, 6) FP16,
-         * we've observed strides=[9600, 32, 1] — i.e. each detection has
-         * 26 fp16 slots of padding after its 6 real fields. Reading the
-         * raw dataPointer assuming unit strides yields valid det[0] then
-         * 26 zero values (the padding) being misread as det[1..5]. Honor
-         * strides explicitly. */
+         * inner dimensions for SIMD alignment.  Use nested loops with
+         * stride arithmetic instead of per-element divmod. */
         NSArray<NSNumber *> *out_shape = output_array.shape;
         NSArray<NSNumber *> *out_strides = output_array.strides;
         int rank = (int)out_shape.count;
-        int dims[8] = {0};
-        int strs[8] = {0};
-        for (int i = 0; i < rank && i < 8; i++) {
+        int dims[4] = {1, 1, 1, 1};
+        int strs[4] = {0, 0, 0, 0};
+        for (int i = 0; i < rank && i < 4; i++) {
             dims[i] = out_shape[i].intValue;
             strs[i] = out_strides[i].intValue;
         }
 
-        int out_count = (int)output_array.count;
-        const uint8_t *base = (const uint8_t *)output_array.dataPointer;
-        size_t elem_size =
-            (output_array.dataType == MLMultiArrayDataTypeFloat32) ? 4 :
-            (output_array.dataType == MLMultiArrayDataTypeFloat16) ? 2 :
-            (output_array.dataType == MLMultiArrayDataTypeDouble)  ? 8 : 0;
+        const void *base = output_array.dataPointer;
+        int is_fp32 = (output_array.dataType == MLMultiArrayDataTypeFloat32);
+        int is_fp16 = (output_array.dataType == MLMultiArrayDataTypeFloat16);
+        size_t elem_size = is_fp32 ? 4 : is_fp16 ? 2 : 8;
+        int out_idx = 0;
 
-        /* Walk canonical index 0..count-1, decompose into per-axis indices
-         * by repeated divmod against the shape, then dot with strides for
-         * the byte offset. Works for any rank up to 8 and any stride
-         * pattern, contiguous or otherwise. */
-        for (int i = 0; i < out_count; i++) {
-            int rem = i;
-            size_t offset = 0;
-            for (int a = rank - 1; a >= 0; a--) {
-                int idx = rem % dims[a];
-                rem /= dims[a];
-                offset += (size_t)idx * (size_t)strs[a];
-            }
-            offset *= elem_size;
-            const void *p = base + offset;
-            float v;
-            if (output_array.dataType == MLMultiArrayDataTypeFloat32) {
-                v = *(const float *)p;
-            } else if (output_array.dataType == MLMultiArrayDataTypeFloat16) {
-                uint16_t h = *(const uint16_t *)p;
-                uint32_t sign = (h >> 15) & 1;
-                uint32_t exp  = (h >> 10) & 0x1F;
-                uint32_t frac = h & 0x3FF;
-                uint32_t f;
-                if (exp == 0) {
-                    f = sign << 31;
-                } else if (exp == 31) {
-                    f = (sign << 31) | 0x7F800000 | (frac << 13);
-                } else {
-                    f = (sign << 31) | ((exp + 112) << 23) | (frac << 13);
+        /* Fast path: FP32 with contiguous innermost dimension — copy
+         * whole rows via memcpy instead of element-by-element. */
+        if (is_fp32 && strs[rank - 1] == 1) {
+            int inner = dims[rank - 1];
+            if (rank <= 2) {
+                for (int d0 = 0; d0 < dims[0]; d0++) {
+                    const float *row = (const float *)base + (size_t)d0 * strs[0];
+                    memcpy(output_data + out_idx, row, inner * sizeof(float));
+                    out_idx += inner;
                 }
-                memcpy(&v, &f, sizeof(float));
+            } else if (rank == 3) {
+                for (int d0 = 0; d0 < dims[0]; d0++) {
+                    for (int d1 = 0; d1 < dims[1]; d1++) {
+                        const float *row = (const float *)base
+                            + (size_t)d0 * strs[0] + (size_t)d1 * strs[1];
+                        memcpy(output_data + out_idx, row, inner * sizeof(float));
+                        out_idx += inner;
+                    }
+                }
             } else {
-                v = (float)[[output_array objectAtIndexedSubscript:i]
-                            floatValue];
+                for (int d0 = 0; d0 < dims[0]; d0++) {
+                    for (int d1 = 0; d1 < dims[1]; d1++) {
+                        for (int d2 = 0; d2 < dims[2]; d2++) {
+                            const float *row = (const float *)base
+                                + (size_t)d0 * strs[0] + (size_t)d1 * strs[1]
+                                + (size_t)d2 * strs[2];
+                            memcpy(output_data + out_idx, row, inner * sizeof(float));
+                            out_idx += inner;
+                        }
+                    }
+                }
             }
-            output_data[i] = v;
+        }
+        /* FP16 with contiguous innermost — convert per row */
+        else if (is_fp16 && strs[rank - 1] == 1) {
+            int inner = dims[rank - 1];
+            if (rank <= 2) {
+                for (int d0 = 0; d0 < dims[0]; d0++) {
+                    const uint16_t *row = (const uint16_t *)base + (size_t)d0 * strs[0];
+                    for (int w = 0; w < inner; w++)
+                        output_data[out_idx++] = fp16_to_fp32(row[w]);
+                }
+            } else if (rank == 3) {
+                for (int d0 = 0; d0 < dims[0]; d0++) {
+                    for (int d1 = 0; d1 < dims[1]; d1++) {
+                        const uint16_t *row = (const uint16_t *)base
+                            + (size_t)d0 * strs[0] + (size_t)d1 * strs[1];
+                        for (int w = 0; w < inner; w++)
+                            output_data[out_idx++] = fp16_to_fp32(row[w]);
+                    }
+                }
+            } else {
+                for (int d0 = 0; d0 < dims[0]; d0++) {
+                    for (int d1 = 0; d1 < dims[1]; d1++) {
+                        for (int d2 = 0; d2 < dims[2]; d2++) {
+                            const uint16_t *row = (const uint16_t *)base
+                                + (size_t)d0 * strs[0] + (size_t)d1 * strs[1]
+                                + (size_t)d2 * strs[2];
+                            for (int w = 0; w < inner; w++)
+                                output_data[out_idx++] = fp16_to_fp32(row[w]);
+                        }
+                    }
+                }
+            }
+        }
+        /* General fallback: nested loops with stride indexing */
+        else {
+            for (int d0 = 0; d0 < dims[0]; d0++) {
+                for (int d1 = 0; d1 < dims[1]; d1++) {
+                    for (int d2 = 0; d2 < dims[2]; d2++) {
+                        for (int d3 = 0; d3 < dims[3]; d3++) {
+                            size_t offset = (size_t)d0 * strs[0]
+                                          + (size_t)d1 * strs[1]
+                                          + (size_t)d2 * strs[2]
+                                          + (size_t)d3 * strs[3];
+                            offset *= elem_size;
+                            const void *p = (const uint8_t *)base + offset;
+                            float v;
+                            if (is_fp32) {
+                                v = *(const float *)p;
+                            } else if (is_fp16) {
+                                v = fp16_to_fp32(*(const uint16_t *)p);
+                            } else {
+                                v = (float)[[output_array objectAtIndexedSubscript:out_idx]
+                                            floatValue];
+                            }
+                            output_data[out_idx++] = v;
+                        }
+                    }
+                }
+            }
         }
     }
 
