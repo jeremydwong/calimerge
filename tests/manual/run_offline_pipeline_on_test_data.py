@@ -413,6 +413,24 @@ def main() -> int:
     calibrated_cams = None
     chosen_via = None
 
+    # Parse recording timestamp from folder name (used for both extrinsic
+    # and view-transform lookups).
+    rec_iso = None
+    _stamp = RECORDING_NAME.split("_", 2)
+    _date_str = _time_str = None
+    if len(_stamp) >= 2 and len(_stamp[0]) >= 8 and _stamp[0].isdigit():
+        _date_str = _stamp[0]
+        _time_str = _stamp[1].split("_", 1)[0]
+    elif len(_stamp) >= 3 and _stamp[1].isdigit() and len(_stamp[1]) == 8:
+        _date_str = _stamp[1]
+        _time_str = _stamp[2].split("_", 1)[0]
+    if _date_str and _time_str and len(_time_str) >= 6:
+        rec_iso = (
+            f"{_date_str[:4]}-{_date_str[4:6]}-{_date_str[6:8]} "
+            f"{_time_str[:2]}:{_time_str[2:4]}:{_time_str[4:6]}"
+        )
+        print(f"[calib] recording timestamp parsed as {rec_iso!r}")
+
     # (-) explicit override via --extrinsic-session-id
     if _ARGS.extrinsic_session_id is not None:
         forced = int(_ARGS.extrinsic_session_id)
@@ -451,37 +469,19 @@ def main() -> int:
         print(f"[calib] note: workouts.db lookup raised: {e}")
 
     # (b) timestamp-before-recording fallback
-    if calibrated_cams is None:
+    if calibrated_cams is None and rec_iso is not None:
         try:
-            stamp = RECORDING_NAME.split("_", 2)
-            # ['username','YYYYMMDD','HHMMSS_<rest>'] OR
-            # legacy ['YYYYMMDD','HHMMSS_<rest>'].
-            date_str = None
-            time_str = None
-            if len(stamp) >= 2 and len(stamp[0]) >= 8 and stamp[0].isdigit():
-                date_str = stamp[0]
-                time_str = stamp[1].split("_", 1)[0]
-            elif len(stamp) >= 3 and stamp[1].isdigit() and len(stamp[1]) == 8:
-                date_str = stamp[1]
-                time_str = stamp[2].split("_", 1)[0]
-            if date_str and time_str and len(time_str) >= 6:
-                rec_iso = (
-                    f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]} "
-                    f"{time_str[:2]}:{time_str[2:4]}:{time_str[4:6]}"
-                )
-                print(f"[calib] recording timestamp parsed as {rec_iso!r}")
-                # list_extrinsic_sessions returns newest-first.
-                for sess in list_extrinsic_sessions():
-                    if str(sess["created_at"]) <= rec_iso:
-                        loaded = load_extrinsic_session(int(sess["id"]))
-                        if loaded is not None:
-                            created_at, calibrated_cams = loaded
-                            sess_id = int(sess["id"])
-                            chosen_via = (
-                                f"newest extrinsic_session before "
-                                f"{rec_iso}"
-                            )
-                            break
+            for sess in list_extrinsic_sessions():
+                if str(sess["created_at"]) <= rec_iso:
+                    loaded = load_extrinsic_session(int(sess["id"]))
+                    if loaded is not None:
+                        created_at, calibrated_cams = loaded
+                        sess_id = int(sess["id"])
+                        chosen_via = (
+                            f"newest extrinsic_session before "
+                            f"{rec_iso}"
+                        )
+                        break
         except Exception as e:
             print(f"[calib] note: timestamp fallback raised: {e}")
 
@@ -620,11 +620,8 @@ def main() -> int:
 
     if view_R is None:
         try:
-            # Prefer a preset tagged with the calibration we just chose;
-            # fall back to untagged / most-recent presets per
-            # load_view_transform's resolution priority.
             preset = load_view_transform(
-                "synthpose", extrinsic_session_id=sess_id,
+                "synthpose", before=rec_iso,
             )
         except Exception as e:
             preset = None
@@ -633,7 +630,7 @@ def main() -> int:
             view_R, view_t, _ = preset
             view_source = (
                 f"view_transforms.db (model=synthpose, "
-                f"session_id={sess_id})"
+                f"before={rec_iso!r})"
             )
 
     if view_R is not None:

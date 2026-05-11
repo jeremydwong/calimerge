@@ -1898,17 +1898,29 @@ def load_view_transform(
     model_key: str,
     extrinsic_session_id: int | None = None,
     db_path: Path | None = None,
+    before: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray, bool] | None:
     """Return (R, t, has_origin) for `model_key`.
 
-    Always returns the most recent row by created_at for the given
-    model_key, regardless of extrinsic_session_id. The session_id
-    argument is accepted for backwards-compat but ignored — view
-    transforms are saved once per rig setup and may span multiple
-    sessions without re-pressing Rotate/Zero.
+    When *before* is given (ISO-format datetime string, e.g.
+    ``"2026-04-28 15:19:34"``), returns the newest row whose
+    ``created_at`` predates that timestamp — i.e. the view transform
+    that was active at recording time.  Without *before*, returns the
+    newest row overall (suitable for the live GUI).
 
-    Returns None if no row matches.
+    ``extrinsic_session_id`` is accepted for backwards-compat but
+    ignored.
     """
+    if before is None:
+        import warnings
+        warnings.warn(
+            "load_view_transform() called without before= timestamp — "
+            "returning newest view transform regardless of when it was "
+            "created. For offline/historical data, pass "
+            "before='YYYY-MM-DD HH:MM:SS' to get the transform that was "
+            "active at recording time.",
+            stacklevel=2,
+        )
     if db_path is None:
         db_path = view_transforms_db_path()
     if not db_path.exists():
@@ -1916,12 +1928,20 @@ def load_view_transform(
     init_view_transforms_db(db_path)
     conn = sqlite3.connect(str(db_path))
     try:
-        row = conn.execute(
-            "SELECT rotation, translation, has_origin FROM view_transforms "
-            "WHERE model_key = ? "
-            "ORDER BY created_at DESC, id DESC LIMIT 1",
-            (str(model_key),),
-        ).fetchone()
+        if before is not None:
+            row = conn.execute(
+                "SELECT rotation, translation, has_origin FROM view_transforms "
+                "WHERE model_key = ? AND created_at <= ? "
+                "ORDER BY created_at DESC, id DESC LIMIT 1",
+                (str(model_key), str(before)),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT rotation, translation, has_origin FROM view_transforms "
+                "WHERE model_key = ? "
+                "ORDER BY created_at DESC, id DESC LIMIT 1",
+                (str(model_key),),
+            ).fetchone()
     finally:
         conn.close()
     if row is None:

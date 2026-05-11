@@ -112,6 +112,22 @@ def resolve_calibration(recording_name: str, args):
     calibrated_cams = None
     chosen_via = None
 
+    # Parse recording timestamp from folder name.
+    rec_iso = None
+    _stamp = recording_name.split("_", 2)
+    _date_str = _time_str = None
+    if len(_stamp) >= 3 and _stamp[1].isdigit() and len(_stamp[1]) == 8:
+        _date_str = _stamp[1]
+        _time_str = _stamp[2].split("_", 1)[0]
+    elif len(_stamp) >= 2 and len(_stamp[0]) >= 8 and _stamp[0].isdigit():
+        _date_str = _stamp[0]
+        _time_str = _stamp[1].split("_", 1)[0]
+    if _date_str and _time_str and len(_time_str) >= 6:
+        rec_iso = (
+            f"{_date_str[:4]}-{_date_str[4:6]}-{_date_str[6:8]} "
+            f"{_time_str[:2]}:{_time_str[2:4]}:{_time_str[4:6]}"
+        )
+
     if args.extrinsic_session_id is not None:
         loaded = load_extrinsic_session(args.extrinsic_session_id)
         if loaded is None:
@@ -145,26 +161,16 @@ def resolve_calibration(recording_name: str, args):
             print(f"[calib] workouts.db lookup raised: {e}")
 
         # timestamp fallback
-        if calibrated_cams is None:
+        if calibrated_cams is None and rec_iso is not None:
             try:
-                stamp = recording_name.split("_", 2)
-                date_str = time_str = None
-                if len(stamp) >= 3 and stamp[1].isdigit() and len(stamp[1]) == 8:
-                    date_str = stamp[1]
-                    time_str = stamp[2].split("_", 1)[0]
-                if date_str and time_str and len(time_str) >= 6:
-                    rec_iso = (
-                        f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]} "
-                        f"{time_str[:2]}:{time_str[2:4]}:{time_str[4:6]}"
-                    )
-                    for sess in list_extrinsic_sessions():
-                        if str(sess["created_at"]) <= rec_iso:
-                            loaded = load_extrinsic_session(int(sess["id"]))
-                            if loaded is not None:
-                                _, calibrated_cams = loaded
-                                sess_id = int(sess["id"])
-                                chosen_via = f"timestamp before {rec_iso}"
-                                break
+                for sess in list_extrinsic_sessions():
+                    if str(sess["created_at"]) <= rec_iso:
+                        loaded = load_extrinsic_session(int(sess["id"]))
+                        if loaded is not None:
+                            _, calibrated_cams = loaded
+                            sess_id = int(sess["id"])
+                            chosen_via = f"timestamp before {rec_iso}"
+                            break
             except Exception:
                 pass
 
@@ -183,7 +189,7 @@ def resolve_calibration(recording_name: str, args):
     # Load view transform
     view_R = view_t = None
     try:
-        preset = load_view_transform("synthpose", extrinsic_session_id=sess_id)
+        preset = load_view_transform("synthpose", before=rec_iso)
         if preset is not None:
             view_R, view_t, _ = preset
     except Exception:

@@ -48,7 +48,7 @@ def main() -> int:
     # be listed here, but the table itself is keyed by string so the
     # GUI's lookup never relies on this list.
     for key in KNOWN_MODEL_KEYS:
-        loaded = load_view_transform(key)
+        loaded = load_view_transform(key, before="9999-12-31 23:59:59")
         print(f"-- model_key = {key!r} " + "-" * 40)
         if loaded is None:
             print("  (no row - Rotate-to-Human / Zero has not been pressed "

@@ -2689,7 +2689,8 @@ class WorkoutPage(QWidget):
         """
         try:
             from ..config import load_view_transform, save_view_transform
-            if load_view_transform("synthpose") is not None:
+            from datetime import datetime
+            if load_view_transform("synthpose", before=datetime.now().strftime("%Y-%m-%d %H:%M:%S")) is not None:
                 return
             import rtoml
             rig_path = self._get_camera_rig_path()
@@ -2753,12 +2754,10 @@ class WorkoutPage(QWidget):
         self._migrate_legacy_view_transform()
         try:
             from ..config import load_view_transform
-            # Prefer a preset tagged with the currently-active
-            # calibration session; fall back to untagged most-recent
-            # via load_view_transform's resolution priority.
+            from datetime import datetime
             loaded = load_view_transform(
                 model_key,
-                extrinsic_session_id=self._calibration_session_id,
+                before=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             )
         except Exception:
             loaded = None
@@ -4199,7 +4198,11 @@ class WorkoutPage(QWidget):
         if not already_in_view_frame:
             try:
                 from ..config import load_view_transform
-                preset = load_view_transform(self._current_model_key())
+                from datetime import datetime
+                preset = load_view_transform(
+                    self._current_model_key(),
+                    before=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                )
                 if preset is not None:
                     R_view, t_view, has_origin = preset
                     if has_origin:
