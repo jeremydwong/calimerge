@@ -1,44 +1,38 @@
 """
-Headless end-to-end test of the offline post-tracking pipeline.
+Headless end-to-end test of the unified offline pipeline.
 
-Goal: reproduce what OfflineProcessingWorker does in src/calimerge/gui/workers.py
-against a real recording, on the command line, so we can debug the C-side
-tracker fragmentation problem and verify that the Python-side stitcher in
-_convert_outputs collapses the fragments back into a small number of distinct
-people.
+Drives UnifiedOfflineWorker — the same code path that the GUI's
+"Generate 3D-npz post-trial" button uses — against a real recording,
+on the command line.
 
 Inputs:
   * Recording folder (copied from <last_project_folder>/workouts/<name>/)
     is duplicated into tests/data/<name>/ on first run.
-  * Latest extrinsic calibration is read from extrinsics.db via
-    config.load_latest_extrinsic_session and dumped to a temp TOML in the
-    CUDA parser format via config.write_cuda_calibration_toml.
-  * ONNX models are taken from <data_dir>/models/onnx/, with a fallback to
-    <repo>/models/onnx/.
+  * Extrinsic calibration from extrinsics.db (matched by recording
+    timestamp or workouts.db session row).
+  * Models are resolved by the worker itself (CoreML on macOS, ONNX +
+    TensorRT on Windows, PyTorch everywhere).
 
 Outputs (written into tests/data/<name>/):
-  * output_3d_poses_tracked_person*.csv  — written by the C tracker
-  * keypoints_3d.raw.npz                 — long-form raw buffer dump
-  * keypoints_3d.npz                     — dense (frames, persons, kps, 3) dump
+  * keypoints_3d.raw.npz  — variable-shape lossless archive
+  * keypoints_3d.npz      — dense (frames, max_persons, kps, 3)
 
 Final report on stdout includes:
-  * # of pre-stitch C-side tracks
-  * # of distinct persons after Python-side _stitch_tracks
-  * Per-survivor frame coverage and hip-COM trajectory range in metres
+  * # of distinct persons in the dense npz
+  * Per-person frame coverage and hip-COM trajectory range in metres
   * Total wall time
 
 Run:
   VIRTUAL_ENV= ~/.local/bin/uv run python tests/manual/run_offline_pipeline_on_test_data.py
 
-If anything blocks (missing CUDA DLL, missing ONNX, etc.), prints a single
-line beginning with "BLOCKED:" and exits non-zero.
+If anything blocks (missing native lib, missing calibration, etc.),
+prints a single line beginning with "BLOCKED:" and exits non-zero.
 """
 
 from __future__ import annotations
 
 import shutil
 import sys
-import tempfile
 import time
 import traceback
 from pathlib import Path
@@ -52,14 +46,9 @@ DEFAULT_RECORDING = "zelda_20260428_151934_fga_horizontal_head_turns"
 
 
 def _parse_args():
-    """Argparse for: positional recording name + optional CLI overrides
-    we want to tune at the command line (person confidence is the one
-    the user has flagged as suspicious — false-positive snaps at low
-    thresholds).
-    """
     import argparse
     parser = argparse.ArgumentParser(
-        description="Headless offline post-tracking pipeline reproducer."
+        description="Headless offline pipeline test (same path as GUI)."
     )
     parser.add_argument(
         "recording", nargs="?", default=DEFAULT_RECORDING,
@@ -67,41 +56,25 @@ def _parse_args():
              f"Defaults to {DEFAULT_RECORDING!r}.",
     )
     parser.add_argument(
-        "--person-confidence", type=float, default=0.1,
+        "--person-confidence", type=float, default=0.5,
         help="YOLO person-detection confidence floor (0.0-1.0). "
-             "Default 0.1 matches run_cuda_pipeline; raise to ~0.4 to "
-             "kill false-positive snaps onto static objects.",
+             "Default 0.5 matches the GUI live slider default.",
     )
     parser.add_argument(
         "--max-track-distance", type=float, default=0.5,
-        help="C tracker max-match distance (m). Default 0.5 matches "
-             "the live tracker.",
+        help="Tracker max-match distance (m). Default 0.5.",
     )
     parser.add_argument(
         "--track-patience", type=int, default=60,
-        help="C tracker frames-of-grace. Default 60 (~2s @ 30fps).",
+        help="Tracker frames-of-grace. Default 60 (~2s @ 30fps).",
     )
     parser.add_argument(
-        "--worker",
-        choices=("deprecated", "unified"),
-        default="unified",
-        help=(
-            "Which offline worker to drive. 'unified' runs "
-            "UnifiedOfflineWorker, which shares the live pipeline's "
-            "per-sync primitive (PyTorch / CUDA stream / MPS stream). "
-            "'deprecated' runs the legacy OfflineProcessingWorker which "
-            "drives pt_main.cpp's batched offline pipeline. Default "
-            "'unified'."
-        ),
-    )
-    parser.add_argument(
-        "--unified-backend",
+        "--backend",
         choices=("pytorch", "cuda", "mps"),
         default=None,
         help=(
-            "Backend for the unified worker. Defaults to 'cuda' on "
-            "Windows, 'mps' on macOS (when available), else 'pytorch'. "
-            "Only consulted when --worker=unified."
+            "Detection backend. Defaults to 'mps' on macOS (when the "
+            "native lib is available), 'cuda' on Windows, else 'pytorch'."
         ),
     )
     parser.add_argument(
@@ -109,9 +82,8 @@ def _parse_args():
         type=int,
         default=0,
         help=(
-            "Cap the number of sync indices the unified worker "
-            "processes. 0 = no limit. Useful for debugging — small "
-            "values (e.g. 50) iterate in seconds rather than minutes."
+            "Cap the number of sync indices processed. "
+            "0 = no limit. Small values (e.g. 50) iterate in seconds."
         ),
     )
     parser.add_argument(
@@ -120,11 +92,7 @@ def _parse_args():
         default=None,
         help=(
             "Force a specific extrinsic_session id from extrinsics.db, "
-            "bypassing the workouts.db lookup + timestamp fallback. "
-            "Use when the chronological selection picks the wrong rig "
-            "(e.g. the user re-calibrated minutes before this recording "
-            "but the BA finished after — its created_at would post-date "
-            "the recording even though it's the right calibration)."
+            "bypassing the workouts.db lookup + timestamp fallback."
         ),
     )
     return parser.parse_args()
@@ -132,31 +100,6 @@ def _parse_args():
 
 _ARGS = _parse_args()
 RECORDING_NAME = _ARGS.recording
-
-
-def _setup_cuda_dll_search_path() -> None:
-    """Make sure CUDA / TensorRT / OpenCV DLLs are findable.
-
-    Mirrors the logic in calimerge.tracking.cuda_stream_binding._load_lib —
-    needed because cuda_binding.py (used by run_cuda_pipeline) doesn't do
-    this itself, and outside the GUI nothing else has set up the path.
-    """
-    if sys.platform != "win32":
-        return
-    import os
-    dep_dirs = [
-        r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9\bin",
-        r"C:\TensorRT\lib",
-        os.environ.get("OPENCV_PATH", r"C:\OpenCV\opencv\build") + r"\x64\vc16\bin",
-    ]
-    for dep_dir in dep_dirs:
-        if os.path.isdir(dep_dir):
-            try:
-                os.add_dll_directory(dep_dir)
-            except Exception:
-                pass
-            if dep_dir not in os.environ.get("PATH", ""):
-                os.environ["PATH"] = dep_dir + ";" + os.environ.get("PATH", "")
 
 
 def _blocked(reason: str) -> int:
@@ -175,7 +118,6 @@ def _find_source_recording() -> Path | None:
     candidate = Path(folder) / "workouts" / RECORDING_NAME
     if candidate.is_dir():
         return candidate
-    # Fallback: walk a few well-known places.
     for root in (
         Path(folder),
         Path("~/Documents/Calimerge").expanduser(),
@@ -188,11 +130,7 @@ def _find_source_recording() -> Path | None:
 
 
 def _copy_recording_to_test_data(src: Path, dst: Path) -> None:
-    """Copy the videos + frame_time_history.csv + camera_mapping.csv.
-
-    Preserves filenames exactly so the offline pipeline's port_{N}_{serial}.mp4
-    pattern still matches.
-    """
+    """Copy the videos + frame_time_history.csv + camera_mapping.csv."""
     dst.mkdir(parents=True, exist_ok=True)
     wanted = []
     wanted.extend(sorted(src.glob("port_*.mp4")))
@@ -215,21 +153,6 @@ def _copy_recording_to_test_data(src: Path, dst: Path) -> None:
         shutil.copy(p, out)
 
 
-def _resolve_onnx_paths() -> tuple[Path | None, Path | None, str]:
-    """Find yolo + vitpose ONNX. Returns (yolo, vitpose, source_label)."""
-    from calimerge.config import models_dir
-
-    primary = models_dir() / "onnx"
-    legacy = REPO_ROOT / "models" / "onnx"
-
-    for root, label in ((primary, "app_data"), (legacy, "repo")):
-        yolo = root / "yolo_v10s.onnx"
-        vitpose = root / "vitpose_synthpose.onnx"
-        if yolo.exists() and vitpose.exists():
-            return yolo, vitpose, f"{label}: {root}"
-    return None, None, "missing"
-
-
 def _count_persons_in_npz(npz_path: Path) -> tuple[int, list[dict]]:
     """Read keypoints_3d.npz and return (n_distinct_people, per_person_stats).
 
@@ -249,7 +172,6 @@ def _count_persons_in_npz(npz_path: Path) -> tuple[int, list[dict]]:
 
     stats = []
     for p in range(max_persons):
-        # frame_valid[i] = True if person p has any finite kp in frame i
         finite_per_kp = np.isfinite(kps[:, p, :, :]).all(axis=-1)  # (frames, kps)
         frame_valid = finite_per_kp.any(axis=-1)                    # (frames,)
         if not frame_valid.any():
@@ -257,8 +179,6 @@ def _count_persons_in_npz(npz_path: Path) -> tuple[int, list[dict]]:
         idx_valid = np.where(frame_valid)[0]
         first_i, last_i = int(idx_valid[0]), int(idx_valid[-1])
 
-        # Hip COM = mean of kps 11 (L_Hip) and 12 (R_Hip), fall back to
-        # shoulders 5/6 if the hips are NaN that frame.
         def _hip_com_at(i: int) -> np.ndarray | None:
             pts = []
             for k in (11, 12):
@@ -279,9 +199,6 @@ def _count_persons_in_npz(npz_path: Path) -> tuple[int, list[dict]]:
         first_com = _hip_com_at(first_i)
         last_com = _hip_com_at(last_i)
 
-        # Bounding-box of all valid hip COMs across this person's track —
-        # this is what tells you whether the person stayed put or moved
-        # halfway across the room.
         coms = []
         for i in idx_valid:
             c = _hip_com_at(int(i))
@@ -318,13 +235,151 @@ def _format_vec3(v: np.ndarray | None) -> str:
     return f"[{v[0]:+.3f}, {v[1]:+.3f}, {v[2]:+.3f}]"
 
 
+# SynthPose-52 skeleton connectivity (same as PoseDetectionWorker._SKELETON).
+_SKELETON = [
+    (0, 1), (0, 2), (1, 3), (2, 4),
+    (0, 17), (17, 5), (17, 6), (17, 48),
+    (5, 19), (6, 18),
+    (5, 7), (7, 9), (7, 21), (7, 23), (9, 25), (9, 27),
+    (6, 8), (8, 10), (8, 20), (8, 22), (10, 24), (10, 26),
+    (5, 11), (6, 12), (11, 12),
+    (48, 51), (51, 50), (50, 49), (49, 29), (49, 28), (29, 31), (28, 30),
+    (11, 13), (13, 15), (13, 33), (13, 35), (15, 37), (15, 39),
+    (12, 14), (14, 16), (14, 32), (14, 34), (16, 36), (16, 38),
+    (15, 46), (15, 41), (41, 43), (43, 45),
+    (16, 47), (16, 40), (40, 42), (42, 44),
+    (5, 6),
+]
+L_ANKLE, R_ANKLE = 15, 16
+
+
+def _generate_annotated_video(
+    npz_path: Path,
+    video_path: Path,
+    output_path: Path,
+    camera,
+    view_R: np.ndarray | None,
+    view_t: np.ndarray | None,
+) -> None:
+    """Render skeleton overlay on one camera's video from the 3D npz."""
+    import cv2
+    from calimerge.types import compute_projection_matrix
+
+    data = np.load(str(npz_path))
+    kps = data["keypoints_3d"]  # (n_frames, max_persons, n_kps, 3)
+    n_frames, max_persons, n_kps, _ = kps.shape
+
+    P = compute_projection_matrix(camera)  # 3x4
+
+    # Precompute inverse view transform (view frame → world frame).
+    if view_R is not None and view_t is not None:
+        R_inv = view_R.T
+        t_neg = -R_inv @ view_t
+    else:
+        R_inv = np.eye(3)
+        t_neg = np.zeros(3)
+
+    cap = cv2.VideoCapture(str(video_path))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(output_path), fourcc, fps, (w, h))
+
+    COLORS = [(80, 200, 120), (100, 160, 255), (255, 180, 80), (220, 100, 220)]
+
+    for fi in range(n_frames):
+        ok, frame = cap.read()
+        if not ok:
+            break
+
+        for pi in range(max_persons):
+            person_kps = kps[fi, pi]  # (n_kps, 3)
+            valid = np.isfinite(person_kps).all(axis=1)
+            if not valid.any():
+                continue
+
+            # Project all keypoints: view → world → pixel
+            world_pts = (R_inv @ person_kps.T).T + t_neg  # (n_kps, 3)
+            hom = P @ np.hstack([world_pts, np.ones((n_kps, 1))]).T  # (3, n_kps)
+            px = np.zeros((n_kps, 2))
+            for k in range(n_kps):
+                if valid[k] and hom[2, k] > 0:
+                    px[k] = hom[:2, k] / hom[2, k]
+                else:
+                    valid[k] = False
+
+            color = COLORS[pi % len(COLORS)]
+            kp_color = tuple(min(255, int(c * 1.3)) for c in color)
+
+            for i, j in _SKELETON:
+                if i >= n_kps or j >= n_kps:
+                    continue
+                if not (valid[i] and valid[j]):
+                    continue
+                pt1 = (int(px[i, 0]), int(px[i, 1]))
+                pt2 = (int(px[j, 0]), int(px[j, 1]))
+                cv2.line(frame, pt1, pt2, color, 2, cv2.LINE_AA)
+
+            for k in range(n_kps):
+                if not valid[k]:
+                    continue
+                pt = (int(px[k, 0]), int(px[k, 1]))
+                cv2.circle(frame, pt, 3, kp_color, -1, cv2.LINE_AA)
+
+        writer.write(frame)
+
+    cap.release()
+    writer.release()
+
+
+def _generate_ankle_plot(
+    npz_path: Path,
+    output_path: Path,
+) -> None:
+    """Plot ankle x/y/z over time and save to PNG."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    data = np.load(str(npz_path))
+    kps = data["keypoints_3d"]
+    timestamps = data["timestamps"]
+    counts = data["person_count"]
+    primary = data.get("primary_person_index",
+                       np.zeros(len(timestamps), dtype=np.int32))
+
+    n_frames = kps.shape[0]
+    left_ankle = np.full((n_frames, 3), np.nan, dtype=np.float32)
+    right_ankle = np.full((n_frames, 3), np.nan, dtype=np.float32)
+    for fi in range(n_frames):
+        if counts[fi] == 0:
+            continue
+        pi = int(primary[fi]) if primary[fi] < counts[fi] else 0
+        left_ankle[fi] = kps[fi, pi, L_ANKLE]
+        right_ankle[fi] = kps[fi, pi, R_ANKLE]
+
+    fig, axes = plt.subplots(3, 1, figsize=(12, 8), sharex=True)
+    for ax, axis_idx, axis_label in zip(axes, range(3), ("x (m)", "y (m)", "z (m)")):
+        ax.plot(timestamps, left_ankle[:, axis_idx], color="#5099ff", label="L_Ankle")
+        ax.plot(timestamps, right_ankle[:, axis_idx], color="#ff5050", label="R_Ankle")
+        ax.set_ylabel(axis_label)
+        ax.grid(True, alpha=0.3)
+    axes[0].set_title("Ankle position over time (primary person)")
+    axes[-1].set_xlabel("time (s)")
+    axes[0].legend(loc="upper right")
+    fig.tight_layout()
+    fig.savefig(str(output_path), dpi=120)
+    plt.close(fig)
+
+
 def main() -> int:
-    _setup_cuda_dll_search_path()
     t0 = time.time()
 
     # ── 1. Locate source recording + copy into tests/data ──────────────
     print("=" * 70)
-    print("offline pipeline test on real recording")
+    print("offline pipeline test (unified worker — same path as GUI)")
     print("=" * 70)
 
     test_data_dir = TEST_DATA_DIR / RECORDING_NAME
@@ -360,8 +415,7 @@ def main() -> int:
     # ── 2. Discover videos in the test data dir ────────────────────────
     port_to_video: dict[int, Path] = {}
     for p in sorted(test_data_dir.glob("port_*.mp4")):
-        # Filename forms: port_0.mp4 OR port_0_<serial>-...mp4
-        stem = p.stem  # 'port_0_6-3023cdee-0-0000'
+        stem = p.stem
         try:
             after = stem[len("port_"):]
             port_str = after.split("_", 1)[0]
@@ -379,25 +433,12 @@ def main() -> int:
     if not frame_time_csv.exists():
         return _blocked(f"missing frame_time_history.csv in {test_data_dir}")
 
-    # ── 3. Load the extrinsic that was ACTIVE when this recording was
-    #       made — NOT the newest extrinsic, since the user may have
-    #       recalibrated for a different camera placement after this
-    #       trial was recorded. Sources, in priority order:
-    #         (a) The session row in workouts.db (matched by
-    #             recording_path) carries `extrinsic_session_id` —
-    #             that's the authoritative pointer.
-    #         (b) Otherwise, parse the YYYYMMDD_HHMMSS timestamp out of
-    #             the recording folder name and pick the newest
-    #             extrinsic_session whose created_at predates it.
-    #         (c) Last resort: load_latest_extrinsic_session — clearly
-    #             wrong if (a) or (b) would have produced a different
-    #             answer, so we print a loud warning.
+    # ── 3. Load extrinsic calibration ──────────────────────────────────
     try:
         from calimerge.config import (
             load_extrinsic_session,
             load_latest_extrinsic_session,
             load_view_transform,
-            write_cuda_calibration_toml,
             list_extrinsic_sessions,
             extrinsics_db_path,
             workouts_db_path,
@@ -413,8 +454,7 @@ def main() -> int:
     calibrated_cams = None
     chosen_via = None
 
-    # Parse recording timestamp from folder name (used for both extrinsic
-    # and view-transform lookups).
+    # Parse recording timestamp from folder name.
     rec_iso = None
     _stamp = RECORDING_NAME.split("_", 2)
     _date_str = _time_str = None
@@ -444,29 +484,30 @@ def main() -> int:
         chosen_via = f"--extrinsic-session-id {forced} (forced)"
 
     # (a) workouts.db session row
-    try:
-        import sqlite3
-        wdb = workouts_db_path()
-        if wdb.exists():
-            conn = sqlite3.connect(str(wdb))
-            try:
-                row = conn.execute(
-                    "SELECT extrinsic_session_id "
-                    "FROM sessions WHERE recording_path LIKE ? "
-                    "ORDER BY created_at DESC LIMIT 1",
-                    (f"%{RECORDING_NAME}",),
-                ).fetchone()
-            finally:
-                conn.close()
-            if row is not None and row[0] is not None:
-                ext_sid = int(row[0])
-                loaded = load_extrinsic_session(ext_sid)
-                if loaded is not None:
-                    created_at, calibrated_cams = loaded
-                    sess_id = ext_sid
-                    chosen_via = "workouts.db sessions.extrinsic_session_id"
-    except Exception as e:
-        print(f"[calib] note: workouts.db lookup raised: {e}")
+    if calibrated_cams is None:
+        try:
+            import sqlite3
+            wdb = workouts_db_path()
+            if wdb.exists():
+                conn = sqlite3.connect(str(wdb))
+                try:
+                    row = conn.execute(
+                        "SELECT extrinsic_session_id "
+                        "FROM sessions WHERE recording_path LIKE ? "
+                        "ORDER BY created_at DESC LIMIT 1",
+                        (f"%{RECORDING_NAME}",),
+                    ).fetchone()
+                finally:
+                    conn.close()
+                if row is not None and row[0] is not None:
+                    ext_sid = int(row[0])
+                    loaded = load_extrinsic_session(ext_sid)
+                    if loaded is not None:
+                        created_at, calibrated_cams = loaded
+                        sess_id = ext_sid
+                        chosen_via = "workouts.db sessions.extrinsic_session_id"
+        except Exception as e:
+            print(f"[calib] note: workouts.db lookup raised: {e}")
 
     # (b) timestamp-before-recording fallback
     if calibrated_cams is None and rec_iso is not None:
@@ -502,16 +543,12 @@ def main() -> int:
           f"cameras={sorted(calibrated_cams.keys())}")
     print(f"[calib] chosen via: {chosen_via}")
 
-    # Reduce calibrated cams to those whose ports we have videos for, OR,
-    # if there's no overlap on port number, remap by serial-number from
-    # camera_mapping.csv.
+    # Remap calibrated cams by serial number if port numbers don't match.
     cal_ports = set(calibrated_cams.keys())
     vid_ports = set(port_to_video.keys())
     missing = vid_ports - cal_ports
     if missing:
         print(f"[calib] WARNING: video ports not in calibration: {missing}")
-        # Try to remap: look up serial in camera_mapping, find calibrated
-        # camera with same serial, re-key to the video port.
         mapping_csv = test_data_dir / "camera_mapping.csv"
         port_to_serial = {}
         if mapping_csv.exists():
@@ -526,7 +563,6 @@ def main() -> int:
             ser = port_to_serial.get(vp)
             if ser and ser in serial_to_cal:
                 base = serial_to_cal[ser]
-                # Rebuild CalibratedCamera with the video-side port.
                 from calimerge.types import CalibratedCamera
                 remapped[vp] = CalibratedCamera(
                     serial_number=base.serial_number,
@@ -540,12 +576,7 @@ def main() -> int:
             calibrated_cams = remapped
             print(f"[calib] remapped by serial -> ports {sorted(calibrated_cams.keys())}")
 
-    # ── 3a-bis. Normalise intrinsics to match the recorded video size. ──
-    # The GUI's `_start_offline_processing` does this before constructing
-    # the worker — the test runner has to do it too or the C-side
-    # triangulation projects against the wrong scale and every 3D point
-    # comes out wrong by a scale factor (we saw 2 m median ankle delta vs
-    # the online output before adding this step).
+    # ── 3a. Normalise intrinsics to match the recorded video size. ─────
     try:
         import cv2 as _cv2
         any_video = next(iter(port_to_video.values()))
@@ -572,22 +603,7 @@ def main() -> int:
     except Exception as e:
         print(f"[calib] WARNING: intrinsic normalisation failed: {e}")
 
-    cuda_cal_path = Path(tempfile.gettempdir()) / "calimerge_offline_test_cal.toml"
-    write_cuda_calibration_toml(calibrated_cams, cuda_cal_path)
-    print(f"[calib] CUDA calibration TOML: {cuda_cal_path}")
-
-    # ── 3b. Load view transform (rotate-to-human + zero-at-ankle) ──
-    #
-    # Source priority:
-    #   (1) The ORIGINAL recording's keypoints_3d.npz (if present in
-    #       <last_project_folder>/workouts/<name>/) — this is the
-    #       transform that was active at record-time and is baked into
-    #       the online output. Using it makes online vs offline an
-    #       apples-to-apples comparison.
-    #   (2) The current DB preset for vitpose. Fallback when the user
-    #       only has the videos (e.g. paused-tracking trial).
-    #   (3) None → camera frame (clearly broken, but caller can opt in
-    #       deliberately by deleting both).
+    # ── 3b. Load view transform ────────────────────────────────────────
     view_R = None
     view_t = None
     view_source = "none"
@@ -606,9 +622,6 @@ def main() -> int:
                     if "view_transform_R" in on.files and "view_transform_t" in on.files:
                         candidate_R = np.array(on["view_transform_R"])
                         candidate_t = np.array(on["view_transform_t"])
-                        # Identity transform = recording was made
-                        # without zero pressed, so it's effectively
-                        # camera frame — fall through to DB preset.
                         if not (np.allclose(candidate_R, np.eye(3))
                                 and np.allclose(candidate_t, 0.0)):
                             view_R = candidate_R
@@ -645,234 +658,154 @@ def main() -> int:
             "camera frame (z huge, x/y rotated)."
         )
 
-    # ── 4. Resolve ONNX models ─────────────────────────────────────────
-    yolo_onnx, vitpose_onnx, onnx_src = _resolve_onnx_paths()
-    if yolo_onnx is None or vitpose_onnx is None:
-        return _blocked(
-            f"could not find yolo_v10s.onnx + vitpose_synthpose.onnx under "
-            f"<data_dir>/models/onnx/ or <repo>/models/onnx/. "
-            f"Download them first."
-        )
-    print(f"[onnx] yolo:    {yolo_onnx}")
-    print(f"[onnx] vitpose: {vitpose_onnx}")
-    print(f"[onnx] source:  {onnx_src}")
+    # ── 4. Pick backend ────────────────────────────────────────────────
+    backend = _ARGS.backend
+    if backend is None:
+        if sys.platform == "darwin":
+            try:
+                from calimerge.tracking.mps_stream_binding import (
+                    is_available as _mps_avail,
+                )
+                backend = "mps" if _mps_avail() else "pytorch"
+            except Exception:
+                backend = "pytorch"
+        else:
+            try:
+                from calimerge.tracking.cuda_stream_binding import (
+                    is_available as _cuda_avail,
+                )
+                backend = "cuda" if _cuda_avail() else "pytorch"
+            except Exception:
+                backend = "pytorch"
 
-    # ── 5. Pick worker + (deprecated path) check CUDA dll availability ──
+    # ── 5. Run the unified offline worker ──────────────────────────────
+    print("=" * 70)
+    print(f"[run ] starting unified offline pipeline (backend={backend})")
+    print("=" * 70)
+    print(
+        f"[run ] params: person_confidence={_ARGS.person_confidence:.2f}  "
+        f"max_track_distance={_ARGS.max_track_distance:.2f}  "
+        f"track_patience={_ARGS.track_patience}"
+    )
+
+    try:
+        from calimerge.gui.unified_offline_worker import UnifiedOfflineWorker
+    except Exception as e:
+        return _blocked(f"importing UnifiedOfflineWorker: {e}")
+
     last_step = ""
+    t_milestones: dict[str, float] = {}
 
     def _on_prog(step: str, frac: float) -> None:
         nonlocal last_step
         if step != last_step:
             last_step = step
+            t_milestones.setdefault(step, time.time())
             print(f"[prog] {step}  {frac:.2f}", flush=True)
 
-    def _on_log(msg: str) -> None:
-        print(f"[c   ] {msg}", flush=True)
+    worker = UnifiedOfflineWorker(
+        session_dir=test_data_dir,
+        cameras=calibrated_cams,
+        port_to_video=port_to_video,
+        frame_time_csv=frame_time_csv,
+        backend=backend,
+        view_rotation=view_R,
+        view_translation=view_t,
+        max_track_distance=_ARGS.max_track_distance,
+        track_patience=_ARGS.track_patience,
+        person_confidence=_ARGS.person_confidence,
+        extrinsic_session_id=sess_id,
+        extrinsic_created_at=str(created_at) if created_at else None,
+    )
 
-    pipe_secs = 0.0
-    per_person_csvs: list[Path] = []
+    if _ARGS.max_syncs > 0:
+        _orig = worker._read_sync_to_ports
+        cap = int(_ARGS.max_syncs)
+        def _capped_read(_orig=_orig, cap=cap):
+            full = _orig()
+            keys = sorted(full.keys())[:cap]
+            return {k: full[k] for k in keys}
+        worker._read_sync_to_ports = _capped_read
+        print(f"[run ] capping at {cap} sync indices", flush=True)
 
-    if _ARGS.worker == "deprecated":
-        try:
-            from calimerge.tracking.cuda_binding import (
-                is_available, run_cuda_pipeline,
-            )
-        except Exception as e:
-            return _blocked(f"importing cuda_binding: {e}")
-        if not is_available():
-            return _blocked(
-                "calimerge_cuda.dll not available. "
-                "Build it via src/cuda_pipeline/build_cuda_win32.bat first."
-            )
-
-        # ── 6a. Run the deprecated C-side batched pipeline ────────────
-        print("=" * 70)
-        print(
-            "[run ] starting CUDA batched pipeline "
-            "(this may take 30-60s on first run)"
+    try:
+        worker.log_message.connect(
+            lambda m: print(f"[work] {m}", flush=True)
         )
-        print("=" * 70)
-        print(
-            f"[run ] params: person_confidence={_ARGS.person_confidence:.2f}  "
-            f"max_track_distance={_ARGS.max_track_distance:.2f}  "
-            f"track_patience={_ARGS.track_patience}"
-        )
-        t_pipe = time.time()
-        try:
-            run_cuda_pipeline(
-                video_paths=port_to_video,
-                calibration_toml=cuda_cal_path,
-                frame_time_csv=frame_time_csv,
-                output_path=test_data_dir,
-                yolo_onnx=yolo_onnx,
-                vitpose_onnx=vitpose_onnx,
-                batch_size=8,
-                person_confidence=_ARGS.person_confidence,
-                max_track_distance=_ARGS.max_track_distance,
-                track_patience=_ARGS.track_patience,
-                progress_callback=_on_prog,
-                log_callback=_on_log,
-            )
-        except Exception as e:
-            print(traceback.format_exc())
-            return _blocked(f"run_cuda_pipeline raised: {e}")
-        pipe_secs = time.time() - t_pipe
-        print(f"[run ] CUDA pipeline finished in {pipe_secs:.1f}s")
+        worker.progress.connect(_on_prog)
+    except Exception:
+        pass
 
-        # ── 7a. Count C-side per-track CSVs (pre-stitch fragmentation) ──
-        per_person_csvs = sorted(
-            list(test_data_dir.glob("output_3d_poses_tracked.csv_person*.csv"))
-            + list(test_data_dir.glob("output_3d_poses_tracked_person*.csv"))
-        )
-        print(f"[run ] C tracker emitted {len(per_person_csvs)} per-person CSVs:")
-        for p in per_person_csvs:
-            print(f"       {p.name}")
+    t_pipe = time.time()
+    try:
+        worker.run()
+    except Exception as e:
+        print(traceback.format_exc())
+        return _blocked(f"UnifiedOfflineWorker.run raised: {e}")
+    t_pipe_end = time.time()
+    pipe_secs = t_pipe_end - t_pipe
 
-        # ── 8a. Drive the deprecated worker's _convert_outputs ────────
-        print("=" * 70)
-        print("[run ] running OfflineProcessingWorker._convert_outputs "
-              "(stitcher + npz)")
-        print("=" * 70)
-        try:
-            from calimerge.gui.workers import OfflineProcessingWorker
-        except Exception as e:
-            return _blocked(f"importing OfflineProcessingWorker: {e}")
+    t_detect = t_milestones.get("detect+triangulate", t_pipe)
+    t_retrack = t_milestones.get("re-tracking", t_pipe_end)
+    load_secs = t_detect - t_pipe
+    infer_secs = t_retrack - t_detect
+    post_secs = t_pipe_end - t_retrack
+    # Estimate sync count for fps calculation — refined after npz load.
+    n_syncs_actual = _ARGS.max_syncs if _ARGS.max_syncs > 0 else 0
 
-        worker = OfflineProcessingWorker(
-            session_dir=test_data_dir,
-            cameras=calibrated_cams,
-            port_to_video=port_to_video,
-            frame_time_csv=frame_time_csv,
-            batch_size=8,
-            view_rotation=view_R,
-            view_translation=view_t,
-            max_track_distance=_ARGS.max_track_distance,
-            track_patience=_ARGS.track_patience,
-        )
-        try:
-            worker.log_message.connect(
-                lambda m: print(f"[work] {m}", flush=True)
-            )
-        except Exception:
-            pass
-        try:
-            worker._convert_outputs()
-        except Exception as e:
-            print(traceback.format_exc())
-            return _blocked(f"_convert_outputs raised: {e}")
+    print(f"[run ] pipeline finished in {pipe_secs:.1f}s")
+    print(f"[time]   model loading:      {load_secs:.1f}s")
+    print(f"[time]   detect+triangulate: {infer_secs:.1f}s")
+    print(f"[time]   retrack+stitch+io:  {post_secs:.1f}s")
 
-    else:
-        # ── 6b/7b/8b. Drive the unified worker end-to-end ─────────────
-        # Pick the backend. Default: CUDA on Windows when available, MPS
-        # on macOS when available, else PyTorch.
-        backend = _ARGS.unified_backend
-        if backend is None:
-            if sys.platform == "darwin":
-                try:
-                    from calimerge.tracking.mps_stream_binding import (
-                        is_available as _mps_avail,
-                    )
-                    backend = "mps" if _mps_avail() else "pytorch"
-                except Exception:
-                    backend = "pytorch"
-            else:
-                try:
-                    from calimerge.tracking.cuda_stream_binding import (
-                        is_available as _cuda_avail,
-                    )
-                    backend = "cuda" if _cuda_avail() else "pytorch"
-                except Exception:
-                    backend = "pytorch"
-
-        print("=" * 70)
-        print(f"[run ] starting unified offline pipeline (backend={backend})")
-        print("=" * 70)
-        print(
-            f"[run ] params: person_confidence={_ARGS.person_confidence:.2f}  "
-            f"max_track_distance={_ARGS.max_track_distance:.2f}  "
-            f"track_patience={_ARGS.track_patience}"
-        )
-
-        try:
-            from calimerge.gui.unified_offline_worker import UnifiedOfflineWorker
-        except Exception as e:
-            return _blocked(f"importing UnifiedOfflineWorker: {e}")
-
-        worker = UnifiedOfflineWorker(
-            session_dir=test_data_dir,
-            cameras=calibrated_cams,
-            port_to_video=port_to_video,
-            frame_time_csv=frame_time_csv,
-            backend=backend,
-            view_rotation=view_R,
-            view_translation=view_t,
-            max_track_distance=_ARGS.max_track_distance,
-            track_patience=_ARGS.track_patience,
-            person_confidence=_ARGS.person_confidence,
-            extrinsic_session_id=sess_id,
-            extrinsic_created_at=str(created_at) if created_at else None,
-        )
-        # Debugging knob: stop after N sync indices. Implemented by
-        # monkey-patching the worker's frame_time_csv reader so it sees
-        # only the first N rows. Cleanest non-invasive way to cap.
-        if _ARGS.max_syncs > 0:
-            _orig = worker._read_sync_to_ports
-            cap = int(_ARGS.max_syncs)
-            def _capped_read(_orig=_orig, cap=cap):
-                full = _orig()
-                keys = sorted(full.keys())[:cap]
-                return {k: full[k] for k in keys}
-            worker._read_sync_to_ports = _capped_read
-            print(f"[run ] DEBUG: capping at {cap} sync indices", flush=True)
-        try:
-            worker.log_message.connect(
-                lambda m: print(f"[work] {m}", flush=True)
-            )
-            worker.progress.connect(_on_prog)
-        except Exception:
-            pass
-
-        # Drive run() synchronously rather than start()ing the QThread —
-        # we don't have an event loop here and run() does not require one
-        # because the signal connections above invoke their slots
-        # directly when emitter and slot share a thread.
-        t_pipe = time.time()
-        try:
-            worker.run()
-        except Exception as e:
-            print(traceback.format_exc())
-            return _blocked(f"UnifiedOfflineWorker.run raised: {e}")
-        pipe_secs = time.time() - t_pipe
-        print(f"[run ] unified pipeline finished in {pipe_secs:.1f}s")
-
-        # The unified path doesn't write per-track CSVs; it goes straight
-        # to keypoints_3d.npz. Pre-stitch track count is therefore the
-        # number of distinct tracker ids the streaming primitive emitted
-        # before stitching — read from the worker's log lines for
-        # reporting. Leave the CSV list empty.
-
-    # ── 9. Inspect outputs ─────────────────────────────────────────────
+    # ── 6. Inspect npz outputs ─────────────────────────────────────────
     raw_npz = test_data_dir / "keypoints_3d.raw.npz"
     npz = test_data_dir / "keypoints_3d.npz"
     print(f"[done] raw npz: {raw_npz} (exists={raw_npz.exists()})")
     print(f"[done] dense npz: {npz} (exists={npz.exists()})")
 
     n_distinct, per_person = _count_persons_in_npz(npz)
-    n_pre_stitch = len(per_person_csvs)
+
+    if npz.exists() and n_syncs_actual == 0:
+        d = np.load(str(npz))
+        n_syncs_actual = d["keypoints_3d"].shape[0]
+
+    # ── 6a. Generate annotated video + ankle plot ──────────────────────
+    first_port = sorted(port_to_video.keys())[0]
+    annotated_video = test_data_dir / f"annotated_port_{first_port}.mp4"
+    ankle_plot = test_data_dir / "ankle_plot.png"
+
+    if npz.exists():
+        print("[viz ] generating annotated video...", flush=True)
+        try:
+            _generate_annotated_video(
+                npz, port_to_video[first_port], annotated_video,
+                calibrated_cams[first_port], view_R, view_t,
+            )
+            print(f"[viz ] wrote {annotated_video}")
+        except Exception as e:
+            print(f"[viz ] annotated video failed: {e}")
+
+        print("[viz ] generating ankle plot...", flush=True)
+        try:
+            _generate_ankle_plot(npz, ankle_plot)
+            print(f"[viz ] wrote {ankle_plot}")
+        except Exception as e:
+            print(f"[viz ] ankle plot failed: {e}")
 
     total_secs = time.time() - t0
 
-    # ── 10. Final report ───────────────────────────────────────────────
+    # ── 7. Final report ────────────────────────────────────────────────
     print()
     print("=" * 70)
     print("FINAL REPORT")
     print("=" * 70)
     print(f"recording dir:        {test_data_dir}")
     print(f"calibration session:  id={sess_id}  created_at={created_at}")
-    print(f"yolo onnx:            {yolo_onnx}")
-    print(f"vitpose onnx:         {vitpose_onnx}")
-    print(f"pre-stitch tracks:    {n_pre_stitch}    (output_3d_poses_tracked_person*.csv)")
-    print(f"post-stitch persons:  {n_distinct}    <-- key fragmentation metric")
+    print(f"backend:              {backend}")
+    print(f"distinct persons:     {n_distinct}    <-- key fragmentation metric")
+    print(f"annotated video:      {annotated_video} (exists={annotated_video.exists()})")
+    print(f"ankle plot:           {ankle_plot} (exists={ankle_plot.exists()})")
     print()
     if per_person:
         for s in per_person:
@@ -893,8 +826,11 @@ def main() -> int:
     else:
         print("  (no surviving tracks)")
     print()
-    print(f"total wall time:      {total_secs:.1f}s "
-          f"(of which CUDA pipeline: {pipe_secs:.1f}s)")
+    print(f"total wall time:      {total_secs:.1f}s")
+    print(f"  model loading:      {load_secs:.1f}s")
+    print(f"  detect+triangulate: {infer_secs:.1f}s  "
+          f"({n_syncs_actual / max(0.01, infer_secs):.1f} syncs/s)")
+    print(f"  retrack+stitch+io:  {post_secs:.1f}s")
     print("=" * 70)
     return 0
 
