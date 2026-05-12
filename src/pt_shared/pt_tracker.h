@@ -115,6 +115,38 @@ int pt_track_get_history(
  */
 int pt_track_count_active(const PT_TrackState *state);
 
+/* ============================================================================
+ * Post-processing: stitch fragmented tracks
+ * ============================================================================ */
+
+/*
+ * pt_track_stitch - Merge tracks whose hip-COM trajectories are spatially
+ * close and temporally adjacent.
+ *
+ * The per-frame tracker spawns a fresh track id whenever the camera subset
+ * feeding triangulation changes for a single frame (e.g. one camera drops
+ * a detection then comes back). For a single-subject trial this fragments
+ * one person into many short tracks.
+ *
+ * This function re-merges tracks using the same greedy algorithm as the
+ * Python track_stitch.py it replaces:
+ *
+ *   1. Two tracks may merge only if their sync-index ranges are disjoint
+ *      (no overlap). Two people on the same syncs must not be stitched.
+ *   2. The temporal gap (newer.first_sync - older.last_sync) must be
+ *      <= max_gap_frames.
+ *   3. The 3D hip COM distance at the seam must be <= max_distance_m.
+ *   4. Among eligible pairs, prefer smallest gap, then smallest distance.
+ *   5. Repeat until no more merges are possible.
+ *
+ * After stitching, consumed tracks have history_count == 0. Surviving
+ * tracks contain the merged ring-buffer entries. pt_export_csv sorts by
+ * sync_index, so insertion order in the ring buffer does not matter.
+ *
+ * Returns the number of merges performed.
+ */
+int pt_track_stitch(PT_TrackState *state, int max_gap_frames, float max_distance_m);
+
 /*
  * Find track index by person_id. Returns -1 if not found.
  */

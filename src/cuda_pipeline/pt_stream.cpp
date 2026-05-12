@@ -742,6 +742,15 @@ extern "C" void pt_stream_reset_tracks(PT_Stream *s) {
 }
 
 /* ============================================================================
+ * pt_stream_stitch_tracks
+ * ============================================================================ */
+
+extern "C" int pt_stream_stitch_tracks(PT_Stream *s, int max_gap_frames, float max_distance_m) {
+    if (!s) return 0;
+    return pt_track_stitch(&s->tracks, max_gap_frames, max_distance_m);
+}
+
+/* ============================================================================
  * pt_stream_export_csv
  * ============================================================================ */
 

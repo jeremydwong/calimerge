@@ -1280,6 +1280,17 @@ extern "C" int pt_pipeline_run(PT_Pipeline *p) {
 
     free(process_indices);
 
+    /* --- Step 6.5: Stitch fragmented tracks --- */
+    {
+        int n_before = pt_export_get_person_count(&p->tracks);
+        int n_merges = pt_track_stitch(&p->tracks, 90, 0.6f);
+        if (n_merges > 0) {
+            int n_after = pt_export_get_person_count(&p->tracks);
+            pipeline_log(p, "Stitched %d tracks -> %d (%d merges, gap<=90f, dist<=0.60m)",
+                         n_before, n_after, n_merges);
+        }
+    }
+
     /* --- Step 7: Export results --- */
 
     double t_export_start = pt_time_seconds();

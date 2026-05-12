@@ -568,3 +568,197 @@ int pt_track_find_by_id(const PT_TrackState *state, int person_id)
     }
     return -1;
 }
+
+/* ============================================================================
+ * Post-processing: stitch fragmented tracks
+ *
+ * Port of Python track_stitch.py (stitch_tracks + hip_com).
+ * ============================================================================ */
+
+/* Per-track summary used during stitching */
+typedef struct {
+    int track_idx;          /* index into PT_TrackState.tracks[] */
+    int first_sync;
+    int last_sync;
+    double first_com[3];
+    double last_com[3];
+    int first_com_valid;
+    int last_com_valid;
+    int alive;              /* 0 = consumed by merge */
+} StitchSummary;
+
+/* Compute hip midpoint from one frame's keypoints (matches Python hip_com). */
+static void stitch_hip_com(
+    const double kps[PT_NUM_KEYPOINTS][3],
+    const int valid[PT_NUM_KEYPOINTS],
+    double out[3], int *out_valid)
+{
+    int count = 0;
+    out[0] = out[1] = out[2] = 0.0;
+    *out_valid = 0;
+
+    if (valid[PT_HIP_LEFT_INDEX]) {
+        out[0] += kps[PT_HIP_LEFT_INDEX][0];
+        out[1] += kps[PT_HIP_LEFT_INDEX][1];
+        out[2] += kps[PT_HIP_LEFT_INDEX][2];
+        count++;
+    }
+    if (valid[PT_HIP_RIGHT_INDEX]) {
+        out[0] += kps[PT_HIP_RIGHT_INDEX][0];
+        out[1] += kps[PT_HIP_RIGHT_INDEX][1];
+        out[2] += kps[PT_HIP_RIGHT_INDEX][2];
+        count++;
+    }
+    if (count > 0) {
+        out[0] /= count;
+        out[1] /= count;
+        out[2] /= count;
+        *out_valid = 1;
+    }
+}
+
+/* Walk ring buffer, find min/max sync and their COMs. */
+static void stitch_build_summary(const PT_PersonTrack *track, StitchSummary *s, int track_idx)
+{
+    int n, i, ri;
+
+    s->track_idx = track_idx;
+    s->first_sync = 0x7FFFFFFF;
+    s->last_sync = -1;
+    s->first_com_valid = 0;
+    s->last_com_valid = 0;
+    s->alive = 1;
+
+    n = track->history_count;
+    if (n > PT_TRACK_HISTORY_SIZE) n = PT_TRACK_HISTORY_SIZE;
+    if (n <= 0) { s->alive = 0; return; }
+
+    int first_ri = -1, last_ri = -1;
+
+    for (i = 0; i < n; i++) {
+        if (track->history_count <= PT_TRACK_HISTORY_SIZE) {
+            ri = i;
+        } else {
+            ri = (track->history_write_idx + i) % PT_TRACK_HISTORY_SIZE;
+        }
+
+        int sync = track->sync_indices[ri];
+        if (sync < s->first_sync) { s->first_sync = sync; first_ri = ri; }
+        if (sync > s->last_sync)  { s->last_sync = sync;  last_ri = ri; }
+    }
+
+    if (first_ri >= 0)
+        stitch_hip_com(track->keypoints_3d[first_ri], track->keypoints_valid[first_ri],
+                       s->first_com, &s->first_com_valid);
+    if (last_ri >= 0)
+        stitch_hip_com(track->keypoints_3d[last_ri], track->keypoints_valid[last_ri],
+                       s->last_com, &s->last_com_valid);
+}
+
+/* Copy all ring-buffer entries from src into dst (append at dst's write head). */
+static void stitch_merge_history(PT_PersonTrack *dst, const PT_PersonTrack *src)
+{
+    int n = src->history_count;
+    if (n > PT_TRACK_HISTORY_SIZE) n = PT_TRACK_HISTORY_SIZE;
+
+    for (int i = 0; i < n; i++) {
+        int ri;
+        if (src->history_count <= PT_TRACK_HISTORY_SIZE) {
+            ri = i;
+        } else {
+            ri = (src->history_write_idx + i) % PT_TRACK_HISTORY_SIZE;
+        }
+
+        int wi = dst->history_write_idx;
+        memcpy(dst->keypoints_3d[wi], src->keypoints_3d[ri],
+               PT_NUM_KEYPOINTS * 3 * sizeof(double));
+        memcpy(dst->keypoints_valid[wi], src->keypoints_valid[ri],
+               PT_NUM_KEYPOINTS * sizeof(int));
+        dst->sync_indices[wi] = src->sync_indices[ri];
+
+        dst->history_write_idx = (wi + 1) % PT_TRACK_HISTORY_SIZE;
+        if (dst->history_count < PT_TRACK_HISTORY_SIZE)
+            dst->history_count++;
+    }
+}
+
+int pt_track_stitch(PT_TrackState *state, int max_gap_frames, float max_distance_m)
+{
+    if (!state) return 0;
+
+    StitchSummary sums[PT_MAX_TRACKS];
+    int n_sums = 0;
+    int merges = 0;
+    int i, j;
+
+    /* Build summaries for all tracks with history */
+    for (i = 0; i < state->num_tracks; i++) {
+        if (state->tracks[i].history_count > 0) {
+            stitch_build_summary(&state->tracks[i], &sums[n_sums], i);
+            n_sums++;
+        }
+    }
+
+    /* Iterative greedy merge (matches Python's while-True loop) */
+    for (;;) {
+        int best_a = -1, best_b = -1;
+        int best_gap = 0x7FFFFFFF;
+        double best_dist = 1e9;
+
+        for (i = 0; i < n_sums; i++) {
+            if (!sums[i].alive) continue;
+            for (j = i + 1; j < n_sums; j++) {
+                if (!sums[j].alive) continue;
+
+                StitchSummary *sa = &sums[i], *sb = &sums[j];
+                int older_idx, newer_idx;
+
+                /* Determine which is older (must be disjoint) */
+                if (sa->last_sync < sb->first_sync) {
+                    older_idx = i; newer_idx = j;
+                } else if (sb->last_sync < sa->first_sync) {
+                    older_idx = j; newer_idx = i;
+                } else {
+                    continue; /* time-overlapping => separate people */
+                }
+
+                StitchSummary *older = &sums[older_idx];
+                StitchSummary *newer = &sums[newer_idx];
+
+                int gap = newer->first_sync - older->last_sync;
+                if (gap > max_gap_frames) continue;
+                if (!older->last_com_valid || !newer->first_com_valid) continue;
+
+                double d = dist3d(older->last_com, newer->first_com);
+                if (d > (double)max_distance_m) continue;
+
+                /* Score: prefer smaller gap, then smaller distance */
+                if (gap < best_gap || (gap == best_gap && d < best_dist)) {
+                    best_gap = gap;
+                    best_dist = d;
+                    best_a = older_idx;
+                    best_b = newer_idx;
+                }
+            }
+        }
+
+        if (best_a < 0) break; /* no more eligible pairs */
+
+        /* Merge newer into older */
+        int older_ti = sums[best_a].track_idx;
+        int newer_ti = sums[best_b].track_idx;
+
+        stitch_merge_history(&state->tracks[older_ti], &state->tracks[newer_ti]);
+
+        /* Clear consumed track */
+        state->tracks[newer_ti].history_count = 0;
+        state->tracks[newer_ti].is_active = 0;
+
+        /* Refresh survivor's summary, mark consumed */
+        stitch_build_summary(&state->tracks[older_ti], &sums[best_a], older_ti);
+        sums[best_b].alive = 0;
+        merges++;
+    }
+
+    return merges;
+}

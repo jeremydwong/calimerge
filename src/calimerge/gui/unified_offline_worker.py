@@ -226,15 +226,14 @@ class UnifiedOfflineWorker(QThread):
                 return
 
             # ── Canonical re-tracking ─────────────────────────────────
-            # Each backend's underlying tracker has different defaults
-            # and different fragmentation behavior (PyTorch _LiveTracker
-            # vs C pt_tracker). Throw away their track ids and re-run a
-            # single canonical _LiveTracker over every recording so the
-            # downstream stitching/output is identical regardless of the
-            # inference backend. Inputs (kps_3d) still differ, but the
-            # tracker code path doesn't.
-            self.progress.emit("re-tracking", 0.90)
-            self._retrack_recording(recording)
+            # C backends (cuda/mps) already run pt_tracker with the same
+            # max_track_distance and track_patience we would pass to the
+            # Python _LiveTracker, so their person IDs are canonical —
+            # skip the redundant re-tracking.  PyTorch uses its own
+            # _LiveTracker whose params may differ from ours, so re-track.
+            if self._backend == "pytorch":
+                self.progress.emit("re-tracking", 0.90)
+                self._retrack_recording(recording)
 
             # ── Stitch tracks across the recording ────────────────────
             self.progress.emit("stitching tracks", 0.92)

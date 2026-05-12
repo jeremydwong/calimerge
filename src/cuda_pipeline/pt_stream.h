@@ -160,6 +160,16 @@ void pt_stream_get_stats(const PT_Stream *s, PT_StreamStats *out);
 void pt_stream_reset_tracks(PT_Stream *s);
 
 /*
+ * Stitch fragmented tracks in the stream's internal PT_TrackState.
+ *
+ * Call after the processing loop finishes (all process_frame calls done)
+ * but before reading results / exporting. Delegates to pt_track_stitch().
+ *
+ * Returns the number of merges performed (0 = nothing stitched).
+ */
+int pt_stream_stitch_tracks(PT_Stream *s, int max_gap_frames, float max_distance_m);
+
+/*
  * Export accumulated track history to CSV files (for testing/verification).
  * Delegates to pt_export_csv() using the stream's internal track state.
  *

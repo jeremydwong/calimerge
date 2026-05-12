@@ -204,6 +204,14 @@ def _load_lib():
     _lib.pt_stream_reset_tracks.argtypes = [ctypes.c_void_p]
     _lib.pt_stream_reset_tracks.restype = None
 
+    # pt_stream_stitch_tracks
+    _lib.pt_stream_stitch_tracks.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_float,
+    ]
+    _lib.pt_stream_stitch_tracks.restype = ctypes.c_int
+
     return _lib
 
 
@@ -399,6 +407,18 @@ class CudaStreamPipeline:
             tracking_ms=stats.tracking_ms,
             total_ms=stats.total_ms,
             frames_processed=stats.frames_processed,
+        )
+
+    def stitch_tracks(
+        self, max_gap_frames: int = 90, max_distance_m: float = 0.6,
+    ) -> int:
+        """Stitch fragmented tracks in the C-side PT_TrackState.
+
+        Call after all process_frame() calls are done. Returns the number
+        of merges performed.
+        """
+        return self._lib.pt_stream_stitch_tracks(
+            self._handle, int(max_gap_frames), float(max_distance_m),
         )
 
     def reset_tracks(self):
