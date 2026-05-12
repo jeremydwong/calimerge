@@ -316,9 +316,9 @@ The Python GUI stays live and usable at every phase. The C++ app grows in `src/a
 
 **Status: complete.** Today's specific pain (CoreML conversion at launch time) is gone.
 
-### Phase 1 (1–2 weeks): consolidate the C++ pipeline
-4. Move `track_stitch.py` (210 lines) into `pt_tracker.cpp`. Verify against the headless reproducer.
-5. Drop the runtime PyTorch pose backend (`tracking/pose_detector.py`). Remove `torch`, `transformers`, `ultralytics` from `pyproject.toml`. The TensorRT/CoreML pipelines are the live path.
+### Phase 1 (done): consolidate the C++ pipeline
+4. ~~Move `track_stitch.py` (210 lines) into `pt_tracker.cpp`.~~ Done: `pt_track_stitch()` in `pt_tracker.cpp`, called from `pt_pipeline_run()` and exposed via `pt_stream_stitch_tracks()`. Headless reproducer verified (pytorch + cuda backends, 1 person, 900 frames).
+5. ~~Drop runtime PyTorch deps from `pyproject.toml`.~~ Done: `torch`, `transformers`, `ultralytics` moved to optional `pytorch-backend` group. Install with `uv sync --extra pytorch-backend`.
 6. Python GUI continues to drive everything. No user-visible change. `uv.lock` shrinks dramatically.
 
 ### Phase 2 (4–6 weeks): C++ calibration pipeline
