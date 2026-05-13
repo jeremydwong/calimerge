@@ -89,6 +89,23 @@ if [[ ! -d "$COREML_DIR/yolo_v10s.mlpackage" || ! -d "$COREML_DIR/vitpose_synthp
     echo "        MPS backend will not work until you run:  bash build_mac_models.sh"
 fi
 
+# Conda's VIRTUAL_ENV env var confuses uv into using the wrong Python.
+unset VIRTUAL_ENV CONDA_PREFIX
+
+# Catch Intel conda on an arm64 Mac before it poisons the whole venv.
+if [[ "$(uname -m)" == "arm64" ]]; then
+    bad_python="$(command -v python3 2>/dev/null || true)"
+    if [[ -n "$bad_python" ]] && file -b "$bad_python" 2>/dev/null | grep -q x86_64; then
+        echo "ERROR: Your default python3 is Intel (x86_64) on an arm64 Mac." >&2
+        echo "       This is usually Intel Miniconda/Anaconda running under Rosetta." >&2
+        echo "       It will pull the wrong wheels and break native extensions." >&2
+        echo "" >&2
+        echo "  Fix: uninstall Intel conda, or install the arm64 (Apple Silicon) version." >&2
+        echo "       uv manages its own Python — conda is not needed for calimerge." >&2
+        exit 1
+    fi
+fi
+
 UV_BIN="${UV_BIN:-$HOME/.local/bin/uv}"
 [[ -x "$UV_BIN" ]] || UV_BIN="$(command -v uv || true)"
 if [[ -z "${UV_BIN:-}" ]]; then

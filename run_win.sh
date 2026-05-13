@@ -117,9 +117,9 @@ else
     fi
 fi
 
-# Anaconda sets VIRTUAL_ENV to its base path on Windows; uv picks the wrong
-# interpreter if it's set. Clear it for this script's child processes.
-unset VIRTUAL_ENV
+# Anaconda sets VIRTUAL_ENV / CONDA_PREFIX to its base path on Windows;
+# uv picks the wrong interpreter if either is set.
+unset VIRTUAL_ENV CONDA_PREFIX
 
 UV_BIN="${UV_BIN:-$HOME/.local/bin/uv}"
 [[ -x "$UV_BIN" ]] || UV_BIN="$(command -v uv || true)"

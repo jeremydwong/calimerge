@@ -6,7 +6,7 @@ license = "BSD-2-Clause"
 authors = [
     { name = "Mac Prible", email = "prible@gmail.com" }
 ]
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.11,<3.13"
 dependencies = [
     "numpy>=1.24.0",
     "opencv-contrib-python>=4.8.0",
